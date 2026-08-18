@@ -1,0 +1,19 @@
+; ===========================================================================
+; myrkrshell.def - the exports of the drag-drop shell extension.
+;
+; Exactly two, and deliberately so.  COM needs DllGetClassObject to hand out
+; the class factory and DllCanUnloadNow to ask whether the module may go; every
+; other entry point would be surface for no gain.
+;
+; There is no DllRegisterServer.  Registration is written by the MSI (see
+; tools\make_msi.ps1), because a self-registering DLL cannot be rolled back
+; cleanly by Windows Installer and leaves a half-registered CLSID behind when
+; an install fails.
+;
+; x64 has no name decoration, so the names below are what the loader sees.
+; PRIVATE keeps them out of the import library - nothing links against this DLL.
+; ===========================================================================
+LIBRARY myrkrshell
+EXPORTS
+    DllGetClassObject   PRIVATE
+    DllCanUnloadNow     PRIVATE

@@ -1,0 +1,39 @@
+/* myrkr.rc - VERSIONINFO resource for bin\myrkr.exe (compiled by rc.exe in
+   build.cmd, then linked in).  Self-contained: numeric FILEOS/FILETYPE values
+   so no SDK headers are required. */
+
+/* Icon groups, in ID order.  The shell picks the LOWEST id for the exe's own
+   icon, and an "path,N" reference indexes these groups in the same ID order -
+   so id 1 is index 0 and id 2 is index 1.  Adding a group with an id below 1
+   would silently change both the exe icon and every ",N" reference. */
+1 ICON "myrkr.ico"              /* application / window icon            -> ,0 */
+2 ICON "logo\\redacted.ico"     /* .mrk container file-type icon        -> ,1 */
+
+1 VERSIONINFO
+ FILEVERSION    1,1,0,0
+ PRODUCTVERSION 1,1,0,0
+ FILEFLAGSMASK  0x3fL
+ FILEFLAGS      0x0L
+ FILEOS         0x40004L            /* VOS_NT_WINDOWS32 */
+ FILETYPE       0x1L                /* VFT_APP */
+ FILESUBTYPE    0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"           /* US English (0x0409), Unicode (1200) */
+        BEGIN
+            VALUE "CompanyName",      "Thomas Smistad"
+            VALUE "FileDescription",  "Myrkr - AES-256-GCM + Argon2id file encryption"
+            VALUE "FileVersion",      "1.1.0.0"
+            VALUE "InternalName",     "myrkr"
+            VALUE "LegalCopyright",   "Copyright (C) 2026 Thomas Smistad"
+            VALUE "OriginalFilename", "myrkr.exe"
+            VALUE "ProductName",      "Myrkr"
+            VALUE "ProductVersion",   "1.1.0.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

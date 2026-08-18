@@ -1,0 +1,80 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" role="img" aria-label="Windows 11 folder with redacted lines">
+  <title>Redacted folder</title>
+  <!--
+    The folder is traced from the real Windows 11 shell folder icon
+    (imageres.dll, icon index 3, 256x256): outline, corner radii, gradient axis,
+    stop colours, the flap's contact shadow and its lit top edge were all sampled
+    from the bitmap. The redaction bars are the only addition.
+  -->
+  <defs>
+    <!-- both plates share one gradient axis, direction (0.5245, 0.852) -->
+    <linearGradient id="gBack" gradientUnits="userSpaceOnUse" x1="16" y1="34" x2="155.9" y2="261.2">
+      <stop offset="0" stop-color="#FFC016"/>
+      <stop offset="1" stop-color="#DFA32E"/>
+    </linearGradient>
+    <linearGradient id="gFront" gradientUnits="userSpaceOnUse" x1="16" y1="74" x2="138.1" y2="272.3">
+      <stop offset="0" stop-color="#FFE9A7"/>
+      <stop offset="1" stop-color="#FFC934"/>
+    </linearGradient>
+    <!-- 4px lit edge along the top of the flap, fading left to right -->
+    <linearGradient id="gBand" gradientUnits="userSpaceOnUse" x1="16" y1="0" x2="240" y2="0">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.271"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0.013"/>
+    </linearGradient>
+
+    <clipPath id="cBack">
+      <path d="M 16 45 A 11 11 0 0 1 27 34 H 84.86 A 24 24 0 0 1 103.4 42.78 L 115.88 58
+               H 228 A 12 12 0 0 1 240 70 V 198
+               A 12 12 0 0 1 228 210 H 28 A 12 12 0 0 1 16 198 Z"/>
+    </clipPath>
+    <clipPath id="cTop"><rect x="0" y="0" width="256" height="100"/></clipPath>
+
+    <mask id="mBand" maskUnits="userSpaceOnUse" x="0" y="0" width="256" height="256">
+      <path fill="#ffffff" d="M 16 86 A 12 12 0 0 1 28 74 H 92 C 105.56 74 111.83 62 118 62
+               H 228 A 12 12 0 0 1 240 74 V 194
+               A 12 12 0 0 1 228 206 H 28 A 12 12 0 0 1 16 194 Z"/>
+      <path fill="#000000" transform="translate(0 4)"
+            d="M 16 86 A 12 12 0 0 1 28 74 H 92 C 105.56 74 111.83 62 118 62
+               H 228 A 12 12 0 0 1 240 74 V 194
+               A 12 12 0 0 1 228 206 H 28 A 12 12 0 0 1 16 194 Z"/>
+    </mask>
+
+    <filter id="fContact" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="6"/>
+    </filter>
+  </defs>
+
+  <!-- back plate + tab -->
+  <path fill="url(#gBack)"
+        d="M 16 45 A 11 11 0 0 1 27 34 H 84.86 A 24 24 0 0 1 103.4 42.78 L 115.88 58
+           H 228 A 12 12 0 0 1 240 70 V 198
+           A 12 12 0 0 1 228 210 H 28 A 12 12 0 0 1 16 198 Z"/>
+
+  <!-- contact shadow the flap casts on the back plate -->
+  <g clip-path="url(#cBack)">
+    <g clip-path="url(#cTop)">
+      <!-- caster's top edge is flat at y=74: the real icon's shadow is anchored there
+           across the whole width, which is why the strip above the flap's raised
+           right-hand edge (y=58..62) is left almost untouched -->
+      <path fill="#000000" opacity="0.26" filter="url(#fContact)"
+            d="M 16 86 A 12 12 0 0 1 28 74 H 228 A 12 12 0 0 1 240 86 V 194
+               A 12 12 0 0 1 228 206 H 28 A 12 12 0 0 1 16 194 Z"/>
+    </g>
+  </g>
+
+  <!-- front flap -->
+  <path fill="url(#gFront)"
+        d="M 16 86 A 12 12 0 0 1 28 74 H 92 C 105.56 74 111.83 62 118 62
+           H 228 A 12 12 0 0 1 240 74 V 194
+           A 12 12 0 0 1 228 206 H 28 A 12 12 0 0 1 16 194 Z"/>
+  <rect x="0" y="0" width="256" height="256" fill="url(#gBand)" mask="url(#mBand)"/>
+
+  <!-- redaction bars: four ragged "lines of text", the second struck in stamp red.
+       Left-aligned at x=44, block centred in the flap (flap spans y62..206) -->
+  <g opacity="0.93">
+    <rect x="44" y="90"  width="152" height="17" rx="4" fill="#12151C"/>
+    <rect x="44" y="114" width="104" height="17" rx="4" fill="#E01B2E"/>
+    <rect x="44" y="138" width="170" height="17" rx="4" fill="#12151C"/>
+    <rect x="44" y="162" width="92"  height="17" rx="4" fill="#12151C"/>
+  </g>
+</svg>

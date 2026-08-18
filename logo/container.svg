@@ -1,0 +1,98 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" role="img" aria-label="Windows 11 folder stamped SECRET in red ink">
+  <title>Secret folder</title>
+  <!--
+    The folder is traced from the real Windows 11 shell folder icon
+    (imageres.dll, icon index 3, 256x256): outline, corner radii, gradient axis,
+    stop colours, the flap's contact shadow and its lit top edge were all sampled
+    from the bitmap. The red rubber stamp is the only addition.
+  -->
+  <defs>
+    <!-- both plates share one gradient axis, direction (0.5245, 0.852) -->
+    <linearGradient id="gBack" gradientUnits="userSpaceOnUse" x1="16" y1="34" x2="155.9" y2="261.2">
+      <stop offset="0" stop-color="#FFC016"/>
+      <stop offset="1" stop-color="#DFA32E"/>
+    </linearGradient>
+    <linearGradient id="gFront" gradientUnits="userSpaceOnUse" x1="16" y1="74" x2="138.1" y2="272.3">
+      <stop offset="0" stop-color="#FFE9A7"/>
+      <stop offset="1" stop-color="#FFC934"/>
+    </linearGradient>
+    <!-- 4px lit edge along the top of the flap, fading left to right -->
+    <linearGradient id="gBand" gradientUnits="userSpaceOnUse" x1="16" y1="0" x2="240" y2="0">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.271"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0.013"/>
+    </linearGradient>
+
+    <clipPath id="cBack">
+      <path d="M 16 45 A 11 11 0 0 1 27 34 H 84.86 A 24 24 0 0 1 103.4 42.78 L 115.88 58
+               H 228 A 12 12 0 0 1 240 70 V 198
+               A 12 12 0 0 1 228 210 H 28 A 12 12 0 0 1 16 198 Z"/>
+    </clipPath>
+    <clipPath id="cTop"><rect x="0" y="0" width="256" height="100"/></clipPath>
+
+    <mask id="mBand" maskUnits="userSpaceOnUse" x="0" y="0" width="256" height="256">
+      <path fill="#ffffff" d="M 16 86 A 12 12 0 0 1 28 74 H 92 C 105.56 74 111.83 62 118 62
+               H 228 A 12 12 0 0 1 240 74 V 194
+               A 12 12 0 0 1 228 206 H 28 A 12 12 0 0 1 16 194 Z"/>
+      <path fill="#000000" transform="translate(0 4)"
+            d="M 16 86 A 12 12 0 0 1 28 74 H 92 C 105.56 74 111.83 62 118 62
+               H 228 A 12 12 0 0 1 240 74 V 194
+               A 12 12 0 0 1 228 206 H 28 A 12 12 0 0 1 16 194 Z"/>
+    </mask>
+
+    <filter id="fContact" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="6"/>
+    </filter>
+
+    <!-- worn rubber-stamp ink: roughen the edges, then eat away patches -->
+    <filter id="stampInk" x="-15%" y="-25%" width="130%" height="150%">
+      <feTurbulence type="fractalNoise" baseFrequency="0.07" numOctaves="3" seed="11" result="warp"/>
+      <feDisplacementMap in="SourceGraphic" in2="warp" scale="1.5"
+                         xChannelSelector="R" yChannelSelector="G" result="rough"/>
+      <feTurbulence type="fractalNoise" baseFrequency="0.7 1.0" numOctaves="4" seed="27" result="grain"/>
+      <feComponentTransfer in="grain" result="patches">
+        <feFuncA type="linear" slope="2.2" intercept="-1.35"/>
+      </feComponentTransfer>
+      <feComposite in="rough" in2="patches" operator="out" result="worn"/>
+      <feTurbulence type="fractalNoise" baseFrequency="1.6" numOctaves="2" seed="5" result="speck"/>
+      <feComponentTransfer in="speck" result="speckcut">
+        <feFuncA type="linear" slope="1.6" intercept="-1.25"/>
+      </feComponentTransfer>
+      <feComposite in="worn" in2="speckcut" operator="out"/>
+    </filter>
+  </defs>
+
+  <!-- back plate + tab -->
+  <path fill="url(#gBack)"
+        d="M 16 45 A 11 11 0 0 1 27 34 H 84.86 A 24 24 0 0 1 103.4 42.78 L 115.88 58
+           H 228 A 12 12 0 0 1 240 70 V 198
+           A 12 12 0 0 1 228 210 H 28 A 12 12 0 0 1 16 198 Z"/>
+
+  <!-- contact shadow the flap casts on the back plate -->
+  <g clip-path="url(#cBack)">
+    <g clip-path="url(#cTop)">
+      <!-- caster's top edge is flat at y=74: the real icon's shadow is anchored there
+           across the whole width, which is why the strip above the flap's raised
+           right-hand edge (y=58..62) is left almost untouched -->
+      <path fill="#000000" opacity="0.26" filter="url(#fContact)"
+            d="M 16 86 A 12 12 0 0 1 28 74 H 228 A 12 12 0 0 1 240 86 V 194
+               A 12 12 0 0 1 228 206 H 28 A 12 12 0 0 1 16 194 Z"/>
+    </g>
+  </g>
+
+  <!-- front flap -->
+  <path fill="url(#gFront)"
+        d="M 16 86 A 12 12 0 0 1 28 74 H 92 C 105.56 74 111.83 62 118 62
+           H 228 A 12 12 0 0 1 240 74 V 194
+           A 12 12 0 0 1 228 206 H 28 A 12 12 0 0 1 16 194 Z"/>
+  <rect x="0" y="0" width="256" height="256" fill="url(#gBand)" mask="url(#mBand)"/>
+
+  <!-- red rubber stamp -->
+  <g filter="url(#stampInk)" transform="rotate(-13 128 142)" fill="none"
+     stroke="#E01B2E" opacity="0.94">
+    <rect x="28" y="110" width="200" height="64" rx="8" stroke-width="5"/>
+    <rect x="36" y="118" width="184" height="48" rx="4" stroke-width="2.5"/>
+    <!-- "SECRET" in Arial Black 32px, letter-spacing 3.5, converted to outlines
+         so the icon does not depend on any font being installed -->
+    <path fill="#E01B2E" stroke="none" d="M49.25 145.92L55.98 145.50C56.13 146.59 56.43 147.43 56.88 148.00C57.60 148.93 58.65 149.39 60.00 149.39C61.01 149.39 61.79 149.15 62.34 148.68C62.88 148.21 63.16 147.66 63.16 147.03C63.16 146.44 62.90 145.91 62.38 145.44C61.85 144.97 60.65 144.53 58.75 144.11C55.65 143.41 53.43 142.48 52.11 141.33C50.78 140.17 50.11 138.70 50.11 136.91C50.11 135.73 50.45 134.62 51.13 133.57C51.82 132.52 52.84 131.70 54.21 131.10C55.58 130.50 57.46 130.20 59.84 130.20C62.77 130.20 65.00 130.75 66.54 131.84C68.08 132.92 68.99 134.66 69.28 137.03L62.61 137.42C62.43 136.39 62.06 135.64 61.49 135.17C60.92 134.70 60.14 134.47 59.14 134.47C58.32 134.47 57.70 134.64 57.28 134.99C56.86 135.34 56.66 135.77 56.66 136.27C56.66 136.63 56.83 136.96 57.17 137.25C57.51 137.55 58.30 137.83 59.55 138.09C62.64 138.76 64.86 139.43 66.20 140.12C67.53 140.80 68.51 141.65 69.12 142.66C69.73 143.67 70.03 144.80 70.03 146.05C70.03 147.52 69.63 148.87 68.81 150.11C68.00 151.35 66.86 152.29 65.41 152.93C63.95 153.57 62.11 153.89 59.89 153.89C55.99 153.89 53.30 153.14 51.80 151.64C50.30 150.14 49.45 148.23 49.25 145.92ZM77.08 130.59L96.05 130.59L96.05 135.48L84.17 135.48L84.17 139.13L95.19 139.13L95.19 143.80L84.17 143.80L84.17 148.31L96.39 148.31L96.39 153.50L77.08 153.50ZM118.95 144.13L125.16 146.00C124.74 147.74 124.08 149.19 123.19 150.36C122.29 151.53 121.18 152.41 119.85 153.00C118.52 153.59 116.83 153.89 114.78 153.89C112.29 153.89 110.26 153.53 108.68 152.81C107.10 152.08 105.74 150.81 104.59 148.99C103.45 147.17 102.88 144.83 102.88 141.99C102.88 138.20 103.88 135.29 105.90 133.26C107.91 131.22 110.77 130.20 114.45 130.20C117.34 130.20 119.61 130.79 121.26 131.95C122.91 133.12 124.14 134.91 124.94 137.33L118.69 138.72C118.47 138.02 118.24 137.51 118.00 137.19C117.60 136.65 117.12 136.23 116.55 135.94C115.97 135.65 115.33 135.50 114.63 135.50C113.02 135.50 111.79 136.15 110.94 137.44C110.29 138.39 109.97 139.90 109.97 141.95C109.97 144.48 110.35 146.22 111.13 147.17C111.90 148.11 112.98 148.58 114.38 148.58C115.73 148.58 116.75 148.20 117.45 147.44C118.14 146.68 118.64 145.57 118.95 144.13ZM132.19 153.50L132.19 130.59L143.98 130.59C146.17 130.59 147.84 130.78 149.00 131.16C150.16 131.53 151.09 132.23 151.80 133.24C152.51 134.26 152.86 135.49 152.86 136.95C152.86 138.22 152.59 139.32 152.05 140.24C151.50 141.16 150.76 141.91 149.81 142.48C149.21 142.85 148.38 143.15 147.33 143.39C148.17 143.67 148.78 143.95 149.17 144.24C149.43 144.42 149.81 144.82 150.30 145.44C150.79 146.05 151.12 146.53 151.29 146.86L154.72 153.50L146.72 153.50L142.94 146.50C142.46 145.59 142.03 145.01 141.66 144.73C141.15 144.38 140.57 144.20 139.92 144.20L139.30 144.20L139.30 153.50ZM139.30 139.88L142.28 139.88C142.60 139.88 143.23 139.77 144.16 139.56C144.63 139.47 145.01 139.23 145.30 138.84C145.60 138.46 145.75 138.02 145.75 137.52C145.75 136.78 145.52 136.21 145.05 135.81C144.58 135.42 143.70 135.22 142.41 135.22L139.30 135.22ZM160.47 130.59L179.44 130.59L179.44 135.48L167.56 135.48L167.56 139.13L178.58 139.13L178.58 143.80L167.56 143.80L167.56 148.31L179.78 148.31L179.78 153.50L160.47 153.50ZM185.48 130.59L207.00 130.59L207.00 136.25L199.78 136.25L199.78 153.50L192.70 153.50L192.70 136.25L185.48 136.25Z"/>
+  </g>
+</svg>

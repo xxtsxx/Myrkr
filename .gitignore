@@ -1,0 +1,34 @@
+# Build outputs (regenerable via build.cmd / build-gui.cmd)
+/bin/
+/obj/
+*.obj
+*.lst
+*.exe
+*.pdb
+*.ilk
+*.map
+*.msi
+*.cab
+
+# Editor / tooling local state
+# b.cmd is a local build wrapper: it hard-codes one machine's vcvars64.bat path.
+# (A comment must be on its own line - gitignore has no trailing comments, so
+#  "/b.cmd  # note" is a pattern that matches a file literally called that.)
+/b.cmd
+/.claude/
+*.swp
+*~
+__pycache__/
+*.pyc
+
+# Encrypted/plaintext working data — never commit user data
+*.mrk
+# ...except the frozen format fixtures.  These are containers written by an
+# older writer, kept so a version bump cannot silently stop opening them; they
+# hold nothing but generated test text and one seeded random blob.  See
+# tests/compattest.ps1 and tools/make_v6_fixtures.ps1.
+!/tests/fixtures/*.mrk
+/checkpoints/
+# encrypted-zip test fixtures (regenerated via pyzipper)
+/ztest/
+*.zip

@@ -1,0 +1,35 @@
+<svg width="512" height="512" viewBox="0 0 512 512" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Myrkr">
+  <title>Myrkr</title>
+  <desc>A dark rounded tile with a blue padlock whose keyhole is the runic m (madr) glyph.</desc>
+  <defs>
+    <radialGradient id="m-bg" cx="50%" cy="34%" r="82%">
+      <stop offset="0%" stop-color="#1a1a22"/>
+      <stop offset="60%" stop-color="#0b0b10"/>
+      <stop offset="100%" stop-color="#030305"/>
+    </radialGradient>
+    <linearGradient id="m-lock" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#4b8ef7"/>
+      <stop offset="100%" stop-color="#005FB8"/>
+    </linearGradient>
+    <clipPath id="m-tile"><rect width="512" height="512" rx="112"/></clipPath>
+  </defs>
+
+  <rect width="512" height="512" rx="112" fill="url(#m-bg)"/>
+
+  <g clip-path="url(#m-tile)">
+    <!-- scanning shine, echoing the animated wordmark -->
+    <polygon points="120,-40 250,-40 -40,250 -40,120" fill="#ffffff" opacity="0.05"/>
+    <!-- padlock shackle -->
+    <path d="M182 236 V186 a74 74 0 0 1 148 0 V236" fill="none" stroke="url(#m-lock)" stroke-width="38" stroke-linecap="round"/>
+    <!-- padlock body -->
+    <rect x="146" y="224" width="220" height="170" rx="36" fill="url(#m-lock)"/>
+    <!-- runic keyhole: the madr (m) rune -->
+    <g stroke="#070710" stroke-width="15" stroke-linecap="round" fill="none">
+      <line x1="256" y1="278" x2="256" y2="362"/>
+      <line x1="256" y1="300" x2="222" y2="270"/>
+      <line x1="256" y1="300" x2="290" y2="270"/>
+    </g>
+  </g>
+
+  <rect x="2.5" y="2.5" width="507" height="507" rx="109.5" fill="none" stroke="#ffffff" stroke-opacity="0.06" stroke-width="3"/>
+</svg>
