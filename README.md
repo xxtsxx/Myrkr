@@ -1,28 +1,136 @@
 # Myrkr
 
-**Encrypt a file or a folder on Windows so nobody without the password can read
-it — or change it without you finding out.**
+**Lock a file or a whole folder behind one password, so nobody else can read it
+— or change it without you knowing.**
 
-Drop something on the window, type a password, and you get one encrypted file.
-Double-click that file later, type the password, and you get your data back.
-
-AES-256-GCM with an Argon2id key derivation, in a single executable with no
-dependencies beyond what Windows already ships. Written entirely in 64-bit
-assembly.
+Drop something on the window, type a password, and you get a single encrypted
+file back. Double-click that file later, type the password, and your data
+returns exactly as it was. That is the entire idea, and everything below is in
+service of doing it well and doing it honestly.
 
 ```
-myrkr.exe          <- the whole program
+myrkr.exe          <- the whole program: one file, nothing to install alongside it
 ```
+
+---
+
+## Why Myrkr
+
+Most encryption you meet is wrapped around something else — a disk, a cloud
+account, a messaging app — and you mostly have to trust that the wrapping is
+sound. Myrkr is the opposite: a small, self-contained tool that does one thing,
+where every part of how it works is written down and can be checked.
+
+- **Your data becomes one sealed file.** A folder of tens of thousands of files
+  turns into a single container. The names, the sizes, the folder structure —
+  all of it is *inside* the encryption. Someone who finds the file sees one
+  opaque blob and learns nothing about what it holds.
+- **Tampering is caught, not just hidden.** It is not enough that an attacker
+  cannot read your data; they must not be able to alter it and have you accept
+  the result. Change one bit of a Myrkr container — anywhere, even in its
+  header — and it refuses to open rather than handing back quietly corrupted
+  data.
+- **There is no way in but the password.** No escrow, no recovery key, no
+  vendor back door, no "reset". This is a promise and a warning in the same
+  breath: forget the password and the data is genuinely gone.
+- **Nothing to trust but the program itself.** One executable, no runtime to
+  install, no third-party libraries, no network. It reads your file, writes an
+  encrypted one, and stops.
+- **Built to stay strong for a long time** — including against the quantum
+  computers people worry will break today's encryption. See
+  [Built for a quantum future](#built-for-a-quantum-future).
+
+If you want the rigorous version — the threat model, what is *not* protected,
+and how each claim was tested — read [`docs/SECURITY.md`](docs/SECURITY.md). It
+is written to be understood without reading a line of the code.
 
 ---
 
 ## Contents
 
+- [Why Myrkr](#why-myrkr) · [Design principles](#design-principles) ·
+  [Built for a quantum future](#built-for-a-quantum-future)
 - [Install](#install) · [Using it](#using-it) · [What you get](#what-you-get)
 - [Splitting across volumes](#splitting-across-volumes) ·
   [ZIP files](#zip-files) · [Settings](#settings)
 - [For administrators](#for-administrators) · [For developers](#for-developers)
 - [Documentation map](#documentation-map)
+
+---
+
+## Design principles
+
+These are the rules the whole project is held to. They explain not just what
+Myrkr does but why it is shaped the way it is.
+
+**One job, done completely.** Myrkr encrypts and decrypts files. It is not a
+backup tool, a sync client, or a service, and it does not try to become one.
+A tool with a small, fixed purpose is a tool you can actually reason about.
+
+**Fail closed, always.** When anything is wrong — a flipped bit, a truncated
+file, a value that does not make sense, a password that does not match — Myrkr
+*stops*, with a clear reason, rather than pressing on and producing something
+that looks fine but is not. Silence and plausible-but-wrong output are treated
+as the worst outcomes, and the design bends over backwards to avoid them.
+
+**Confidentiality and integrity together.** Keeping a secret and detecting
+tampering are two halves of the same job. Every byte Myrkr writes is
+authenticated, so "nobody can read it" and "nobody can change it undetected"
+hold at the same time.
+
+**Hide the shape, not just the contents.** File names, sizes, and folder layout
+leak more than people expect. Myrkr puts all of it inside the encryption, so the
+container reveals nothing about what it contains.
+
+**No secret ingredients.** The container format and the cryptography are
+documented down to the byte. There is no obscurity doing any of the security
+work — the password is the only secret, exactly as it should be.
+
+**Defence in depth.** The password is typed on a private desktop other programs
+cannot reach; secrets are held in memory that cannot be swapped to disk and are
+wiped after use; the program is hardened against whole classes of memory
+attacks. No single one of these is load-bearing — they are layers.
+
+**Honest about limits.** The security documentation lists what Myrkr does *not*
+protect against as plainly as what it does, and every protective claim is
+written next to the test that checks it. A guarantee with no evidence beside it
+is marked as such.
+
+**Friction where friction protects you.** The command line deliberately refuses
+to take a password as an argument, so encryption cannot be silently scripted
+across an estate. Sometimes the secure choice is to make the dangerous thing
+harder, not easier.
+
+---
+
+## Built for a quantum future
+
+You may have heard that quantum computers will one day break modern encryption.
+That worry is real — but it is far more specific than the headlines suggest, and
+Myrkr was designed on the safe side of it.
+
+The quantum threat lands almost entirely on one family of cryptography: the
+**public-key** maths behind web-address padlocks, secure messaging, and digital
+signatures — the handshakes where two strangers agree on a secret. A future
+quantum computer is expected to unpick those handshakes.
+
+**Myrkr does not use any of that.** There are no key exchanges, no public/private
+key pairs, no certificates — nothing for the quantum computer's headline trick to
+grab hold of. Your key comes from your password and nothing else.
+
+The one thing Myrkr does rely on — a **256-bit AES key** — faces only a much
+weaker quantum effect, one that at best cuts a key's strength roughly in half.
+A 256-bit key was chosen from the start with exactly this in mind: even halved,
+what remains is an amount of guessing no computer, quantum or otherwise, is
+expected to get through. The password-scrambling step (Argon2id) rests on the
+same solid ground.
+
+So the honest summary is this: **the part of cryptography that quantum computers
+are expected to break is not in Myrkr, and the part that is has been sized with
+room to spare.** This is not a promise that any specific algorithm is unbreakable
+forever — it is a deliberate choice to stand only on the ground widely expected
+to survive. The mathematical detail, and the reasoning, is in
+[`docs/SECURITY.md`](docs/SECURITY.md#quantum-resistance).
 
 ---
 
@@ -212,7 +320,7 @@ feature tests and what each one asserts.
 
 | Read this | For |
 |---|---|
-| [`docs/SECURITY.md`](docs/SECURITY.md) | **Start here for anything security-related.** Threat model, what is and is not defended, every hardening control with the test that proves it, and an honest residual-risk list. |
+| [`docs/SECURITY.md`](docs/SECURITY.md) | **Start here for anything security-related.** Threat model, what is and is not defended, the quantum-resistance reasoning, every hardening control with the test that proves it, and an honest residual-risk list. |
 | [`manifest.md`](manifest.md) | The technical reference: container format, cryptographic construction, module map, engineering notes. |
 | [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) | Installing across an estate — every MSI property, policy versus default, and the registry surface. |
 | [`docs/VOLUMES.md`](docs/VOLUMES.md) | Splitting a container across several files. |

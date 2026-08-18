@@ -98,6 +98,50 @@ All primitives are validated against official test vectors on demand:
 myrkr selftest
 ```
 
+<a name="quantum-resistance"></a>
+
+### 3.1 Quantum resistance
+
+The security of every algorithm above rests on **symmetric** cryptography and
+password hashing. Myrkr uses **no public-key cryptography** — no RSA, no
+elliptic curves, no Diffie–Hellman, no key exchange, no digital signatures.
+This is verifiable rather than asserted: there is no such primitive anywhere in
+`src/`, and the container needs none, because the key comes from the password
+via Argon2id and nothing is negotiated with a second party.
+
+That matters because the two quantum algorithms of concern are not equal in
+reach:
+
+| Quantum algorithm | Breaks | Present in Myrkr? |
+|---|---|---|
+| **Shor's** | Public-key cryptography (RSA, ECC, DH) — a full break, exponential speed-up | **No such primitive exists in Myrkr.** Nothing for it to attack. |
+| **Grover's** | Symmetric ciphers — a *quadratic* speed-up only, i.e. it halves the effective key length | Applies to AES-256, which is sized for it (below). |
+
+**Shor's algorithm is what makes "quantum breaks encryption" frightening**, and
+it is confined to public-key systems — the handshakes and signatures Myrkr does
+not use. It has no bearing on a Myrkr container.
+
+**Grover's algorithm** is the only quantum result that touches Myrkr's cipher,
+and its speed-up is merely quadratic: it reduces a brute-force search from
+2²⁵⁶ to about 2¹²⁸ operations for a 256-bit key. 2¹²⁸ is the same security
+level AES-128 offers *today* against classical attack — already beyond any
+feasible search, and Grover parallelises poorly, which erodes even that
+advantage in practice. NIST's own post-quantum guidance treats AES-256 as
+appropriate for the quantum era for exactly this reason. The 256-bit key was
+chosen with this halving in mind; a 128-bit cipher would have been the
+questionable choice, not this one.
+
+Argon2id derives the key from the password and is memory-hard; Grover offers no
+special leverage against it beyond the same quadratic factor, and the memory
+cost — not the raw operation count — is what dominates the attacker's bill.
+
+**What this is and is not.** This is not a claim that AES-256 is unbreakable, or
+that cryptography cannot advance. It is the deliberate, checkable position that
+Myrkr stands only on the primitive family widely expected to survive scalable
+quantum computers, and sizes it with margin. If that expectation ever changes,
+the fix is a larger symmetric key inside the same format — not a change of
+cryptographic species, because the species vulnerable to Shor was never here.
+
 ---
 
 ## 4. Exploit hardening — claim, mechanism, evidence
