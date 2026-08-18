@@ -194,15 +194,69 @@ followed by ciphertext, a 16-byte tag, and the inventory (§4.1):
 | 52 | 12 | container id (CSPRNG) - held the GCM nonce up to v3 |
 | 64 | 16 | key-check value = `SHA-256(key)[0..15]` |
 
-Minimum container = 96 bytes. Maximum plaintext = **2³⁹ − 256 bits =
-68,719,476,704 bytes** (32 bytes under 64 GiB) — AES-GCM's hard per-key ceiling,
-not a guideline: past it the 32-bit counter block wraps and the keystream
-repeats. Each **entry** is its own GCM stream (v4), so the ceiling bounds one
-entry, not the container — and with segments (v8, on since 1.0.83) one *segment*,
-so even a single entry past it becomes possible. `encrypt`'s pre-flight refuses
-the largest single input over the bound only when segmentation is off (§14.2).
-In archive mode the figure checked is the entry's tar framing, so
-per-entry framing counts toward it.
+A container is at least **96 bytes** — the header alone, holding nothing.
+
+The upper bound is set by AES-GCM, and it is a hard mathematical limit rather
+than a tuning choice. A single GCM stream can encrypt at most **`MAX_PLAINTEXT_SIZE`
+= 68,719,476,704 bytes**, which is 32 bytes short of 64 GiB (the NIST SP800-38D
+ceiling of 2³⁹ − 256 *bits* of plaintext per key). One byte past it, the cipher's
+internal 32-bit block counter wraps, the keystream repeats, and confidentiality
+is lost — so this is enforced, not advised.
+
+Two design choices keep that ceiling from limiting real use:
+
+- **Per-entry streams (v4).** Every entry in an archive is its own GCM stream, so
+  the 64 GiB limit bounds a *single entry*, never the container. An archive of any
+  total size is fine; only one individual file larger than the limit is a problem.
+- **Segments (v8, default since 1.0.83).** A large entry is sliced into segments,
+  each its own stream, so the limit bounds a *segment* rather than the entry.
+  With segments on, a single file of any size encrypts — field-proven on a
+  155.4 GB entry.
+
+The `encrypt` pre-flight therefore refuses an over-large input only when
+segmentation is off, and only when a *single* input exceeds the bound (§14.2). In
+archive mode it weighs each entry's tar framing, not the raw file, since the
+framing is what the stream actually seals.
+
+### The hard limits, in one place
+
+Every fixed ceiling in the format is collected here, because they are otherwise
+scattered across the sections that introduce them. Two things are true of all of
+them. First, **the crypto-derived ones are not preferences** — the GCM plaintext
+limit and the index-revision limit exist because crossing them would repeat a
+keystream or reuse a nonce, which silently destroys confidentiality; they are the
+reason several of these caps exist at all. Second, **every limit fails closed**:
+reaching one produces a refusal with a clear exit code, never a silent
+truncation, wrap, or corrupt output. A container that would have been unsafe is
+never written.
+
+| Limit | Value | Why it exists | At the limit |
+|---|---|---|---|
+| Plaintext per GCM stream | 68,719,476,704 B (~64 GiB, `MAX_PLAINTEXT_SIZE`) | AES-GCM's 32-bit block counter wraps past it and the keystream repeats | `encrypt` refuses an over-large single input when unsegmented; segments remove the limit in practice |
+| Segment size | 4 KiB … 32 GiB (`SEG_SHIFT_MIN`=12 … `SEG_SHIFT_MAX`=35; default 4 GiB) | Each segment must stay under the GCM ceiling by construction | An out-of-range `seg_shift` is rejected before anything derives from it (`seg_bytes_from_hdr`) |
+| Inventory size | 2047 MiB (`IDX_MAX_BYTES`, ≈17 M files at 85-char paths) | Kept just under 2³¹ so no `imm32` bound test can sign-extend and invert | `idx_add` fails the pack; nothing is dropped silently (§4.1) |
+| In-place rewrites of one container | 2³² − 1 (`IDX_REV_MAX`, ≈4.29 billion) | The index nonce is `IDX_NONCE_BASE + revision`; wrapping would reuse revision 0's nonce | `idx_rev_bump` refuses the rewrite; a repack draws a fresh key and resets it |
+| Parts in a volume set | 4096 (`VOL_MAX_PARTS`) | Bounds the reassembly bookkeeping | A split needing more parts is refused before writing (§14.4) |
+| Filesystem path | 32,767 UTF-16 units (`MAX_PATH_CHARS`) | The Windows extended-length maximum; where a file is read from or written to (§7) | A longer path is rejected, not truncated |
+| Stored entry name | 100 B per component, 256 B total (ustar name + prefix) | The POSIX ustar header fields; there is no long-name (PAX/LongLink) extension | The entry is refused (`EXIT_CORRUPT`, "name too long") rather than stored under a lossy name |
+| CLI file inputs | 255 (`MAX_ARGS` − 1) | Fixed argument-vector width | Extra inputs beyond the cap are not taken |
+| Password | 1024 UTF-8 bytes (`MAX_PASSWORD_BYTES`) | Fixed, locked secret buffer | A longer password is rejected at entry |
+
+The two path limits are different measurements and do not contradict. The
+**filesystem** limit governs where files live on disk — the absolute path Myrkr
+reads from or extracts to, up to the full Windows maximum (§7). The **stored
+entry name** is the path *relative to the encryption root* that ustar records
+inside the container, and ustar caps it at 100 bytes per component and 256 bytes
+overall. In normal use the relative names are short even when the absolute paths
+are long, so the ustar cap is rarely met; a genuinely deep tree *within* the
+encrypted set is the case that reaches it, and it is refused rather than
+truncated.
+
+The two nonce-driven caps — the GCM plaintext limit and the revision limit — are
+the load-bearing ones: they are not about resource use but about never letting the
+same keystream or nonce be produced twice under one key. The rest bound memory or
+bookkeeping, and are set generously enough that ordinary use never meets them (a
+2047 MiB *listing* alone is roughly seventeen million files).
 
 **Why the KDF parameters live in the header:** decrypt and unpack must
 reconstruct the exact key, so the cost parameters travel with the ciphertext.
@@ -887,6 +941,12 @@ the extended-length `\\?\` form internally. Combined with the `longPathAware`
 manifest, this supports paths up to the Windows maximum of 32,767 characters,
 far beyond the legacy 260-character `MAX_PATH`. Drive-absolute and UNC paths are
 handled directly; relative paths resolve via `GetFullPathNameW`.
+
+This is the limit on the **filesystem** path — where a file is read from or
+written to. It is distinct from the length of the entry name *stored inside* a
+container, which POSIX ustar caps at 100 bytes per component and 256 overall
+(§4, "The hard limits, in one place"); the two rarely collide because the stored
+names are relative to the encryption root.
 
 ---
 
