@@ -306,13 +306,24 @@ prog_render endp
 
 ; =============================================================================
 public progress_begin
+public progress_begin_rewrite
+progress_begin_rewrite proc
+    mov     r9d, 1
+    jmp     pb_enter
+progress_begin_rewrite endp
+
 progress_begin proc frame
+    xor     r9d, r9d
+pb_enter::
     FRAME_PROLOG 32
     mov     qword ptr [g_prog_total], rcx
     mov     qword ptr [g_prog_label], rdx
     mov     dword ptr [g_prog_lablen], r8d
     mov     qword ptr [g_prog_done], 0
+    test    r9d, r9d
+    jnz     @F
     mov     dword ptr [g_prog_abort], 0
+@@:
     ; reset the per-input counters (totals are filled by the caller afterwards)
     mov     qword ptr [g_cur_input], 0
     xor     r10, r10

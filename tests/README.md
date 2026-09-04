@@ -5,9 +5,14 @@ Full plan, rationale, scope, and results: [`docs/security-testing.md`](../docs/s
 
 | File | What it does |
 |------|--------------|
+| `listsurfacetest.ps1` | Verifies uniformly coloured unused list space in empty and populated windows after resizing and a theme notification; checks double buffering/full-row selection stay enabled and gridlines stay off. Works with release builds. Reproduced the original Explorer-theme seam before the fix. |
+| `cmdbartest.ps1` | Checks all six command-bar buttons: background matching, distinct hover/pressed states, disabled appearance, and visible labels. Uses only its own test window; works with release builds. |
 | `secsuite.py` | **Phase 1** — adversarial crypto/input tests against the shipping binary (GCM/WinZip-AES tamper matrices, salt/nonce uniqueness, path-traversal corpus, malformed-archive robustness, password policy). |
 | `redteam.py` | **Phase 2** — drives the instrumented build's `redteam <case>` command to fault-inject each memory-safety control and assert it fastfails with the exact expected code. Requires `build.cmd dbg`. |
 | `run.ps1` | Builds both variants and runs both phases end to end. |
+| `zipboundstest.py` | Targeted ZIP64 record-length and filename validation, including valid controls. Included in `run.ps1`; standalone: `python tests/zipboundstest.py bin/myrkr.exe` after `build testio`. |
+| `nonceforktest.py` | Regression for native-container edit nonce reuse. Requires `build testio`; included in `run.ps1`. Checks fresh-key add/delete across copied containers, rollback on duplicate/missing input or corruption, and stored/compressed readback. |
+| `nativeeditguitest.ps1` | Requires `build dbg`; included in `run.ps1`. Checks small GUI removal, the 100 MiB warning, declining it, and cancelling a native rewrite. |
 
 ```powershell
 # from the repo root, inside a vcvars64 shell:
@@ -19,12 +24,12 @@ minutes (it runs Argon2id hundreds of times).
 
 ## Feature tests
 
-Not part of `run.ps1` — each builds the binary variant it needs and is run on
-its own, and each leaves a **test** build in `bin\`, so rebuild release
-afterwards. They exist because five defects in the drag-and-drop work reached
-the user rather than a test: all five built clean and passed every checker, and
-what would have caught them was asserting what is *drawn* or reading the result
-back through something that owes the feature nothing.
+Native editing now uses full fresh-key rewrites. Tests expecting in-place
+ciphertext movement, ordinal/revision continuation, or random overwrite describe
+the superseded design and must be updated; round-trip and rollback invariants
+remain required. The default suite includes fresh-key backend and GUI warning/
+cancellation regressions.
+
 
 | File | What it asserts |
 |------|-----------------|

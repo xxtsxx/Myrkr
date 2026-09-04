@@ -1,5 +1,17 @@
 # Myrkr — Technical Manifest
 
+**Security update, 2026-09-04:** native add/removal now perform a full streaming
+re-encryption under a fresh random salt/key and container identity. The old
+in-place editing descriptions below are historical: local counters alone cannot
+prevent nonce reuse across copies or restored files. Source content is
+authenticated, a sibling encrypted replacement is flushed, and Windows
+`ReplaceFileW` commits it while preserving metadata/ACLs. Pre-commit failures
+and cancellation leave the original unchanged; commit failures retain and
+report the completed encrypted recovery file. GUI edits warn at 100 MiB.
+No plaintext is staged to disk; v6-v8 sources remain readable; edited output is
+v8, preserving compression and segmentation policy. Volume editing remains
+unsupported. See [the current design and tests](docs/AUDIT_2026-09-04.md).
+
 **myrkr.exe** is a self-contained Windows x64 console application that encrypts,
 decrypts, verifies, and archives files using AES-256-GCM with an Argon2id key
 derivation function. It is written entirely in 64-bit MASM assembly
@@ -93,7 +105,7 @@ Mitigation switches on the shipping link line:
 - The manifest (`myrkr.manifest`) declares `longPathAware` so the OS does not
   impose the legacy 260-character `MAX_PATH` cap (see §7).
 - A resource script (`myrkr.rc` → `rc.exe` → `obj\myrkr.res`, linked in) carries
-  a `VERSIONINFO` block — FileVersion/ProductVersion `1.1.0.0`, product name,
+  a `VERSIONINFO` block — FileVersion/ProductVersion `1.1.1.0`, product name,
   description, company and copyright (shown under Properties → Details) — and the
   application **icon** (`myrkr.ico`, a multi-resolution 16–256px set rendered from
   `logo/myrkr.svg`). Resource ID 1 makes it the shell file icon; `gui.asm` also

@@ -199,7 +199,7 @@ rt_v_heap proc frame
     test    rax, rax
     jz      rt_heap_done                     ; OOM: can't run the test
     mov     qword ptr [rbp-24], rax          ; save user ptr
-    mov     byte ptr [rax+64], 0AAh          ; overflow past user region -> rear canary
+    xor     byte ptr [rax+64], 1            ; guaranteed corruption, even if random byte is AAh
     mov     rcx, qword ptr [rbp-24]
     call    tagged_check                     ; rear-canary mismatch -> FF_HEAP_TAG
 rt_heap_done:

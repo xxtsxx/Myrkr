@@ -43,6 +43,15 @@ g_dfdir     dw MAX_PATH_CHARS dup (?)    ; scratch: directory of a path
 
 .code
 
+; Keep the source immutable to other writers while allowing our atomic rename.
+public file_open_rewrite_source
+file_open_rewrite_source proc frame
+    FRAME_PROLOG 64
+    WINCALL CreateFileW, rcx, 0C0000000h, 5, 0, OPEN_EXISTING, FILE_ATTR_NORMAL, 0
+    FRAME_EPILOG
+    ret
+file_open_rewrite_source endp
+
 ; =============================================================================
 ; disk_has_space(rcx = wide path on the target volume, rdx = required bytes)
 ;   -> eax: 0 = enough free, 1 = NOT enough, 2 = could not determine

@@ -1,5 +1,12 @@
 # Adding files to an existing archive
 
+**Superseded for native containers, 2026-09-04:** authenticated in-file counters
+do not make appending safe across copies/restored backups. Native edits now use
+a full streaming rewrite under a fresh key, with a large-file warning and
+cancellation before replacement. ZIP editing is unchanged. The following is a
+historical design record, not the current native writer.
+See [the security review](AUDIT_2026-09-04.md).
+
 **Status: the foundation is built and tested; the three pieces that use it are
 specified, not built.** Container format v6 landed in `785e117` — the trailer
 now records the next ordinal to issue, which is the thing that makes appending

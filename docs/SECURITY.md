@@ -1,5 +1,17 @@
 # Security and risk
 
+**Fixed in the working tree (2026-09-04): native edits now fully re-encrypt.**
+The previous in-place writer reused AES-GCM nonces across copied/restored
+containers. Add and removal now authenticate the source and write a complete
+replacement with a fresh random salt, derived key, and container identity.
+Plaintext is streamed in memory, never staged to disk. A sibling encrypted file
+is flushed before replacement; cancellation or pre-commit failure leaves the
+original unchanged. If Windows fails during replacement, the completed encrypted
+temporary file is retained and its recovery path is reported.
+The GUI warns at 100 MiB (container size, decoded contents, or an added input).
+Volume sets still cannot be edited. This does not repair exposure from old
+binaries. See [the review and regression tests](AUDIT_2026-09-04.md).
+
 What Myrkr protects, what it does not, and how each claim was checked.
 
 This is the document to read first. It is written to be understood without

@@ -508,24 +508,36 @@ z64_loop:
     ja      z64_done
     movzx   eax, word ptr [rcx+r9]
     movzx   r8d, word ptr [rcx+r9+2]
+    add     r10, r8                       ; complete extra record must fit
+    cmp     r10, rdx
+    ja      eze_corrupt
     cmp     eax, 1
     jne     z64_next
     lea     r11, [rcx+r9+4]
+    mov     r10, r8                       ; bytes left in this ZIP64 record
     xor     r8, r8
     cmp     dword ptr [rbp-40], 0FFFFFFFFh
     jne     @F
+    cmp     r10, 8
+    jb      eze_corrupt
+    sub     r10, 8
     mov     rax, qword ptr [r11+r8]
     mov     qword ptr [rbp-40], rax
     add     r8, 8
 @@:
     cmp     dword ptr [rbp-32], 0FFFFFFFFh
     jne     @F
+    cmp     r10, 8
+    jb      eze_corrupt
+    sub     r10, 8
     mov     rax, qword ptr [r11+r8]
     mov     qword ptr [rbp-32], rax
     add     r8, 8
 @@:
     cmp     dword ptr [rbp-48], 0FFFFFFFFh
     jne     z64_done
+    cmp     r10, 8
+    jb      eze_corrupt
     mov     rax, qword ptr [r11+r8]
     mov     qword ptr [rbp-48], rax
     jmp     z64_done
@@ -539,15 +551,15 @@ z64_done:
     add     r10, 46
     mov     r8, qword ptr [rbp-96]
     cmp     r8, 4094
-    jbe     @F
-    mov     r8, 4094
-@@:
+    ja      eze_corrupt                    ; never extract under a shortened name
     lea     r11, [uz_name8]
     xor     r9, r9
 ne_cpy:
     cmp     r9, r8
     jae     ne_cpd
     mov     al, byte ptr [r10+r9]
+    test    al, al
+    jz      eze_corrupt                    ; ZIP names are length-delimited
     mov     byte ptr [r11+r9], al
     inc     r9
     jmp     ne_cpy

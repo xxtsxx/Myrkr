@@ -6,6 +6,39 @@ ISO-8601 (`YYYY-MM-DD`).
 This file is maintained by hand alongside every change; each entry summarizes
 what changed and why, not a raw commit dump.
 
+## [1.1.1] - 2026-09-05
+
+- Clarify GUI workflows: Create .mrk / Create ZIP for new archives, Extract all /
+  Extract selected for open archives, Delete for saved entries versus Remove
+  for staged inputs. Explain immediate saving in status/tooltips. Use Close
+  while idle and Cancel while working; honor uncancellable ZIP deletion for
+  keyboard/command-bar shortcuts too. Cover labels in GUI regressions.
+
+- Remove vertical column seams from unused list space by disabling Explorer
+  visual styles on the list control only. Remove the old per-row background
+  overpaint; retain native full-row selection and double buffering. Add empty/
+  populated-list pixel regressions across resizing and theme notifications.
+- Blend command-bar buttons into the window background at rest; retain rounded
+  hover/pressed feedback and mute disabled commands. Fix overlapping glyph-draw
+  locals that could corrupt label handles. Add six-button paint regressions.
+- Reject ZIP64 extra records whose declared payload cannot hold the size and
+  offset fields being read, or whose record extends beyond the extra area.
+- Reject ZIP entry names containing NUL bytes or exceeding the extraction name
+  buffer instead of silently extracting under a shortened name.
+- Add deterministic ZIP parser regressions to the security-suite runner.
+- Replace native in-place add/removal with full streaming re-encryption under a
+  fresh salt, key, and container identity. Copied/restored containers no longer
+  share an edit nonce namespace. Preserve compression, KDF costs, and segmentation.
+- Keep plaintext in memory; flush a CREATE_NEW encrypted sibling before replacing
+  the original. Cancellation/pre-commit failures leave the original unchanged;
+  replacement failures retain an encrypted recovery file and report its path.
+- Warn before GUI rewrites at 100 MiB of container/content/added-input size.
+  Native removals support cancellation, including requests during preflight.
+- Add copied-container fresh-key, rollback, corruption, readback, and GUI warning/
+  cancellation regressions. Earlier exposure from old binaries cannot be repaired.
+- Make the heap-canary fault-injection test flip a bit instead of writing a
+  fixed byte that can already match the random canary (a 1-in-256 false failure).
+
 ## [1.1.0] - 2026-08-18
 
 First public release. Myrkr was developed privately through a long 1.0.x

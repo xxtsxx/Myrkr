@@ -161,12 +161,14 @@ Give it a `.mrk` file instead — drop it on the window, or double-click it — 
 the window opens in decrypt mode: it lists what is inside, and **Decrypt** puts
 it back.
 
-An open container is a working view, not just a listing. You can:
+You can **drag files out of an open container** into Explorer, and they are
+decrypted where you drop them.
 
-- **drag files out of it** into Explorer, and they are decrypted where you drop
-  them;
-- **drop files into it** to add them;
-- **select rows and Remove** to take them out.
+**Native edits fully re-encrypt the container.** Adding or removing files writes
+a complete replacement under a fresh encryption key, so independently edited
+copies cannot reuse the original key's nonces. Plaintext stays in memory.
+Large edits (100 MiB or more) warn about time and extra disk space first;
+you can cancel before replacement without changing the original.
 
 ### From Explorer
 
@@ -232,8 +234,8 @@ whole set is reassembled. The set is found from the part numbers inside the
 files, not from their names, so which one you pick makes no difference.
 
 The size is a **ceiling, not a request for a set**: a container that fits inside
-it is written as one ordinary file, with no part number and no restriction on
-editing it. Setting 100 MB and encrypting 50 MB gives you `thing.mrk`.
+it is written as one ordinary file, with no part number. Setting 100 MB and
+encrypting 50 MB gives you `thing.mrk`. Volume sets cannot be edited; extract them and encrypt a new set to make changes.
 
 A set is *not* a different kind of encryption — it is the same container with
 cuts in it, so it has exactly the same integrity properties. Three things are

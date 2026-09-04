@@ -10,8 +10,8 @@
 2 ICON "logo\\redacted.ico"     /* .mrk container file-type icon        -> ,1 */
 
 1 VERSIONINFO
- FILEVERSION    1,1,0,0
- PRODUCTVERSION 1,1,0,0
+ FILEVERSION    1,1,1,0
+ PRODUCTVERSION 1,1,1,0
  FILEFLAGSMASK  0x3fL
  FILEFLAGS      0x0L
  FILEOS         0x40004L            /* VOS_NT_WINDOWS32 */
@@ -24,12 +24,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName",      "Thomas Smistad"
             VALUE "FileDescription",  "Myrkr - AES-256-GCM + Argon2id file encryption"
-            VALUE "FileVersion",      "1.1.0.0"
+            VALUE "FileVersion",      "1.1.1.0"
             VALUE "InternalName",     "myrkr"
             VALUE "LegalCopyright",   "Copyright (C) 2026 Thomas Smistad"
             VALUE "OriginalFilename", "myrkr.exe"
             VALUE "ProductName",      "Myrkr"
-            VALUE "ProductVersion",   "1.1.0.0"
+            VALUE "ProductVersion",   "1.1.1.0"
         END
     END
     BLOCK "VarFileInfo"

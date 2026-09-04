@@ -49,6 +49,14 @@ Write-Host "=== Phase 2: instrumented build (redteam fault injection) ==="
 Build "dbg strict"; Copy-Item $exe $dbg -Force
 python (Join-Path $PSScriptRoot "redteam.py") $dbg
 $p2 = $LASTEXITCODE
+python (Join-Path $PSScriptRoot "nonceforktest.py") $dbg --segments
+$p2 = $p2 -bor $LASTEXITCODE
+& pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot "nativeeditguitest.ps1")
+$p2 = $p2 -bor $LASTEXITCODE
+& pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot "cmdbartest.ps1")
+$p2 = $p2 -bor $LASTEXITCODE
+& pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot "listsurfacetest.ps1")
+$p2 = $p2 -bor $LASTEXITCODE
 
 Write-Host "`n=== Phase 1: testio build (adversarial crypto/input tests) ==="
 Build "testio strict"
@@ -56,6 +64,10 @@ $wd = Join-Path $env:TEMP "myrkr_sec_run"
 Remove-Item -Recurse -Force $wd -EA SilentlyContinue
 python (Join-Path $PSScriptRoot "secsuite.py") $exe $wd
 $p1 = $LASTEXITCODE
+python (Join-Path $PSScriptRoot "zipboundstest.py") $exe
+$p1 = $p1 -bor $LASTEXITCODE
+python (Join-Path $PSScriptRoot "nonceforktest.py") $exe
+$p1 = $p1 -bor $LASTEXITCODE
 
 Write-Host "`n=== Restore: shipping build ==="
 # "strict release", not "strict": a shipping build is the RELEASE build, and the

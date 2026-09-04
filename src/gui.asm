@@ -29,6 +29,8 @@
 ; =============================================================================
 
 include macros.inc
+externdef g_temppath:word
+externdef g_prog_abort:dword
 
 ; ---- our runtime (shared with the CLI build) --------------------------------
 extern cpu_gate:proc
@@ -558,7 +560,6 @@ NMH_idFrom          equ 8
 NMH_code            equ 16
 NMCD_dwDrawStage    equ 24
 NMCD_hdc            equ 32
-NMCD_rc             equ 40                  ; RECT: the row's bounds
 NMCD_dwItemSpec     equ 56
 NMLVCD_iSubItem     equ 88
 CDDS_PREPAINT       equ 00001h
@@ -918,7 +919,6 @@ MK_LBUTTON          equ 1
 ST_OWNERSTAT        equ WS_CHILD or WS_VISIBLE or SS_OWNERDRAW   ; owner-draw static (slider)
 CLR_TRACK           equ 000332f2bh           ; slider track (off) grey
 CLR_HINT            equ 0007a7a7ah           ; muted section-header grey
-CLR_MARGIN          equ 000101010h           ; left margin "hint grey" #101010
 GLYPH_INK           equ 000B0B0B0h           ; sidebar glyph ink (light grey)
 ; ---- glyph buttons (ported from vordr's "ghost button", see its theme.asm) ---
 ; A frameless button that paints one font glyph plus a rounded hover halo.  The
@@ -929,7 +929,7 @@ GLYPH_INK           equ 000B0B0B0h           ; sidebar glyph ink (light grey)
 ; reader, so the accessible name has to come from somewhere.
 GWLP_USERDATA       equ -21
 GLYPH_HOVER_BIT     equ 00100h
-CLR_GLYPH_HOVER     equ 0002C2C2Ch           ; halo: margin blended ~10% toward the ink
+CLR_GLYPH_HOVER     equ 0002C2C2Ch           ; subtle command hover halo #2C2C2C
 WM_MOUSELEAVE       equ 002A3h
 ; The scrollbar strip is NON-client while the bar is shown and client while it
 ; is hidden, so the hover has to be tracked on both sides of that line or it
@@ -998,6 +998,7 @@ TTS_NOPREFIX        equ 00002h
 TTF_IDISHWND        equ 00001h
 TTF_SUBCLASS        equ 00010h
 TTM_ADDTOOLW        equ 00432h               ; WM_USER + 50
+TTM_UPDATETIPTEXTW  equ 00439h               ; WM_USER + 57
 ; ---- Format: a two-segment picker -------------------------------------------
 ; The chip it replaces showed only the CURRENT format, so the other choice - and
 ; the fact that there WAS a choice - was invisible until you clicked it and
@@ -1250,19 +1251,22 @@ WSTR cls_scrollbar, <SCROLLBAR>
 WSTR t_add_fail,    <Could not add to the archive>
 WSTR m_add_fail,    <Nothing was added and the archive is unchanged. It may be open in another program, or on a drive with no room left.>
 WSTR m_add_dup,     <One of those is already in the archive, under the same name. Nothing was added and the archive is unchanged.>
-; The CLI prints e_vol_edit for this, which the window never shows - so without
-; its own sentence a split container reported "it may be open in another program,
-; or on a drive with no room left", which is three wrong guesses at once.
-WSTR t_vol_edit,    <This container is split across volumes>
+; Native editing is refused by pack.asm before writes. Explain the remedy in
+; the window too; EXIT_UNSUPPORTED no longer means only a split volume set.
+WSTR t_vol_edit,    <Volume sets cannot be edited>
 ; One line: WSTR is a forc over the literal, so it has no way to carry a line
 ; break - every other message here is one paragraph for the same reason.
-WSTR m_vol_edit,    <A volume set cannot be changed once it is written. Nothing was added or removed, and every part is exactly as it was. You can still open and extract it - to change what is in it, extract it and encrypt the result again.>
+WSTR m_vol_edit,    <Extract the volume set, make your changes, then encrypt a new container.>
 WSTR t_excl_full,   <Too many exclusions>
 WSTR m_excl_full,   <Myrkr cannot track any more removed items. Clear the list and start again, or add the folders you want instead of removing what you do not.>
 WSTR cls_tooltip,   <tooltips_class32>
 WSTR s_tip_addfiles,  <Add files to the list>
 WSTR s_tip_addfolder, <Add a folder to the list>
-WSTR s_tip_remove,    <Remove the selected items from the list>
+WSTR s_tip_remove,    <Remove from the list. Source files are unchanged.>
+WSTR s_tip_archive_files, <Add files to this archive. Changes are saved immediately.>
+WSTR s_tip_archive_folder, <Add a folder to this archive. Changes are saved immediately.>
+WSTR s_tip_delete, <Delete selected entries from this archive. Saved immediately; no undo.>
+WSTR s_tip_extract, <Copy entries out of the archive. The archive is unchanged.>
 WSTR s_tip_clear,     <Remove every item from the list>
 WSTR s_tip_settings,  <Settings>
 WSTR s_change,  <Change...>
@@ -1272,14 +1276,14 @@ WSTR s_ph_pass, <Password>
 WSTR s_ph_conf, <Confirm>
 WSTR s_show,    <Show>
 WSTR s_hide,    <Hide>
-WSTR s_exit,    <Exit>
-WSTR s_encrypt, <Encrypt>
-WSTR s_execute, <Archive>             ; action label for the no-password zip case
+WSTR s_exit,    <Close>
+WSTR s_encrypt, <Create .mrk>
+WSTR s_execute, <Create ZIP>
 WSTR s_scan_pre, <Scanning... >       ; live scan-status prefix
 WSTR s_files_mid, < files, >          ; between the file count and the total size
 WSTR s_folders_mid, < folders, >       ; only when there are any - see fmt_summary
 WSTR s_empty, <>                      ; empty prefix -> final summary "N files, X"
-WSTR s_decrypt, <Decrypt>
+WSTR s_decrypt, <Extract>
 WSTR lg_op_enc, <encrypt>               ; event-log operation names (lowercase)
 WSTR lg_op_dec, <decrypt>
 WSTR s_comp_on,  <Compress: On>
@@ -1499,9 +1503,12 @@ SETROW_COUNT        equ 9
 ;          300 MiB is honoured and simply sits between two stops.
 ;   unit   a suffix drawn after the number, so "512" reads as "512 MiB"
 WSTR s_ready,   <Ready>
+WSTR s_edits_saved, <Edits save immediately>
+WSTR s_delete, <Delete>
 WSTR s_working, <Working...>
-WSTR s_pfx_enc, <Encrypting  >
-WSTR s_pfx_dec, <Decrypting  >
+WSTR s_pfx_enc, <Creating  >
+WSTR s_pfx_dec, <Extracting  >
+WSTR s_pfx_save, <Saving changes  >
 WSTR cls_static,   <STATIC>
 WSTR cls_edit,     <EDIT>
 WSTR cls_button,   <BUTTON>
@@ -1557,7 +1564,7 @@ WSTR t_about,     <About Myrkr>
 ; belongs to the no-args window that this replaced.  This is the short version:
 ; enough to identify the build, with the repo one click away on the version
 ; label at the bottom left of the main window.
-WSTR m_about_body, <Myrkr v1.1.0 - AES-256-GCM + Argon2id file encryption. Drop files or folders onto the window, or use Add files. The version label at the bottom left opens the project page.>
+WSTR m_about_body, <Myrkr v1.1.1 - AES-256-GCM + Argon2id file encryption. Drop files or folders onto the window, or use Add files. The version label at the bottom left opens the project page.>
 WSTR m_nocpu,   <This CPU lacks the required AES-NI / PCLMULQDQ instructions.>
 CSTR c_nocpu,   "error: CPU lacks required features (AES-NI, PCLMULQDQ, SSE4.1)",13,10
 WSTR m_nopass,  <Please enter a password.>
@@ -1565,6 +1572,9 @@ WSTR m_badpass, <The password contains invalid characters or is too long.>
 WSTR m_policy,  <Password rejected: requires at least 12 characters and 3 of 4 classes (upper lower digit symbol).>
 WSTR m_nodest,  <Please choose a destination.>
 WSTR m_overwrite, <The output already exists. Overwrite it?>
+WSTR m_rewrite_fail, <The full re-encryption could not be completed. Check the password, file integrity, free space, and permissions. The original container was not replaced.>
+WSTR t_rewrite_recovery, <Replacement failed - keep this encrypted recovery file>
+WSTR m_reencrypt, <This edit rewrites the entire container with a fresh encryption key. Large files may take a while and need space for a second container. You can cancel before replacement; the original stays unchanged. Continue?>
 WSTR m_slow_remove, <Removing from an archive this large means moving a lot of data, which will take a while. The window will not respond until it finishes, and nothing is changed if you stop now. Remove the selected items?>
 WSTR t_slow, <Myrkr - this will take a while>
 WSTR m_zip_norw, <This archive uses ZIP features Myrkr will not rewrite: entries whose sizes follow their data, or ZIP64 offsets. Rewriting one of those wrongly would destroy it, so nothing was changed.>
@@ -1595,7 +1605,7 @@ WSTR s_ab_name,    <Myrkr>                  ; heading beside the icon
 ; the VERSIONINFO resource cheaply from here, so it is kept in step by hand:
 ; bump this WHENEVER myrkr.rc's FILEVERSION changes.  tools/constcheck.py cannot
 ; catch the drift - one side is an .rc, not an equ.
-WSTR s_ab_ver,     <Version 1.1.0.0>        ; version line (accent)
+WSTR s_ab_ver,     <Version 1.1.1.0>        ; version line (accent)
 WSTR s_ab_tag,     <AES-256-GCM authenticated encryption  -  Argon2id KDF>
 WSTR s_ab_foot,    <github.com/xxtsxx/Myrkr>
 WSTR s_close,      <Close>
@@ -1680,8 +1690,8 @@ ab_body:
 WSTR s_ext_agcm, <.mrk>
 WSTR s_ext_zip,  <.zip>
 WSTR s_extract,  <Extract>
+WSTR s_extract_all, <Extract all>
 WSTR s_extract_sel, <Extract selected>
-WSTR s_decrypt_sel, <Decrypt selected>
 WSTR s_ext_dec,  <.dec>
 align 2
 ; one-entry accelerator table: ESC -> ID_CANCEL (Exit).  ACCEL = {BYTE fVirt,
@@ -6660,20 +6670,12 @@ create_controls_enc proc
     ; No scrollbar CONTROL: the bar is drawn into the list's own back buffer by
     ; draw_lv_thumb.  g_sbw is still SM_CXVSCROLL because that is the width of
     ; the strip you reach for, whatever is drawn inside it.
-    ; Dark scrollbar, in two halves.  DarkMode_Explorer is the theme Explorer
-    ; uses for its own dark panes, but naming it is only half the request: the
-    ; theme resolves dark only for a window that has been opted in, on a process
-    ; that has declared the preference.  enable_dark_mode did the process; this
-    ; does the window, and it has to happen before SetWindowTheme opens the
-    ; theme handle.  Without the pair, the bar stayed the light themed one.
-    mov     rcx, qword ptr [g_hlist]
-    call    dark_mode_window
-    WINCALL SetWindowTheme, qword ptr [g_hlist], addr s_theme_dark, 0
-    ; A theme change does not repaint the NON-CLIENT area on its own, and the
-    ; scrollbar lives there - so the first paint showed the classic 3D bar until
-    ; something else happened to recalculate the frame.  SWP_FRAMECHANGED
-    ; (0020h) forces that now, with NOMOVE|NOSIZE|NOZORDER|NOACTIVATE (0037h).
-    WINCALL SetWindowPos, qword ptr [g_hlist], 0, 0, 0, 0, 0, 0037h
+    ; The Explorer theme draws column seams even with LVS_EX_GRIDLINES off.
+    ; Disable visual styles for this control only: its native background/text
+    ; colours then cover unused space as well as rows. Empty strings (not NULL)
+    ; persist across WM_THEMECHANGED. Keep comctl32 v6 and double buffering;
+    ; the scrollbar/drop overlay are our own and need no Explorer theme.
+    WINCALL SetWindowTheme, qword ptr [g_hlist], addr s_empty, addr s_empty
     ; full-row select + double-buffer (reduces flicker on owner-drawn bars)
     WINCALL SendMessageW, qword ptr [g_hlist], LVM_SETEXTENDEDLISTVIEWSTYLE, 0, <LVS_EX_FULLROWSELECT or LVS_EX_DOUBLEBUFFER>
     ; dark listview: dark background + white text
@@ -7103,12 +7105,21 @@ adapt_for_container proc frame
     ; zeros are still never acted on, and the command is no longer missing from
     ; half the archives it makes sense for.
 afc_action:
-    lea     rdx, [s_decrypt]
-    cmp     dword ptr [g_is_zip], 0
-    je      @F
-    lea     rdx, [s_extract]
-@@:
-    WINCALL SetWindowTextW, qword ptr [g_haction], rdx
+    WINCALL SetWindowTextW, qword ptr [g_haction], addr s_extract_all
+    WINCALL SetWindowTextW, qword ptr [g_hcmdremove], addr s_delete
+    WINCALL SetWindowTextW, qword ptr [g_hstatus], addr s_edits_saved
+    mov     rcx, qword ptr [g_haddfiles]
+    lea     rdx, [s_tip_archive_files]
+    call    tip_add
+    mov     rcx, qword ptr [g_haddfolder]
+    lea     rdx, [s_tip_archive_folder]
+    call    tip_add
+    mov     rcx, qword ptr [g_hcmdremove]
+    lea     rdx, [s_tip_delete]
+    call    tip_add
+    mov     rcx, qword ptr [g_haction]
+    lea     rdx, [s_tip_extract]
+    call    tip_add
     ; create_controls_enc disables the action until the password meets policy.
     ; That is an ENCRYPT rule - there is no policy to meet when decrypting, and
     ; the password has already been given by the time this window is shown.
@@ -7461,14 +7472,15 @@ gs_ret:
 glyph_subclass endp
 
 ; -----------------------------------------------------------------------------
-; draw_glyph_btn(rcx = DRAWITEMSTRUCT*) - margin fill, hover halo, then the
-; glyph centred.  One routine for every sidebar button; which glyph it paints
+; draw_glyph_btn(rcx = DRAWITEMSTRUCT*) - window-matched fill, interaction halo,
+; then glyph/label. All attached glyph controls now live in the command bar;
+; which glyph it paints
 ; comes from the control's own userdata.
 ; -----------------------------------------------------------------------------
 draw_glyph_btn proc frame
-    FRAME_PROLOG 160
+    FRAME_PROLOG 208
     mov     qword ptr [rbp-24], rcx
-    mov     edx, CLR_MARGIN
+    mov     edx, CLR_DARK
     call    fill_di
     mov     qword ptr [rbp-32], rax           ; hdc
     mov     rcx, qword ptr [rbp-24]
@@ -7483,11 +7495,23 @@ draw_glyph_btn proc frame
     mov     rax, qword ptr [rcx+DI_HWNDITEM]
     mov     qword ptr [rbp-40], rax           ; the control itself
     WINCALL GetWindowLongPtrW, qword ptr [rbp-40], GWLP_USERDATA
-    mov     dword ptr [rbp-44], eax           ; userdata
-    test    eax, GLYPH_HOVER_BIT
+    mov     dword ptr [rbp-48], eax           ; userdata, separate from HWND[-40]
+    WINCALL IsWindowEnabled, qword ptr [rbp-40]
+    mov     dword ptr [rbp-120], eax
+    test    eax, eax
+    jz      dgb_glyph
+    mov     rcx, qword ptr [rbp-24]
+    test    dword ptr [rcx+DI_ITEMSTATE], ODS_SELECTED
+    jnz     dgb_pressed
+    test    dword ptr [rbp-48], GLYPH_HOVER_BIT
     jz      dgb_glyph
     ; rounded hover halo behind the glyph, borderless (NULL_PEN)
-    WINCALL CreateSolidBrush, CLR_GLYPH_HOVER
+    mov     ecx, CLR_GLYPH_HOVER
+    jmp     dgb_halo
+dgb_pressed:
+    mov     ecx, CLR_BTN_DARK
+dgb_halo:
+    call    CreateSolidBrush
     mov     qword ptr [rbp-56], rax
     WINCALL GetStockObject, 8                 ; NULL_PEN
     WINCALL SelectObject, qword ptr [rbp-32], rax
@@ -7500,7 +7524,7 @@ draw_glyph_btn proc frame
     WINCALL SelectObject, qword ptr [rbp-32], qword ptr [rbp-88]
     WINCALL DeleteObject, qword ptr [rbp-56]
 dgb_glyph:
-    mov     eax, dword ptr [rbp-44]
+    mov     eax, dword ptr [rbp-48]
     shr     eax, 16
     movzx   eax, ax                           ; codepoint
     test    eax, eax
@@ -7509,7 +7533,12 @@ dgb_glyph:
     mov     word ptr [g_glyphbuf+2], 0
     mov     dword ptr [rbp-92], eax           ; SetTextColor clobbers rax
     WINCALL SetBkMode, qword ptr [rbp-32], 1  ; TRANSPARENT
-    WINCALL SetTextColor, qword ptr [rbp-32], GLYPH_INK
+    mov     edx, GLYPH_INK
+    cmp     dword ptr [rbp-120], 0
+    jne     @F
+    mov     edx, CLR_HINT
+@@:
+    WINCALL SetTextColor, qword ptr [rbp-32], edx
     mov     eax, dword ptr [rbp-92]
     cmp     eax, 0E000h                       ; PUA -> icon font, else symbol font
     jb      dgb_sym
@@ -7521,7 +7550,7 @@ dgb_draw:
     mov     qword ptr [rbp-96], rax           ; old font
     ; Bare glyph (sidebar) is centred; a labelled command (command bar) puts the
     ; glyph in a fixed left gutter so the labels below it line up.
-    test    dword ptr [rbp-44], GLYPH_LABEL_BIT
+    test    dword ptr [rbp-48], GLYPH_LABEL_BIT
     jnz     dgb_labelled
     WINCALL DrawTextW, qword ptr [rbp-32], addr g_glyphbuf, -1, addr rbp-80, \
             <DT_CENTER or DT_VCENTER or DT_SINGLELINE>
@@ -7542,7 +7571,12 @@ dgb_labelled:
     ; label in the UI font, from the window text (which is also the MSAA name)
     WINCALL SelectObject, qword ptr [rbp-32], qword ptr [g_hfont]
     WINCALL GetWindowTextW, qword ptr [rbp-40], addr g_lblbuf, 64
-    WINCALL SetTextColor, qword ptr [rbp-32], CLR_WHITE
+    mov     edx, CLR_WHITE
+    cmp     dword ptr [rbp-120], 0
+    jne     @F
+    mov     edx, CLR_HINT
+@@:
+    WINCALL SetTextColor, qword ptr [rbp-32], edx
     mov     eax, dword ptr [rbp-80]
     add     eax, CMD_LABEL_X
     mov     dword ptr [rbp-112], eax
@@ -7648,6 +7682,8 @@ ta_zero:
     mov     rax, qword ptr [rbp-32]
     mov     qword ptr [g_ti+48], rax             ; lpszText
     WINCALL SendMessageW, qword ptr [g_htip], TTM_ADDTOOLW, 0, addr g_ti
+    ; Existing controls change meaning when a staged list becomes an archive.
+    WINCALL SendMessageW, qword ptr [g_htip], TTM_UPDATETIPTEXTW, 0, addr g_ti
 ta_done:
     FRAME_EPILOG
     ret
@@ -10680,6 +10716,16 @@ container_add_run proc frame
 car_fromsel:
     call    container_prefix_from_selection
 car_haveprefix:
+    cmp     dword ptr [g_is_zip], 0
+    jne     car_confirmed
+    mov     ecx, 1
+    call    confirm_slow_remove
+    test    eax, eax
+    jnz     car_confirmed
+    mov     rax, qword ptr [rbp-16]
+    mov     qword ptr [g_poscount], rax
+    jmp     car_ret
+car_confirmed:
     lea     rax, [g_filepath_w]
     mov     qword ptr [g_cfg_in], rax
     ; g_poscount is NOT put back here - the worker is about to walk
@@ -10726,17 +10772,12 @@ container_update_action proc
     sub     rsp, 64
     cmp     dword ptr [g_container], 0
     je      cua_ret
+    cmp     dword ptr [g_running], 0
+    jne     cua_ret
     WINCALL SendMessageW, qword ptr [g_hlist], LVM_GETSELECTEDCOUNT, 0, 0
     mov     qword ptr [rbp-8], rax
-    lea     rdx, [s_decrypt]
-    cmp     dword ptr [g_is_zip], 0
-    je      @F
-    lea     rdx, [s_extract]
-@@:
+    lea     rdx, [s_extract_all]
     cmp     qword ptr [rbp-8], 0
-    je      cua_set
-    lea     rdx, [s_decrypt_sel]
-    cmp     dword ptr [g_is_zip], 0
     je      cua_set
     lea     rdx, [s_extract_sel]
 cua_set:
@@ -10751,24 +10792,49 @@ container_update_action endp
 ; =============================================================================
 ; confirm_slow_remove -> eax = 1 go ahead, 0 the user stopped.
 ;
-; Removal is proportional to what follows the hole - the survivors are moved
-; down over it - so on a large archive it is a long synchronous write on the UI
-; thread, and the window stops answering.  Being told that afterwards is no use,
-; so it is said first, with a way out.
-;
-; The threshold is a size, not a guess about the disk: 100 MiB is where the
-; pause stops being instant on anything.  Below it the question would be noise,
-; and a dialog people learn to click through is worse than no dialog.
-;
-; Nothing has been written when this is asked, so cancelling costs nothing and
-; the message says so.
-; =============================================================================
+; Large edits need a complete replacement and extra disk space. Ask before
+; the worker starts; cancellation before commit leaves the source unchanged.
 SLOW_REMOVE_BYTES   equ 6400000h                  ; 100 MiB
 
 confirm_slow_remove proc
     push    rbp
     mov     rbp, rsp
     sub     rsp, 80
+    mov     dword ptr [rbp-16], ecx
+    cmp     dword ptr [g_is_zip], 0
+    jne     csr_disk
+    ; Compressed containers may be small on disk but expensive to rewrite.
+    xor     r9d, r9d
+    xor     r8d, r8d
+csr_inventory:
+    cmp     r9, qword ptr [g_idxlen]
+    jae     csr_inputs
+    mov     r10, qword ptr [g_idxptr]
+    add     r10, r9
+    add     r8, qword ptr [r10+IDXE_size]
+    jc      csr_ask
+    cmp     r8, SLOW_REMOVE_BYTES
+    jae     csr_ask
+    mov     eax, dword ptr [r10+IDXE_namelen]
+    add     r9, IDXE_FIXED
+    add     r9, rax
+    jmp     csr_inventory
+csr_inputs:
+    cmp     dword ptr [rbp-16], 0
+    je      csr_disk
+    mov     qword ptr [rbp-24], 1
+csr_input:
+    mov     rax, qword ptr [rbp-24]
+    cmp     rax, qword ptr [g_poscount]
+    jae     csr_disk
+    lea     r11, [g_positionals]
+    mov     rcx, qword ptr [r11+rax*8]
+    call    input_size
+    cmp     rax, SLOW_REMOVE_BYTES
+    jae     csr_ask
+    inc     qword ptr [rbp-24]
+    jmp     csr_input
+csr_disk:
     WINCALL GetFileAttributesExW, addr g_filepath_w, 0, addr g_fad
     test    eax, eax
     jz      csr_yes                               ; size unknown: do not invent a warning
@@ -10780,6 +10846,10 @@ confirm_slow_remove proc
     jb      csr_yes
 csr_ask:
     lea     rcx, [m_slow_remove]
+    cmp     dword ptr [g_is_zip], 0
+    jne     @F
+    lea     rcx, [m_reencrypt]
+@@:
     lea     rdx, [t_slow]
     mov     r8d, MB_OKCANCEL or MB_ICONWARNING
     call    mbox
@@ -10877,17 +10947,14 @@ container_remove_selected proc frame
     ; nothing selected: no question, and nothing to do
     cmp     qword ptr [rbp-32], 0
     je      crs_wipekey
+    xor     ecx, ecx
     call    confirm_slow_remove
     test    eax, eax
     jz      crs_wipekey
 crs_marked:
     cmp     qword ptr [rbp-32], 0
     je      crs_wipekey                     ; nothing selected that is in there
-    ; One removal, whatever the size: the entry is overwritten where it lies and
-    ; the gap closed.  There used to be a question here - rewrite the container
-    ; or overwrite in place - and it existed because rewriting meant decrypting
-    ; and re-encrypting everything.  Closing the gap is a byte copy now, so there
-    ; is nothing to weigh and nothing to ask.
+    ; Both size classes use the same fresh-key, cancellable rewrite.
     mov     dword ptr [g_wt_job], 2
     call    enter_running
 crs_ret:
@@ -10924,6 +10991,7 @@ crs_zip:
     mov     qword ptr [rbp-32], rax
     cmp     qword ptr [rbp-32], 0
     je      crs_ret
+    xor     ecx, ecx
     call    confirm_slow_remove
     test    eax, eax
     jz      crs_ret                         ; stopped: the next removal re-reads
@@ -11024,6 +11092,8 @@ cl_listed:
     lea     rcx, [s_empty]
     call    fmt_summary
     WINCALL SetWindowTextW, qword ptr [g_hscan], addr g_summbuf
+    call    container_update_action
+    WINCALL SetWindowTextW, qword ptr [g_hstatus], addr s_edits_saved
     xor     eax, eax
     FRAME_EPILOG
     ret
@@ -11486,6 +11556,7 @@ enter_running proc
     sub     rsp, 64
     mov     dword ptr [g_running], 1
     mov     dword ptr [g_cancelled], 0
+    mov     dword ptr [g_prog_abort], 0 ; reset before publishing the worker
     mov     qword ptr [g_prog_total], 0
     mov     qword ptr [g_prog_done], 0
     ; The action log covers ONE operation.  Started here, on the UI thread and
@@ -11507,17 +11578,17 @@ enter_running proc
     WINCALL EnableWindow, qword ptr [g_hchange], 0
 @@:
     ; enable cancel, show progress
+    WINCALL SetWindowTextW, qword ptr [g_hcancel], addr s_mb_cancel
     WINCALL EnableWindow, qword ptr [g_hcancel], 1
     mov     dword ptr [g_prog_pct], 0
     WINCALL ShowWindow, qword ptr [g_hprog], SW_SHOW
     ; An ADD (job 1) now totals its inputs and checks for cancellation between
-    ; them, so it gets both.  A REMOVAL (job 2) gets neither: do_remove_marked
-    ; overwrites entries in place and zip_delete_marked rewrites the archive,
-    ; and stopping either half way leaves work that the user would have to be
-    ; told about rather than simply undone.  A Cancel that cannot cleanly undo
-    ; is worse than no Cancel.
+    ; them, so it gets both. Native removal is now cancellable too;
+    ; ZIP removal still disables cancellation while rewriting.
     cmp     dword ptr [g_wt_job], 2
     jne     @F
+    cmp     dword ptr [g_is_zip], 0
+    je      @F
     WINCALL EnableWindow, qword ptr [g_hcancel], 0
     ; A .mrk removal totals its work exactly and drives the bar.  A zip removal
     ; still cannot: zip_delete_marked copies whole local records and the survey
@@ -11538,6 +11609,7 @@ enter_running proc
     jmp     er_done
 er_fail:
     mov     dword ptr [g_running], 0
+    WINCALL SetWindowTextW, qword ptr [g_hcancel], addr s_exit
 er_done:
     add     rsp, 64
     pop     rbp
@@ -12028,7 +12100,12 @@ dps_hide:
     WINCALL ShowWindow, qword ptr [g_hprog], SW_HIDE
     ; the tick below writes "Decrypting NN% ..." over the status line, and a
     ; drag that has ended is not decrypting anything
-    WINCALL SetWindowTextW, qword ptr [g_hstatus], addr s_ready
+    lea     rdx, [s_ready]
+    cmp     dword ptr [g_container], 0
+    je      @F
+    lea     rdx, [s_edits_saved]
+@@:
+    WINCALL SetWindowTextW, qword ptr [g_hstatus], rdx
 dps_ret:
     add     rsp, 48
     pop     rbp
@@ -12149,6 +12226,9 @@ set_status_pct proc
     test    rax, rax
     jnz     ssp_bare
     lea     rcx, [g_statusw]
+    lea     rdx, [s_pfx_save]
+    cmp     dword ptr [g_wt_job], 0
+    jne     ssp_prefix
     lea     rdx, [s_pfx_enc]
     cmp     dword ptr [g_op], 0
     jne     ssp_dec
@@ -12159,6 +12239,7 @@ set_status_pct proc
 ssp_dec:
     lea     rdx, [s_pfx_dec]
 @@:
+ssp_prefix:
     WBOUND  r8, g_statusw, STATUSW_CHARS
     call    wcopy
     mov     r11, rax
@@ -12206,6 +12287,7 @@ on_done proc
     sub     rsp, 48
     WINCALL KillTimer, qword ptr [g_hwnd], 1
     mov     dword ptr [g_running], 0
+    WINCALL SetWindowTextW, qword ptr [g_hcancel], addr s_exit
     ; The Exit button comes back ON EVERY completion path, before any of them
     ; branch.  A REMOVAL (job 2) deliberately disables it at the start - it
     ; doubles as Cancel while a job runs, and a removal cannot be cleanly undone
@@ -12391,6 +12473,16 @@ od_container:
     ; Cancelled is not failed: the rollback already put the archive back, and a
     ; box saying it did not work would describe the user's own decision as a
     ; fault.
+    cmp     dword ptr [g_is_zip], 0
+    jne     od_c_choose
+    cmp     dword ptr [g_op_result], EXIT_PARTIAL
+    jne     od_c_choose
+    lea     rcx, [g_temppath]
+    lea     rdx, [t_rewrite_recovery]
+    mov     r8d, MB_OK or MB_ICONWARNING
+    call    mbox
+    jmp     od_c_reload
+od_c_choose:
     cmp     dword ptr [g_cancelled], 0
     jne     od_c_reload
     cmp     dword ptr [g_wt_job], 1
@@ -12403,13 +12495,10 @@ od_container:
     jne     @F
     lea     rcx, [m_add_dup]
 @@:
-    ; A volume set refuses the edit before anything is written, and that is the
-    ; second failure here a user can act on - so it says what it is rather than
-    ; guessing at a locked file or a full disk.
-    ; A volume set refuses the edit before anything is written, and that is the
-    ; second failure here a user can act on - so it says what it is rather than
-    ; guessing at a locked file or a full disk.
+    ; Volume sets still refuse edits before writes.
     cmp     dword ptr [g_op_result], EXIT_UNSUPPORTED
+    jne     @F
+    cmp     dword ptr [g_is_zip], 0
     jne     @F
     lea     rcx, [m_vol_edit]
     lea     rdx, [t_vol_edit]
@@ -12418,10 +12507,7 @@ od_container:
     call    mbox
     jmp     od_c_reload
 od_c_remerr:
-    ; A .mrk normally reports its own removal errors in place, so this path is
-    ; the zip's - except for the volume-set refusal, which nothing else surfaces.
-    ; Without this, REMOVING from a set failed silently: the entry stayed, no box
-    ; appeared, and nothing said why.
+    ; Explain volume-set refusal separately from rewrite failures.
     cmp     dword ptr [g_op_result], EXIT_UNSUPPORTED
     jne     od_c_remzip
     cmp     dword ptr [g_is_zip], 0
@@ -12433,7 +12519,13 @@ od_c_remerr:
     jmp     od_c_reload
 od_c_remzip:
     cmp     dword ptr [g_is_zip], 0
-    je      od_c_reload                     ; the .mrk path reports in place
+    jne     od_c_ziperr
+    lea     rcx, [m_rewrite_fail]
+    lea     rdx, [t_slow]
+    mov     r8d, MB_OK or MB_ICONWARNING
+    call    mbox
+    jmp     od_c_reload
+od_c_ziperr:
     ; Say which of the two it was.  "It did not work" is the same sentence for an
     ; archive that is untouched and one whose only copy is now under another
     ; name, and those need different things from the user.
@@ -12485,8 +12577,13 @@ od_restore:
     WINCALL EnableWindow, qword ptr [g_hdest], 1
     WINCALL EnableWindow, qword ptr [g_hchange], 1
 @@:
-    ; (Exit button stays enabled throughout)
-    WINCALL SetWindowTextW, qword ptr [g_hstatus], addr s_ready
+    ; Closing never commits or rolls back an already completed archive edit.
+    lea     rdx, [s_ready]
+    cmp     dword ptr [g_container], 0
+    je      @F
+    lea     rdx, [s_edits_saved]
+@@:
+    WINCALL SetWindowTextW, qword ptr [g_hstatus], rdx
     ; clear password fields + buffers
     mov     word ptr [g_statusw], 0
     WINCALL SetWindowTextW, qword ptr [g_hpass], addr g_statusw
@@ -12518,39 +12615,6 @@ od_fin:
 on_done endp
 
 
-; =============================================================================
-; lv_fill_row(rcx = NMCUSTOMDRAW*) - paint the whole row rect the list's own
-; background before the control draws the row.
-;
-; This is what removes the vertical column rules.  They are not gridlines -
-; LVS_EX_GRIDLINES is not set - and nothing here draws them: comctl32 v6 fills
-; each SUBITEM rect with the LVM_SETBKCOLOR colour and leaves a one-pixel column
-; between them unpainted, so the themed listview background shows through as a
-; hairline.  It was invisible under v5 because the whole row was filled in one
-; go.  Painting the row first means those gaps are already the right colour when
-; the control leaves them alone.
-;
-; locals (frame 64): hdc[-8] rc[-32..-17]
-; =============================================================================
-lv_fill_row proc
-    push    rbp
-    mov     rbp, rsp
-    sub     rsp, 64
-    mov     rax, qword ptr [rcx+NMCD_hdc]
-    mov     qword ptr [rbp-8], rax
-    mov     eax, dword ptr [rcx+NMCD_rc+0]
-    mov     dword ptr [rbp-32], eax
-    mov     eax, dword ptr [rcx+NMCD_rc+4]
-    mov     dword ptr [rbp-28], eax
-    mov     eax, dword ptr [rcx+NMCD_rc+8]
-    mov     dword ptr [rbp-24], eax
-    mov     eax, dword ptr [rcx+NMCD_rc+12]
-    mov     dword ptr [rbp-20], eax
-    WINCALL FillRect, qword ptr [rbp-8], addr rbp-32, qword ptr [g_hbr_dark]
-    add     rsp, 64
-    pop     rbp
-    ret
-lv_fill_row endp
 
 
 ; =============================================================================
@@ -14166,7 +14230,7 @@ wp_notify:
 @@:
     cmp     eax, CDDS_ITEMPREPAINT
     jne     @F
-    call    lv_fill_row                  ; rcx still = NMCUSTOMDRAW*
+    ; Native painting now owns the complete background, with no row overpaint.
     mov     rax, CDRF_NOTIFYSUBITEMDRAW
     jmp     wp_ret
 @@:
@@ -14366,6 +14430,13 @@ wp_cancel:
     WINCALL DestroyWindow, qword ptr [rbp-8]
     jmp     wp_zero
 wp_exit_cancel:
+    ; ZIP deletion cannot cancel. Honor that for Escape and the command-bar X
+    ; too, not just for clicks on the disabled bottom button.
+    cmp     dword ptr [g_wt_job], 2
+    jne     @F
+    cmp     dword ptr [g_is_zip], 0
+    jne     wp_zero
+@@:
     mov     dword ptr [g_cancelled], 1
     call    progress_abort
     jmp     wp_zero

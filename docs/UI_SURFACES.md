@@ -1,17 +1,42 @@
 # Every action, on every surface
 
+## Workflow labels (2026-09-05)
+
+New lists use **Create .mrk** / **Create ZIP**. Open archives use **Extract all**
+or **Extract selected**: these copy entries out without changing the archive.
+**Remove** only unstages inputs; **Delete** changes an open archive immediately.
+The archive status and add/delete tooltips explain immediate saving (no undo).
+**Close** neither saves pending edits nor discards completed edits. It becomes
+**Cancel** while cancellable work runs, then returns to Close. ZIP deletion
+disables cancellation, including Escape and the command-bar close shortcut.
+
+## List background rendering (2026-09-05)
+
+The list uses native colours with visual styles disabled for that control via
+`SetWindowTheme(hwndList, L"", L"")`. The Explorer theme produced vertical seams
+at column boundaries even without `LVS_EX_GRIDLINES`; filling item rows hid only
+the occupied part and left seams visible below the final row. That row-fill
+workaround has been removed. There is no new background overlay or post-paint
+erase. Common-controls v6, `LVS_EX_DOUBLEBUFFER`, full-row selection, custom
+progress cells, and the existing scrolling/drop overlay paths remain in use.
+
+The empty-string association persists across theme changes, as documented by
+[Microsoft](https://learn.microsoft.com/en-us/windows/win32/api/uxtheme/nf-uxtheme-setwindowtheme).
+`tests/listsurfacetest.ps1` reproduced the original seam and checks empty and
+populated views after repeated resizing and a theme notification.
+
 What each format can do, and which of the three surfaces reaches it: the
 **buttons** in the window, **drag-and-drop** onto the window, and Explorer's
 **right-click / right-drag** through the shell extension.
 
 | action | `.mrk` | `.zip` | buttons | drop on window | Explorer |
 |---|---|---|---|---|---|
-| create | yes | yes | Encrypt | yes | right-click / right-drag |
+| create | yes | yes | Create .mrk / Create ZIP | yes | right-click / right-drag |
 | open / browse | yes | yes | — | — | double-click, or "Myrkr decrypt/extract" |
-| extract all | yes | yes | Decrypt / Extract | — | yes |
-| extract selected | yes | yes | select + Decrypt | — | — |
+| extract all | yes | yes | Extract all | — | yes |
+| extract selected | yes | yes | Extract selected | — | — |
 | **add to an existing archive** | yes | yes | Add files / Add folder | **yes, since 1.0.16 — verified in 1.0.18** | no |
-| remove entries | yes | yes | Remove | — | no |
+| remove entries | yes | yes | Delete | — | no |
 
 ## The gap this closed
 

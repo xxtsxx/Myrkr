@@ -87,6 +87,7 @@ extern entry_stream_open:proc
 extern seg_bytes_from_hdr:proc   ; pack.asm: the only place a shift becomes bytes
 extern idx_read:proc
 extern normalize_path:proc
+extern file_open_rewrite_source:proc
 extern tagged_alloc:proc
 extern tagged_free:proc
 extern mem_free:proc
@@ -221,7 +222,8 @@ ES_ctremain     equ 160         ; dq  ciphertext in segments NOT yet started
 ES_ordinal      equ 168         ; dq  for reopening at a boundary
 ES_key          equ 176         ; 32  the raw key, this object's own copy
 ES_ctx          equ 208         ; GCTX_SIZE
-ES_RAW          equ 544         ; ES_ctx + GCTX_SIZE
+ES_header       equ 544         ; immutable authenticated source header
+ES_RAW          equ ES_header + HDR_BYTES
 ES_RAW_BYTES    equ MAX_PATH_CHARS*2
 ES_IN           equ ES_RAW + ES_RAW_BYTES    ; compressed payload (framed only)
 ES_OUT          equ ES_IN + CBLOCK           ; decompressed block (framed only)
@@ -447,7 +449,7 @@ err_nextseg:
     mov     qword ptr [r10+ES_ctleft], rax
     sub     qword ptr [r10+ES_ctremain], rax
     lea     rcx, [r10+ES_ctx]
-    lea     rdx, [g_pkhdr]
+    lea     rdx, [r10+ES_header]
     mov     r8, qword ptr [r10+ES_ordinal]
     mov     r9, 1                           ; decrypt
     lea     rax, [r10+ES_key]
@@ -831,9 +833,24 @@ es_destroy endp
 ;
 ; locals: [rbp-16] path  [rbp-32] this
 ; =============================================================================
+public es_new_edit
+es_new_edit proc
+    mov     edx, 1
+    jmp     es_new_mode
+es_new_edit endp
+
+public es_handle
+es_handle proc
+    mov     rax, qword ptr [rcx+ES_hfile]
+    ret
+es_handle endp
+
 public es_new
 es_new proc frame
+    xor     edx, edx
+es_new_mode::
     FRAME_PROLOG 96
+    mov     dword ptr [rbp-40], edx
     mov     qword ptr [rbp-16], rcx
     mov     qword ptr [rbp-32], 0
     ; one allocation, sized to what this container's framing actually needs
@@ -854,6 +871,11 @@ esn_alloc:
     lea     rax, [vtbl_EntryStream]
     mov     qword ptr [r10+ES_vtbl], rax
     mov     dword ptr [r10+ES_refs], 1
+    lea     rcx, [r10+ES_header]
+    lea     rdx, [g_pkhdr]
+    mov     r8d, HDR_BYTES
+    call    es_copy
+    mov     r10, qword ptr [rbp-32]
     ; framing flags, from the header the index was authenticated against
     xor     r9d, r9d
     movzx   eax, byte ptr [g_pkhdr+CONTAINER_HDR.compressed]
@@ -890,7 +912,13 @@ esn_alloc:
     ; per context and refcounted, because drag-out keeps every entry's stream
     ; open at once and one closing must not shut the others' parts.
     lea     rcx, [r10+ES_RAW]
+    cmp     dword ptr [rbp-40], 0
+    je      esn_readonly
+    call    file_open_rewrite_source
+    jmp     esn_opened
+esn_readonly:
     call    vset_open
+esn_opened:
     cmp     rax, INVALID
     je      esn_fail
     mov     r10, qword ptr [rbp-32]
@@ -1028,7 +1056,7 @@ esb_split:
     ; ordinal the entry was SEALED with, which a delete leaves alone - not its
     ; position in the table.  Segment 0 until B4 gives an entry more than one.
     lea     rcx, [r10+ES_ctx]
-    lea     rdx, [g_pkhdr]
+    lea     rdx, [r10+ES_header]
     mov     r8, qword ptr [r11+IDXE_ordinal]
     mov     r9, 1                           ; decrypt
     lea     rax, [r10+ES_key]               ; the object's copy, same as a reopen

@@ -37,7 +37,6 @@ extern file_write_all:proc
 ; testio builds too, because the security suite runs against one.
 ifdef TEST_IO
 extern GetEnvironmentVariableW:proc     ; MYRKR_DBG_* knobs, see do_pack/nonce_log
-extern CreateFileW:proc                 ; the nonce log, see nonce_log
 extern WriteFile:proc
 extern CloseHandle:proc
 endif
@@ -88,12 +87,20 @@ extern comp_close:proc
 ; drain the padding, check the tag.  do_unpack extracts THROUGH it rather than
 ; keeping a second copy of those rules: two copies of a rule is how
 ; vol_part_suffix shipped a version that could not read 4-digit volume parts.
+extern CreateFileW:proc
+extern FlushFileBuffers:proc
+extern ReplaceFileW:proc
+extern es_new_edit:proc
+extern es_handle:proc
+extern mem_alloc:proc
+extern mem_free:proc
 extern es_new:proc
 extern es_bind:proc
 extern es_consume:proc
 extern es_code:proc
 extern es_destroy:proc
 extern progress_begin:proc
+extern progress_begin_rewrite:proc
 extern progress_add:proc
 extern rlog_added:proc                  ; ramlog.asm: one line per entry
 extern rlog_extracted:proc
@@ -184,6 +191,7 @@ CSTR e_idx_full,     "error: too many entries for one container - the inventory 
 ; Says what CAN be done, because a refusal that only says no leaves the user to
 ; guess whether their data is stuck.  It is not: reading a set is supported.
 CSTR e_vol_edit,     "error: this container is split across volumes and cannot be edited.",13,10,"  It can still be opened and extracted. To change what is in it, extract",13,10,"  it and encrypt the result again.",13,10
+CSTR e_rewrite_recovery, "error: replacement failed; completed encrypted recovery file: "
 CSTR e_pparams,      "error: container has out-of-range KDF parameters",13,10
 CSTR e_ptoobig,      "error: a single file exceeds what one AES-GCM stream can seal (~64 GiB)",13,10
 CSTR e_ptoobig2,     "       (split the input, or encrypt it in parts)",13,10
@@ -4712,67 +4720,503 @@ imd_none:
 idx_mark_flag endp
 
 ; =============================================================================
-; idx_drop(rcx = cursor of the entry to remove) - take it out of the table.
-; The survivors keep the ordinals they were sealed with, which is the whole
-; reason those are recorded rather than implied by position.
-; =============================================================================
-idx_drop proc frame
-    FRAME_PROLOG 48
-    mov     qword ptr [rbp-16], rcx
-    mov     r10, qword ptr [g_idxptr]
-    add     r10, rcx
+; Native edits decode the authenticated source and fully re-encrypt a replacement.
+; No plaintext staging file, inherited nonce namespace, or in-place writes.
+; mode 0 adds positionals[1..]; mode 1 omits IDXEF_DROPPED entries.
+native_rewrite proc frame
+    FRAME_PROLOG 512
+    ; mode -16, source context -24, old index -32, old length -40,
+    ; cursor -48, entry -56, remaining -64, chunk -72, output -80,
+    ; result -88, total -96, arg -104, dup cutoff -112, source size -120,
+    ; old key [-160..-129], header [-240..-161], tail [-288..-241],
+    ; snapshot scratch [-368..-289], random [-384..-369], owned -392.
+    mov     dword ptr [rbp-16], ecx
+    mov     qword ptr [rbp-24], 0
+    mov     qword ptr [rbp-32], 0
+    mov     qword ptr [rbp-80], INVALID
+    mov     dword ptr [rbp-392], 0
+    mov     qword ptr [g_packerr], 0
+    mov     qword ptr [rbp-96], 0
+    lea     rcx, [rbp-160]
+    lea     rdx, [g_key]
+    mov     r8d, 32
+    call    nr_copy
+    lea     rcx, [rbp-240]
+    lea     rdx, [g_pkhdr]
+    mov     r8d, HDR_BYTES
+    call    nr_copy
+    lea     rcx, [rbp-288]
+    lea     rdx, [g_pktag2]
+    mov     r8d, 16
+    call    nr_copy
+    lea     rcx, [rbp-272]
+    lea     rdx, [g_idxtrl]
+    mov     r8d, 32
+    call    nr_copy
+    mov     rax, qword ptr [g_idxlen]
+    mov     qword ptr [rbp-40], rax
+    lea     rcx, [rax+1]
+    call    mem_alloc
+    test    rax, rax
+    jz      nr_oom
+    mov     qword ptr [rbp-32], rax
+    mov     rcx, rax
+    mov     rdx, qword ptr [g_idxptr]
+    mov     r8, qword ptr [rbp-40]
+    call    nr_copy
+    lea     rcx, [g_pk_np]
+    call    es_new_edit
+    test    rax, rax
+    jz      nr_io
+    mov     qword ptr [rbp-24], rax
+    ; idx_read preceded the lock. Verify the exact authenticated snapshot has
+    ; not changed during that interval before trusting its index and key.
+    mov     rcx, rax
+    call    es_handle
+    mov     rcx, rax
+    lea     rdx, [rbp-120]
+    call    get_file_size
+    test    eax, eax
+    jnz     nr_io
+    cmp     qword ptr [rbp-120], HDR_BYTES+48
+    jb      nr_corrupt
+    mov     rcx, qword ptr [rbp-24]
+    call    es_handle
+    mov     rcx, rax
+    xor     edx, edx
+    lea     r8, [rbp-368]
+    mov     r9d, HDR_BYTES
+    call    file_read_at
+    test    eax, eax
+    jnz     nr_io
+    lea     rcx, [rbp-240]
+    lea     rdx, [rbp-368]
+    mov     r8d, HDR_BYTES
+    call    ct_memcmp
+    test    eax, eax
+    jnz     nr_corrupt
+    mov     rcx, qword ptr [rbp-24]
+    call    es_handle
+    mov     rcx, rax
+    mov     rdx, qword ptr [rbp-120]
+    sub     rdx, 48
+    lea     r8, [rbp-368]
+    mov     r9d, 48
+    call    file_read_at
+    test    eax, eax
+    jnz     nr_io
+    lea     rcx, [rbp-288]
+    lea     rdx, [rbp-368]
+    mov     r8d, 48
+    call    ct_memcmp
+    test    eax, eax
+    jnz     nr_corrupt
+    ; Survey every source entry, including removals: all are authenticated.
+    mov     qword ptr [rbp-48], 0
+nr_survey:
+    mov     rax, qword ptr [rbp-48]
+    cmp     rax, qword ptr [rbp-40]
+    jae     nr_inputs
+    add     rax, IDXE_FIXED
+    cmp     rax, qword ptr [rbp-40]
+    ja      nr_corrupt
+    mov     r10, qword ptr [rbp-32]
+    add     r10, qword ptr [rbp-48]
+    mov     edx, dword ptr [r10+IDXE_namelen]
+    test    edx, edx
+    jz      nr_corrupt
+    cmp     edx, 4095
+    ja      nr_corrupt
+    add     rax, rdx
+    cmp     rax, qword ptr [rbp-40]
+    ja      nr_corrupt
+    mov     qword ptr [rbp-48], rax
+    mov     rax, qword ptr [r10+IDXE_size]
+    add     qword ptr [rbp-96], rax
+    jc      nr_corrupt
+    jmp     nr_survey
+nr_inputs:
+    mov     qword ptr [g_biggest], 0
+    mov     qword ptr [rbp-104], 1
+    cmp     dword ptr [rbp-16], 0
+    jne     nr_sized
+nr_sum:
+    mov     rax, qword ptr [rbp-104]
+    cmp     rax, qword ptr [g_poscount]
+    jae     nr_sized
+    lea     r11, [g_positionals]
+    mov     rcx, qword ptr [r11+rax*8]
+    call    input_size
+    add     qword ptr [rbp-96], rax
+    jc      nr_corrupt
+    inc     qword ptr [rbp-104]
+    jmp     nr_sum
+nr_sized:
+    ; Preserve segmentation policy, including the unsegmented stream ceiling.
+    lea     rcx, [g_pkhdr]
+    call    seg_bytes_from_hdr
+    test    rax, rax
+    jnz     nr_space
+    mov     rax, qword ptr [g_biggest]
+    add     rax, PACK_ENTRY_OVERHEAD
+    jc      nr_too_big
+    mov     r10, MAX_PLAINTEXT_SIZE
+    cmp     rax, r10
+    ja      nr_too_big
+nr_space:
+    ; Conservative preflight; actual writes remain checked (free space races).
+    mov     rdx, qword ptr [rbp-96]
+    add     rdx, qword ptr [rbp-120]
+    jc      nr_nospace
+    add     rdx, CHUNK
+    jc      nr_nospace
+    lea     rcx, [g_pk_np]
+    call    disk_has_space
+    cmp     eax, 1
+    je      nr_nospace
+    mov     rcx, qword ptr [rbp-96]
+    lea     rdx, [lbl_pack]
+    mov     r8d, lbl_pack_len
+    call    progress_begin_rewrite
+    cmp     dword ptr [g_prog_abort], 0
+    jne     nr_cancel
+    ; Copy the authenticated policy, but NEVER its salt or key.
+    mov     dword ptr [g_pkhdr+CONTAINER_HDR.version], HDR_VERSION
+    mov     byte ptr [g_pkhdr+CONTAINER_HDR.archive], 1
+    lea     rcx, [g_pkhdr+20]
+    mov     edx, 44
+    call    rng_fill
+    test    eax, eax
+    jz      nr_io
+    lea     rcx, [g_pkhdr+20]
+    mov     edx, dword ptr [g_pkhdr+CONTAINER_HDR.t_cost]
+    mov     r8d, dword ptr [g_pkhdr+CONTAINER_HDR.m_cost_kib]
+    call    derive_key
+    test    eax, eax
+    jnz     nr_oom
+    lea     rcx, [g_pkhdr+KCV_OFFSET]
+    call    compute_kcv
+    ; Random sibling name + CREATE_NEW: never truncate somebody else's temp.
+    lea     rcx, [rbp-384]
+    mov     edx, 16
+    call    rng_fill
+    test    eax, eax
+    jz      nr_io
+    lea     r10, [g_pk_np]
+    lea     r11, [g_temppath]
+    xor     r9d, r9d
+nr_path:
+    cmp     r9d, MAX_PATH_CHARS-40
+    jae     nr_io
+    movzx   eax, word ptr [r10+r9*2]
+    mov     word ptr [r11+r9*2], ax
+    test    eax, eax
+    jz      nr_suffix
+    inc     r9
+    jmp     nr_path
+nr_suffix:
+    mov     word ptr [r11+r9*2], '.'
+    inc     r9
+    lea     r10, [rbp-384]
+    xor     ecx, ecx
+nr_hex:
+    movzx   eax, byte ptr [r10+rcx]
+    mov     edx, eax
+    shr     eax, 4
+    and     edx, 15
+    add     eax, 'a'
+    add     edx, 'a'
+    mov     word ptr [r11+r9*2], ax
+    mov     word ptr [r11+r9*2+2], dx
+    add     r9, 2
+    inc     ecx
+    cmp     ecx, 16
+    jb      nr_hex
+    mov     word ptr [r11+r9*2], '.'
+    mov     word ptr [r11+r9*2+2], 't'
+    mov     word ptr [r11+r9*2+4], 'm'
+    mov     word ptr [r11+r9*2+6], 'p'
+    mov     word ptr [r11+r9*2+8], 0
+    WINCALL CreateFileW, addr g_temppath, 40000000h, 0, 0, 1, 80h, 0
+    cmp     rax, INVALID
+    je      nr_io
+    mov     qword ptr [rbp-80], rax
+    mov     dword ptr [rbp-392], 1
+    mov     qword ptr [g_sink_hout], rax
+    mov     rcx, rax
+    lea     rdx, [g_pkhdr]
+    mov     r8d, HDR_BYTES
+    call    file_write_all
+    test    eax, eax
+    jnz     nr_io
+    call    idx_reset
+    mov     qword ptr [g_payoff], 0
+    mov     qword ptr [g_entnext], 0
+    mov     qword ptr [g_sinkfill], 0
+    mov     qword ptr [g_rawfill], 0
+    mov     dword ptr [g_bare], 0
+    movzx   eax, byte ptr [g_pkhdr+CONTAINER_HDR.compressed]
+    mov     qword ptr [g_compress], rax
+    test    eax, eax
+    jz      nr_entries
+    call    comp_init
+    test    eax, eax
+    jnz     nr_io
+nr_entries:
+    mov     qword ptr [rbp-48], 0
+nr_entry:
+    cmp     dword ptr [g_prog_abort], 0
+    jne     nr_cancel
+    mov     rax, qword ptr [rbp-48]
+    cmp     rax, qword ptr [rbp-40]
+    jae     nr_add
+    add     rax, qword ptr [rbp-32]
+    mov     qword ptr [rbp-56], rax
+    mov     rcx, qword ptr [rbp-24]
+    mov     rdx, rax
+    lea     r8, [rbp-160]
+    call    es_bind
+    test    eax, eax
+    jnz     nr_decode_error
+    mov     r10, qword ptr [rbp-56]
+    mov     rax, qword ptr [r10+IDXE_size]
+    mov     qword ptr [rbp-64], rax
+    test    dword ptr [r10+IDXE_flags], IDXEF_DROPPED
+    jnz     nr_content
+    lea     rcx, [g_rel]
+    lea     rdx, [r10+IDXE_name]
+    mov     r8d, dword ptr [r10+IDXE_namelen]
+    mov     qword ptr [g_rellen], r8
+    call    nr_copy
+    lea     r10, [g_rel]
+    mov     rax, qword ptr [g_rellen]
+    mov     byte ptr [r10+rax], 0
+    lea     rcx, [g_rel]
+    mov     rdx, rax
+    call    split_name
+    test    eax, eax
+    jnz     nr_name_error
+    call    entry_begin
+    mov     r10, qword ptr [rbp-56]
+    mov     eax, '0'
+    test    dword ptr [r10+IDXE_flags], IDXEF_DIR
+    jz      @F
+    mov     eax, '5'
+@@:
+    mov     qword ptr [rsp+32], rax
+    lea     rcx, [g_tarhdr]
+    lea     rdx, [g_namebuf]
+    lea     r8, [g_prefixbuf]
+    mov     r9, qword ptr [rbp-64]
+    call    tar_build_header
+    lea     rcx, [g_tarhdr]
+    mov     edx, 512
+    call    tar_out
+nr_content:
+    mov     r8, qword ptr [rbp-64]
+    cmp     r8, CHUNK
+    jbe     @F
+    mov     r8d, CHUNK
+@@:
+    mov     qword ptr [rbp-72], r8
+    mov     rcx, qword ptr [rbp-24]
+    lea     rdx, [g_filebuf]
+    call    es_consume
+    test    eax, eax
+    jnz     nr_decode_error
+    mov     r10, qword ptr [rbp-56]
+    test    dword ptr [r10+IDXE_flags], IDXEF_DROPPED
+    jnz     nr_progress
+    lea     rcx, [g_filebuf]
+    mov     rdx, qword ptr [rbp-72]
+    call    tar_out
+nr_progress:
+    cmp     qword ptr [g_packerr], 0
+    jne     nr_packerror
+    mov     rcx, qword ptr [rbp-72]
+    call    progress_add
+    test    eax, eax
+    jnz     nr_cancel
+    mov     rax, qword ptr [rbp-72]
+    sub     qword ptr [rbp-64], rax
+    jnz     nr_content
+    mov     r10, qword ptr [rbp-56]
+    test    dword ptr [r10+IDXE_flags], IDXEF_DROPPED
+    jnz     nr_next
+    mov     rdx, qword ptr [r10+IDXE_size]
+    neg     rdx
+    and     edx, 511
+    lea     rcx, [g_zeros]
+    call    tar_out
+    call    entry_end
+    mov     r10, qword ptr [rbp-56]
+    mov     rcx, qword ptr [r10+IDXE_size]
+    mov     edx, dword ptr [r10+IDXE_flags]
+    and     edx, IDXEF_DIR
+    call    idx_add
+    cmp     qword ptr [g_packerr], 0
+    jne     nr_packerror
+nr_next:
+    mov     r10, qword ptr [rbp-56]
     mov     eax, dword ptr [r10+IDXE_namelen]
     add     rax, IDXE_FIXED
-    mov     qword ptr [rbp-24], rax             ; bytes this entry occupies
-    ; slide the tail down over it
-    mov     r11, qword ptr [rbp-16]
-    add     r11, rax                            ; source
-    mov     rcx, qword ptr [g_idxlen]
-    sub     rcx, r11                            ; bytes to move
-    mov     r10, qword ptr [g_idxptr]
-    add     r11, r10                            ; source pointer
-    mov     rdx, qword ptr [rbp-16]
-    add     rdx, r10                            ; destination pointer
-    xor     r9, r9
-id_move:
-    cmp     r9, rcx
-    jae     id_moved
-    mov     al, byte ptr [r11+r9]
-    mov     byte ptr [rdx+r9], al
-    inc     r9
-    jmp     id_move
-id_moved:
-    mov     rax, qword ptr [rbp-24]
-    sub     qword ptr [g_idxlen], rax
-    dec     qword ptr [g_idxcount]
+    add     qword ptr [rbp-48], rax
+    jmp     nr_entry
+nr_add:
+    mov     qword ptr [rbp-104], 1
+    cmp     dword ptr [rbp-16], 0
+    jne     nr_finish
+nr_add_loop:
+    mov     rax, qword ptr [rbp-104]
+    cmp     rax, qword ptr [g_poscount]
+    jae     nr_finish
+    mov     rdx, qword ptr [g_idxlen]
+    mov     qword ptr [rbp-112], rdx
+    mov     qword ptr [g_cur_input], rax
+    lea     r11, [g_positionals]
+    mov     rcx, qword ptr [r11+rax*8]
+    call    pack_input_top
+    cmp     dword ptr [g_prog_abort], 0
+    jne     nr_cancel
+    cmp     qword ptr [g_packerr], 0
+    jne     nr_packerror
+    mov     rcx, qword ptr [rbp-112]
+    call    idx_dup_since
+    cmp     rax, -1
+    jne     nr_usage
+    inc     qword ptr [rbp-104]
+    jmp     nr_add_loop
+nr_finish:
+    ; Older readers require at least one payload tag, even for an empty index.
+    ; Reserve an empty stream under this fresh key; it is not a listed entry.
+    cmp     qword ptr [g_idxcount], 0
+    jne     nr_write_index
+    call    entry_begin
+    call    entry_end
+    cmp     qword ptr [g_packerr], 0
+    jne     nr_packerror
+nr_write_index:
+    mov     rcx, qword ptr [rbp-80]
+    call    idx_write
+    test    eax, eax
+    jnz     nr_io
+    WINCALL FlushFileBuffers, qword ptr [rbp-80]
+    test    eax, eax
+    jz      nr_io
+    mov     rcx, qword ptr [rbp-80]
+    call    file_close
+    mov     qword ptr [rbp-80], INVALID
+    cmp     dword ptr [g_prog_abort], 0
+    jne     nr_cancel
+    ; ReplaceFile preserves the source ACL/metadata. Keep the write-exclusion
+    ; handle through commit; preserve the finished temp on ANY commit failure
+    ; because Windows can remove the original name before reporting failure.
+    WINCALL ReplaceFileW, addr g_pk_np, addr g_temppath, 0, 0, 0, 0
+    test    eax, eax
+    jz      nr_recovery
+    mov     dword ptr [rbp-392], 0
+    xor     eax, eax
+    jmp     nr_cleanup
+nr_recovery:
+    mov     dword ptr [rbp-392], 0
+    prn     e_rewrite_recovery
+    lea     rcx, [g_temppath]
+    call    print_wz
+    prn     msg_lst_nl
+    mov     eax, EXIT_PARTIAL
+    jmp     nr_cleanup
+nr_too_big:
+    prn     e_ptoobig
+    prn     e_atoobig2
+    jmp     nr_usage
+nr_name_error:
+    prn     e_pname
+    jmp     nr_corrupt
+nr_decode_error:
+    mov     rcx, qword ptr [rbp-24]
+    call    es_code
+    test    eax, eax
+    jnz     nr_cleanup
+nr_corrupt:
+    mov     eax, EXIT_CORRUPT
+    jmp     nr_cleanup
+nr_packerror:
+    mov     eax, dword ptr [g_packerr]
+    jmp     nr_cleanup
+nr_cancel:
+    mov     eax, EXIT_CANCELLED
+    jmp     nr_cleanup
+nr_usage:
+    mov     eax, EXIT_USAGE
+    jmp     nr_cleanup
+nr_nospace:
+    mov     eax, EXIT_NOSPACE
+    jmp     nr_cleanup
+nr_oom:
+    mov     eax, EXIT_OOM
+    jmp     nr_cleanup
+nr_io:
+    mov     eax, EXIT_IO
+nr_cleanup:
+    mov     dword ptr [rbp-88], eax
+    call    comp_close
+    call    progress_done
+    mov     rcx, qword ptr [rbp-80]
+    call    file_close
+    cmp     dword ptr [rbp-392], 0
+    je      @F
+    lea     rcx, [g_temppath]
+    call    file_delete
+@@:
+    mov     rcx, qword ptr [rbp-24]
+    test    rcx, rcx
+    jz      @F
+    call    es_destroy
+@@:
+    mov     rcx, qword ptr [rbp-32]
+    mov     rdx, qword ptr [rbp-40]
+    call    mem_free
+    lea     rcx, [rbp-160]
+    mov     edx, 32
+    call    secure_zero
+    lea     rcx, [g_key]
+    mov     edx, 32
+    call    secure_zero
+    lea     rcx, [g_filebuf]
+    mov     edx, CHUNK
+    call    secure_zero
+    lea     rcx, [g_rawblk]
+    mov     edx, CBLOCK
+    call    secure_zero
+    lea     rcx, [g_compbuf]
+    mov     edx, 2*CBLOCK
+    call    secure_zero
+    lea     rcx, [g_sink]
+    mov     edx, CHUNK
+    call    secure_zero
+    lea     rcx, [g_pkctx]
+    mov     edx, GCTX_SIZE
+    call    secure_zero
+    mov     eax, dword ptr [rbp-88]
     FRAME_EPILOG
     ret
-idx_drop endp
+native_rewrite endp
 
-; =============================================================================
-; do_delete -> eax exit code.  Remove named entries from a container IN PLACE.
-;
-; This is the >= 500 MB half of the delete rules: the entry's ciphertext is
-; overwritten where it lies with random bytes and taken out of the index, so
-; nothing is rewritten but the index and nothing survives to be recovered.  The
-; carve half - decrypt, drop, re-encrypt under a fresh key - is a repack and is
-; not this proc.
-;
-; RANDOM, never zeros: a run of zeros in a container advertises exactly where
-; something used to be and how big it was.  Random bytes are indistinguishable
-; from the ciphertext around them.
-;
-; The index rewrite is the one part that encrypts anything, and it consumes
-; exactly one counter: the next revision.  Re-encrypting a changed index under
-; the nonce the old one used would be catastrophic, which is why the revision
-; lives in the trailer and the nonce is derived from it.
-;
-; locals (frame 192): handle[-16] size[-24] tail[-32] idxoff[-40] argi[-48]
-;   remaining[-56] chunk[-64] code[-72] argname[-80] entry[-88] fileoff[-96].
-;   192 because WideCharToMultiByte takes EIGHT arguments - 32 bytes of shadow
-;   space plus four stack slots - and that outgoing area has to sit below the
-;   deepest local, not through it.
-; =============================================================================
+nr_copy proc
+    test    r8, r8
+    jz      nrc_done
+nrc_loop:
+    mov     al, byte ptr [rdx]
+    mov     byte ptr [rcx], al
+    inc     rcx
+    inc     rdx
+    dec     r8
+    jnz     nrc_loop
+nrc_done:
+    ret
+nr_copy endp
+
+
 public do_delete
 do_delete proc frame
     FRAME_PROLOG 192
@@ -4787,8 +5231,8 @@ do_delete proc frame
     cmp     qword ptr [g_poscount], 2
     jb      dd_usage
     ; ---- mark what is to go -------------------------------------------------
-    ; Marked, not removed: which of the two removal paths runs depends on the
-    ; container's size, and both need to know what was chosen.
+    ; Keep source records intact: even removed entries must authenticate before
+    ; committing the replacement, but they do not enter its new inventory.
     mov     qword ptr [rbp-48], 1
 dd_arg:
     mov     rax, qword ptr [rbp-48]
@@ -4904,44 +5348,10 @@ ids_none:
 idx_dup_since endp
 
 ; =============================================================================
-; do_add -> eax exit code.  Append positionals[1..] to the container named by
-; positionals[0], in place.
-;
-; This is what format v6 exists for.  Every added entry is sealed with an
-; ordinal taken from g_entnext, which idx_read restored from the trailer's
-; AUTHENTICATED counter - never from the entry count and never from one past the
-; highest survivor, either of which would hand out an ordinal a deleted entry
-; already spent under this same key.  That is GCM nonce reuse, and it is the one
-; mistake in this format that cannot be recovered from.
-;
-; The new entries are written AFTER the old trailer rather than over the old
-; index.  That costs the old inventory's bytes as dead space in the middle of
-; the file - never referenced, because extraction is extent-driven - and it buys
-; a clean abort: nothing at or below the original length is touched, so any
-; refusal truncates back and leaves the container byte for byte what it was.
-; Writing over the index instead would mean a REFUSED add had already destroyed
-; the listing, which is a poor trade for a few hundred bytes.
-;
-; A crash mid-write is still fatal to the listing: once the file has grown past
-; the old trailer there is no valid trailer at its end until the new one lands.
-; That is a property of editing in place - do_remove_marked has it too - not
-; something appending introduced.
-;
-; Compression follows the CONTAINER, not the current setting.  The reader takes
-; store-versus-xpress from header byte 18 for the whole file, so an entry added
-; in the other mode would decode to nothing.
-;
-; locals (frame 128): hout[-16] size0[-24] idxlen0[-32] argi[-40] code[-48]
-;   dup[-56]
-; =============================================================================
+; do_add: authenticate, then transactionally rewrite with the added inputs.
 public do_add
 do_add proc frame
-    FRAME_PROLOG 128
-    mov     qword ptr [rbp-16], INVALID
-    ; A volume set cannot be edited.  Checked BEFORE the password is asked for:
-    ; the refusal does not depend on knowing the key, and making someone type a
-    ; password to be told no is its own small insult.  The path has to be
-    ; normalized first - idx_read is what usually does that, and it has not run.
+    FRAME_PROLOG 48
     mov     rcx, qword ptr [g_cfg_in]
     lea     rdx, [g_pk_np]
     call    normalize_path
@@ -4951,8 +5361,6 @@ do_add proc frame
     call    vol_is_set
     test    eax, eax
     jnz     da_isset
-    ; The inventory, which is also the password check, the key, and - the part
-    ; this proc cannot do without - g_entnext.
     mov     dword ptr [g_keep_key], 1
     call    idx_read
     mov     dword ptr [g_keep_key], 0
@@ -4960,531 +5368,46 @@ do_add proc frame
     jnz     da_ret_code
     cmp     qword ptr [g_poscount], 2
     jb      da_usage
-    lea     rcx, [g_pk_np]
-    call    file_open_rw
-    cmp     rax, INVALID
-    je      da_io
-    mov     qword ptr [rbp-16], rax
-    mov     rcx, rax
-    lea     rdx, [rbp-24]
-    call    get_file_size
-    test    eax, eax
-    jnz     da_io
-    ; where the listing ended before this add, so the duplicate scan can tell
-    ; the added entries from the ones already there
-    mov     rax, qword ptr [g_idxlen]
-    mov     qword ptr [rbp-32], rax
-    ; ---- point the packing globals at the end of the file -------------------
-    mov     rax, qword ptr [rbp-16]
-    mov     qword ptr [g_sink_hout], rax
-    mov     qword ptr [g_sinkfill], 0
-    mov     qword ptr [g_rawfill], 0
-    mov     qword ptr [g_packerr], 0
-    mov     rax, qword ptr [rbp-24]
-    sub     rax, HDR_BYTES
-    mov     qword ptr [g_payoff], rax        ; extents are relative to HDR_BYTES
-    movzx   eax, byte ptr [g_pkhdr+CONTAINER_HDR.compressed]
-    mov     qword ptr [g_compress], rax
-    mov     rcx, qword ptr [rbp-16]
-    mov     rdx, qword ptr [rbp-24]
-    call    file_seek
-    test    eax, eax
-    jnz     da_io
-    cmp     qword ptr [g_compress], 0
-    je      da_nocomp
-    call    comp_init
-    test    eax, eax
-    jz      da_nocomp                        ; 0 is success, as in do_pack
-    mov     qword ptr [g_packerr], EXIT_IO
-    jmp     da_packerr
-da_nocomp:
-    ; ---- progress: total the inputs being ADDED, not the archive ------------
-    ; positionals[0] is the archive and is not being read, so sum_inputs (which
-    ; walks the whole array) would inflate the total by the archive's own size
-    ; and leave the bar short of the end.
-    mov     qword ptr [rbp-64], 0
-    mov     qword ptr [g_biggest], 0         ; the walk below tracks the largest
-                                             ; single file, for the per-entry
-                                             ; ceiling check at da_sumd
-    mov     qword ptr [rbp-40], 1
-da_sum:
-    mov     rax, qword ptr [rbp-40]
-    cmp     rax, qword ptr [g_poscount]
-    jae     da_sumd
-    lea     r11, [g_positionals]
-    mov     rcx, qword ptr [r11+rax*8]
-    call    input_size
-    add     qword ptr [rbp-64], rax
-    inc     qword ptr [rbp-40]
-    jmp     da_sum
-da_sumd:
-    ; ---- the per-entry ceiling, which ADD never checked ---------------------
-    ; do_pack has refused an oversized single file since the beginning; an add
-    ; of the same file sailed straight past and wrote one GCM stream over the
-    ; counter wrap - the keystream-reuse failure everything else here exists to
-    ; prevent.  Present since v4 made entries the streams; found in the 1.0.83
-    ; audit of the segment-default flip.
-    ;
-    ; Judged per the HEADER, not per this build: an add to a segmented container
-    ; rolls at SEG_BYTES and has no per-entry bound; an add to a pre-segment
-    ; container must fit one stream.  Nothing is open or written yet, so the
-    ; no-rollback exit is the right one - same reasoning as da_isset.
-    lea     rcx, [g_pkhdr]
-    call    seg_bytes_from_hdr              ; -1 impossible: idx_read refused it
-    test    rax, rax
-    jnz     da_size_ok
-    mov     rax, qword ptr [g_biggest]
-    CHECK_ADD_OVF rax, PACK_ENTRY_OVERHEAD
-    mov     r10, MAX_PLAINTEXT_SIZE
-    cmp     rax, r10
-    jbe     da_size_ok
-    prn     e_ptoobig
-    prn     e_atoobig2
-    mov     eax, EXIT_USAGE
-    jmp     da_close
-da_size_ok:
-    mov     rcx, qword ptr [rbp-64]
-    lea     rdx, [lbl_pack]
-    mov     r8d, lbl_pack_len
-    call    progress_begin
-    ; ---- walk the new inputs, exactly as do_pack walks its own --------------
-    mov     qword ptr [rbp-40], 1            ; [0] is the container itself
-da_inloop:
-    mov     rax, qword ptr [rbp-40]
-    cmp     rax, qword ptr [g_poscount]
-    jae     da_walked
-    mov     qword ptr [g_cur_input], rax
-    lea     r11, [g_positionals]
-    mov     rcx, qword ptr [r11+rax*8]
-    call    pack_input_top
-    cmp     qword ptr [g_packerr], 0
-    jne     da_packerr
-    ; Cancel is checked BETWEEN inputs, where the rollback below still puts the
-    ; file back exactly.  Checking mid-entry would abandon a half-written one
-    ; past the old trailer, which the truncate would still clean up - but the
-    ; entry boundary is where the accounting is simplest to be sure about.
-    cmp     dword ptr [g_prog_abort], 0
-    jne     da_cancelled
-    inc     qword ptr [rbp-40]
-    jmp     da_inloop
-da_walked:
-    cmp     qword ptr [g_compress], 0
-    je      da_dupscan
-    call    comp_close
-    cmp     qword ptr [g_packerr], 0
-    jne     da_packerr
-da_dupscan:
-    ; Refused rather than allowed: two entries under one name extract as
-    ; whichever is written second, which is a silent wrong answer.  Nothing is
-    ; committed yet, so the rollback below puts the file back untouched.
-    mov     rcx, qword ptr [rbp-32]
-    call    idx_dup_since
-    cmp     rax, -1
-    jne     da_dupname
-    ; ---- commit: a fresh revision, then the new listing ---------------------
-    ; The revision is what gives the rewritten index its own nonce.  Encrypting
-    ; a changed index under the nonce the old one used would be catastrophic.
-    ; Nothing is committed yet, so an exhausted counter rolls back like any
-    ; other refusal and the container is left exactly as it was.
-    call    idx_rev_bump
-    test    eax, eax
-    jnz     da_revfull
-    mov     rcx, qword ptr [rbp-16]
-    call    idx_write
-    test    eax, eax
-    jnz     da_io
-    call    progress_done
-    prn_a   msg_add_ok
-    xor     eax, eax
-    jmp     da_close
-da_revfull:
-    prn     e_idx_revfull
-    mov     eax, EXIT_UNSUPPORTED
-    jmp     da_rollback
-da_dupname:
-    mov     qword ptr [rbp-56], rax
-    prn     e_add_dup
-    mov     r10, qword ptr [g_idxptr]
-    add     r10, qword ptr [rbp-56]
-    mov     edx, dword ptr [r10+IDXE_namelen]
-    lea     rcx, [r10+IDXE_name]
-    call    print_a
-    lea     rcx, [msg_nl]
-    mov     edx, 2
-    call    print_a
-    mov     eax, EXIT_USAGE
-    jmp     da_rollback
-da_cancelled:
-    call    progress_done
-    mov     eax, EXIT_CANCELLED
-    jmp     da_rollback
-da_packerr:
-    call    progress_done
-    mov     eax, dword ptr [g_packerr]
-    cmp     eax, EXIT_CORRUPT               ; name-too-long already reported
-    je      da_rollback
-    prn     e_pio
-    mov     eax, EXIT_IO
-    jmp     da_rollback
-da_io:
-    prn     e_pio
-    mov     eax, EXIT_IO
-    jmp     da_rollback
+    xor     ecx, ecx
+    call    native_rewrite
+    jmp     da_ret_code
 da_usage:
-    prn     e_add_usage
+    lea     rcx, [g_key]
+    mov     edx, 32
+    call    secure_zero
     mov     eax, EXIT_USAGE
-    jmp     da_close
+    jmp     da_ret_code
 da_isset:
-    ; Straight to da_close, not da_rollback: nothing has been opened or written,
-    ; and the rollback path would truncate a file it never touched.
     prn     e_vol_edit
     mov     eax, EXIT_UNSUPPORTED
-    jmp     da_close
-da_rollback:
-    ; Nothing at or below the original length was written, so putting the length
-    ; back restores the container exactly.  This is the whole reason the new
-    ; entries went after the old trailer instead of over the old index.
-    mov     dword ptr [rbp-48], eax
-    mov     rcx, qword ptr [rbp-16]
-    mov     rdx, qword ptr [rbp-24]
-    call    file_truncate
-    mov     eax, dword ptr [rbp-48]
-da_close:
-    mov     dword ptr [rbp-48], eax
-    lea     rcx, [g_key]
-    mov     rdx, 32
-    call    secure_zero
-    mov     rcx, qword ptr [rbp-16]
-    call    file_close
-    mov     eax, dword ptr [rbp-48]
+    jmp     da_ret_code
+da_io:
+    mov     eax, EXIT_IO
 da_ret_code:
     FRAME_EPILOG
     ret
 do_add endp
 
 ; =============================================================================
-; do_remove_marked -> eax exit code.  Remove the marked entries: overwrite them
-; where they lie, then close the gap they leave.
-;
-; Two steps, both cheap, and neither of them touches the crypto of what survives:
-;
-;   OVERWRITE with random.  This is what makes the removal unrecoverable, and it
-;   is why the entry is not simply dropped from the index and forgotten.  RANDOM,
-;   never zeros - a run of zeros advertises exactly where something used to be
-;   and how big it was, where random is indistinguishable from the ciphertext
-;   around it.
-;
-;   COMPACT.  An entry's tag does not depend on where it sits: the nonce comes
-;   from its recorded ordinal, the AAD is header || ordinal, and the offset
-;   appears nowhere in the tag.  So the survivors' ciphertext is MOVED down over
-;   the hole and their extents updated - a byte copy, no decryption, no
-;   re-encryption, no fresh key.
-;
-; The move is front to back and every destination is at or below its source, so
-; a forward copy can never overwrite bytes it has not read yet.  An index whose
-; offsets are not ascending would break that, so it is checked rather than
-; assumed.
-;
-; Only the index is re-encrypted, and it consumes exactly one counter: the next
-; revision.  Re-encrypting a changed index under the nonce the old one used would
-; be catastrophic, which is why the revision lives in the trailer.
-;
-; locals (frame 160): handle[-16] size[-24] idxoff[-32] cursor[-40] left[-48]
-;   remaining[-56] chunk[-64] code[-72] next[-80] newoff[-88] src[-96] dst[-104]
-; =============================================================================
+; do_remove_marked: the GUI has already authenticated and marked the inventory.
+; All source content is authenticated; only survivors enter the replacement.
 public do_remove_marked
 do_remove_marked proc frame
-    FRAME_PROLOG 224
-    mov     qword ptr [rbp-16], INVALID
-    ; ---- claim the revision UP FRONT, before anything is destroyed ----------
-    ; This operation ends by rewriting the index, so it needs a fresh revision -
-    ; but unlike an add it has already overwritten the dropped entries with
-    ; random and slid the survivors down by the time it gets there. Refusing at
-    ; that point would leave a container whose payload has been rewritten and
-    ; whose index has not, which is worse than either outcome the check exists
-    ; to choose between. So it is claimed here, where refusing costs nothing.
-    ;
-    ; Claiming one and then failing is harmless: a skipped revision is a nonce
-    ; never used, and g_idxrev is re-read from the trailer next time the
-    ; container is opened. Only REUSE is unsafe, and this errs the other way.
-    ; And a set cannot be deleted from either, for the same reason and with more
-    ; at stake: this path overwrites entries in place.  g_pk_np is already
-    ; normalized here - idx_read ran before the GUI marked anything.
+    FRAME_PROLOG 48
     lea     rcx, [g_pk_np]
     call    vol_is_set
     test    eax, eax
     jnz     dw_isset
-    call    idx_rev_bump
-    test    eax, eax
-    jnz     dw_revfull
-    lea     rcx, [g_pk_np]
-    call    file_open_rw
-    cmp     rax, INVALID
-    je      dw_io
-    mov     qword ptr [rbp-16], rax
-    mov     rcx, rax
-    lea     rdx, [rbp-24]
-    call    get_file_size
-    test    eax, eax
-    jnz     dw_io
-    ; ---- what this operation will actually write ----------------------------
-    ; Every dropped entry is overwritten, and every survivor AFTER the first
-    ; dropped one slides down over the hole.  A survivor BEFORE it does not
-    ; move at all - its destination equals its source and the compact pass
-    ; skips it - so summing every entry would over-report and leave the bar
-    ; stalled short of the end.
-    ;
-    ; Entries are in ascending offset order (the compact pass depends on it and
-    ; checks it), so "after the first dropped one" is just "seen a dropped one
-    ; already" in cursor order.
-    ; [rbp-112]=total [rbp-120]=seen a drop [rbp-128]=cursor [rbp-136]=left
-    mov     qword ptr [rbp-112], 0
-    mov     qword ptr [rbp-120], 0
-    mov     qword ptr [rbp-128], 0
-    mov     rax, qword ptr [g_idxcount]
-    mov     qword ptr [rbp-136], rax
-dw_tot:
-    cmp     qword ptr [rbp-136], 0
-    je      dw_totd
-    mov     r10, qword ptr [g_idxptr]
-    add     r10, qword ptr [rbp-128]
-    mov     r11d, dword ptr [r10+IDXE_namelen]
-    mov     rax, qword ptr [r10+IDXE_stored]
-    mov     r9d, dword ptr [r10+IDXE_flags]
-    test    r9d, IDXEF_DROPPED
-    jz      dw_tot_keep
-    add     qword ptr [rbp-112], rax         ; it gets overwritten
-    mov     qword ptr [rbp-120], 1
-    jmp     dw_tot_step
-dw_tot_keep:
-    cmp     qword ptr [rbp-120], 0
-    je      dw_tot_step                      ; sits before the first hole: stays put
-    add     qword ptr [rbp-112], rax         ; it slides down
-dw_tot_step:
-    mov     rax, qword ptr [rbp-128]
-    add     rax, IDXE_FIXED
-    add     rax, r11
-    mov     qword ptr [rbp-128], rax
-    dec     qword ptr [rbp-136]
-    jmp     dw_tot
-dw_totd:
-    mov     rcx, qword ptr [rbp-112]
-    lea     rdx, [lbl_pack]
-    mov     r8d, lbl_pack_len
-    call    progress_begin
-    ; ---- step one: random over every marked entry ---------------------------
-    mov     qword ptr [rbp-40], 0
-    mov     rax, qword ptr [g_idxcount]
-    mov     qword ptr [rbp-48], rax
-dw_entry:
-    cmp     qword ptr [rbp-48], 0
-    je      dw_move
-    mov     rax, qword ptr [rbp-40]
-    add     rax, IDXE_FIXED
-    cmp     rax, qword ptr [g_idxlen]
-    ja      dw_corrupt
-    mov     r10, qword ptr [g_idxptr]
-    add     r10, qword ptr [rbp-40]
-    mov     r11d, dword ptr [r10+IDXE_namelen]
-    add     rax, r11
-    cmp     rax, qword ptr [g_idxlen]
-    ja      dw_corrupt
-    mov     qword ptr [rbp-80], rax
-    mov     eax, dword ptr [r10+IDXE_flags]
-    test    eax, IDXEF_DROPPED
-    jz      dw_step
-    mov     rax, qword ptr [r10+IDXE_stored]
-    mov     qword ptr [rbp-56], rax
-    mov     rcx, qword ptr [rbp-16]
-    mov     rdx, qword ptr [r10+IDXE_offset]
-    add     rdx, HDR_BYTES
-    call    file_seek
-    test    eax, eax
-    jnz     dw_io
-dw_wipe:
-    cmp     qword ptr [rbp-56], 0
-    je      dw_step
-    mov     r8, qword ptr [rbp-56]
-    cmp     r8, CHUNK
-    jbe     dw_wsz
-    mov     r8, CHUNK
-dw_wsz:
-    mov     qword ptr [rbp-64], r8
-    lea     rcx, [g_filebuf]
-    mov     edx, dword ptr [rbp-64]
-    call    rng_fill
-    test    eax, eax
-    jz      dw_io
-    mov     rcx, qword ptr [rbp-16]
-    lea     rdx, [g_filebuf]
-    mov     r8, qword ptr [rbp-64]
-    call    file_write_all
-    test    eax, eax
-    jnz     dw_io
-    mov     rcx, qword ptr [rbp-64]
-    call    progress_add
-    mov     rax, qword ptr [rbp-64]
-    sub     qword ptr [rbp-56], rax
-    jmp     dw_wipe
-dw_step:
-    mov     rax, qword ptr [rbp-80]
-    mov     qword ptr [rbp-40], rax
-    dec     qword ptr [rbp-48]
-    jmp     dw_entry
-; ---- step two: slide the survivors down over the holes ----------------------
-dw_move:
-    mov     qword ptr [rbp-88], 0               ; where the next survivor goes
-    mov     qword ptr [rbp-40], 0
-    mov     rax, qword ptr [g_idxcount]
-    mov     qword ptr [rbp-48], rax
-dw_m_next:
-    cmp     qword ptr [rbp-48], 0
-    je      dw_compact
-    mov     r10, qword ptr [g_idxptr]
-    add     r10, qword ptr [rbp-40]
-    mov     r11d, dword ptr [r10+IDXE_namelen]
-    mov     rax, qword ptr [rbp-40]
-    add     rax, IDXE_FIXED
-    add     rax, r11
-    mov     qword ptr [rbp-80], rax
-    mov     eax, dword ptr [r10+IDXE_flags]
-    test    eax, IDXEF_DROPPED
-    jnz     dw_m_step                           ; its space is what we are closing
-    mov     rax, qword ptr [r10+IDXE_offset]
-    mov     qword ptr [rbp-96], rax
-    mov     rax, qword ptr [r10+IDXE_stored]
-    mov     qword ptr [rbp-56], rax
-    mov     rax, qword ptr [rbp-88]
-    cmp     rax, qword ptr [rbp-96]
-    ja      dw_corrupt                          ; not ascending: refuse to guess
-    je      dw_m_place                          ; already where it belongs
-    ; move it down
-    mov     rax, qword ptr [rbp-96]
-    add     rax, HDR_BYTES
-    mov     qword ptr [rbp-96], rax             ; source, absolute
-    mov     rax, qword ptr [rbp-88]
-    add     rax, HDR_BYTES
-    mov     qword ptr [rbp-104], rax            ; destination, absolute
-dw_m_chunk:
-    cmp     qword ptr [rbp-56], 0
-    je      dw_m_place
-    mov     r8, qword ptr [rbp-56]
-    cmp     r8, CHUNK
-    jbe     dw_m_sz
-    mov     r8, CHUNK
-dw_m_sz:
-    mov     qword ptr [rbp-64], r8
-    mov     rcx, qword ptr [rbp-16]
-    mov     rdx, qword ptr [rbp-96]
-    lea     r8, [g_filebuf]
-    mov     r9, qword ptr [rbp-64]
-    call    file_read_at
-    test    eax, eax
-    jnz     dw_io
-    mov     rcx, qword ptr [rbp-16]
-    mov     rdx, qword ptr [rbp-104]
-    call    file_seek
-    test    eax, eax
-    jnz     dw_io
-    mov     rcx, qword ptr [rbp-16]
-    lea     rdx, [g_filebuf]
-    mov     r8, qword ptr [rbp-64]
-    call    file_write_all
-    test    eax, eax
-    jnz     dw_io
-    mov     rcx, qword ptr [rbp-64]
-    call    progress_add
-    mov     rax, qword ptr [rbp-64]
-    add     qword ptr [rbp-96], rax
-    add     qword ptr [rbp-104], rax
-    sub     qword ptr [rbp-56], rax
-    jmp     dw_m_chunk
-dw_m_place:
-    mov     r10, qword ptr [g_idxptr]
-    add     r10, qword ptr [rbp-40]
-    mov     rax, qword ptr [rbp-88]
-    mov     qword ptr [r10+IDXE_offset], rax    ; the extent is the only thing
-    mov     rax, qword ptr [r10+IDXE_stored]    ; a move changes
-    add     qword ptr [rbp-88], rax
-dw_m_step:
-    mov     rax, qword ptr [rbp-80]
-    mov     qword ptr [rbp-40], rax
-    dec     qword ptr [rbp-48]
-    jmp     dw_m_next
-; ---- take the marked entries out of the table ------------------------------
-dw_compact:
-    mov     qword ptr [rbp-40], 0
-dw_c_next:
-    mov     rax, qword ptr [rbp-40]
-    cmp     rax, qword ptr [g_idxlen]
-    jae     dw_rewrite
-    mov     r10, qword ptr [g_idxptr]
-    add     r10, rax
-    mov     r11d, dword ptr [r10+IDXE_namelen]
-    mov     eax, dword ptr [r10+IDXE_flags]
-    test    eax, IDXEF_DROPPED
-    jnz     dw_c_drop
-    mov     rax, qword ptr [rbp-40]
-    add     rax, IDXE_FIXED
-    add     rax, r11
-    mov     qword ptr [rbp-40], rax
-    jmp     dw_c_next
-dw_c_drop:
-    mov     rcx, qword ptr [rbp-40]
-    call    idx_drop                            ; leaves the cursor where it is
-    jmp     dw_c_next
-; ---- the inventory goes where the payload now ends -------------------------
-dw_rewrite:
-    mov     rax, qword ptr [rbp-88]
-    add     rax, HDR_BYTES
-    mov     qword ptr [rbp-32], rax
-    ; the revision was claimed at the top of this proc, before the overwrite
-    mov     rcx, qword ptr [rbp-16]
-    mov     rdx, qword ptr [rbp-32]
-    call    file_seek
-    test    eax, eax
-    jnz     dw_io
-    mov     rcx, qword ptr [rbp-16]
-    call    idx_write
-    test    eax, eax
-    jnz     dw_io
-    mov     rax, qword ptr [rbp-32]
-    add     rax, qword ptr [g_idxlen]
-    add     rax, IDX_TAIL_FIXED
-    mov     rcx, qword ptr [rbp-16]
-    mov     rdx, rax
-    call    file_truncate
-    test    eax, eax
-    jnz     dw_io
-    call    progress_done
-    prn_a   msg_del_moved
-    xor     eax, eax
-    jmp     dw_close
-dw_corrupt:
-    call    progress_done
-    prn     e_pcorrupt
-    mov     eax, EXIT_CORRUPT
-    jmp     dw_close
-dw_io:
-    call    progress_done
-    prn     e_pio
-    mov     eax, EXIT_IO
-    jmp     dw_close
+    mov     ecx, 1
+    call    native_rewrite
+    FRAME_EPILOG
+    ret
 dw_isset:
+    lea     rcx, [g_key]
+    mov     edx, 32
+    call    secure_zero
     prn     e_vol_edit
     mov     eax, EXIT_UNSUPPORTED
-    jmp     dw_close
-dw_revfull:
-    prn     e_idx_revfull
-    mov     eax, EXIT_UNSUPPORTED
-dw_close:
-    mov     dword ptr [rbp-72], eax
-    lea     rcx, [g_key]
-    mov     rdx, 32
-    call    secure_zero
-    mov     rcx, qword ptr [rbp-16]
-    call    file_close
-    mov     eax, dword ptr [rbp-72]
     FRAME_EPILOG
     ret
 do_remove_marked endp
