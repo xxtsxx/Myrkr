@@ -212,8 +212,12 @@ password the data is gone. That is the point, and it is also the most likely way
 to lose data with this tool.
 
 **Very large inputs are fine.** Files are streamed in chunks, so memory use does
-not grow with the file. Paths up to the Windows maximum of 32,767 characters
-work, well past the old 260-character limit.
+not grow with the file. Extended-length Windows filesystem paths are supported,
+well past the old 260-character limit. This does **not** mean 32K names inside
+an archive: Myrkr currently limits stored relative paths to **4,094 UTF-8 bytes**
+for both `.mrk` and ZIP. Extraction also needs room for the destination plus
+the entry name and temporary suffix. These are Myrkr limits, not ZIP's format
+limit; see [path limits and compatibility](docs/PATH_LIMITS.md).
 
 ---
 

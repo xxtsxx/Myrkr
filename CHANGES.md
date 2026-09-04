@@ -6,6 +6,19 @@ ISO-8601 (`YYYY-MM-DD`).
 This file is maintained by hand alongside every change; each entry summarizes
 what changed and why, not a raw commit dump.
 
+## [1.1.2] - 2026-09-05
+
+- Remove the native writer's unnecessary ustar name restriction: preserve full
+  names in the authenticated index and use a marker only in the ignored legacy
+  header. Keep v8 framing and content offsets unchanged. Fix the undersized
+  directory-name scratch buffer exposed by paths beyond 1 KiB.
+- Bound native/ZIP relative-name construction at 4,094 UTF-8 bytes without
+  silent truncation; report the failing source. Explain Myrkr versus ZIP format
+  limits in ZIP reader errors and path documentation. Reject combined extraction
+  paths that do not fit instead of shortening them.
+- Test long leaves, Unicode, deep checkpoint paths, 4,094-byte boundaries,
+  streaming drag-out, full rewrites, and independent ZIP readback.
+
 ## [1.1.1] - 2026-09-05
 
 - Clarify GUI workflows: Create .mrk / Create ZIP for new archives, Extract all /

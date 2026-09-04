@@ -1564,7 +1564,7 @@ WSTR t_about,     <About Myrkr>
 ; belongs to the no-args window that this replaced.  This is the short version:
 ; enough to identify the build, with the repo one click away on the version
 ; label at the bottom left of the main window.
-WSTR m_about_body, <Myrkr v1.1.1 - AES-256-GCM + Argon2id file encryption. Drop files or folders onto the window, or use Add files. The version label at the bottom left opens the project page.>
+WSTR m_about_body, <Myrkr v1.1.2 - AES-256-GCM + Argon2id file encryption. Drop files or folders onto the window, or use Add files. The version label at the bottom left opens the project page.>
 WSTR m_nocpu,   <This CPU lacks the required AES-NI / PCLMULQDQ instructions.>
 CSTR c_nocpu,   "error: CPU lacks required features (AES-NI, PCLMULQDQ, SSE4.1)",13,10
 WSTR m_nopass,  <Please enter a password.>
@@ -1605,7 +1605,7 @@ WSTR s_ab_name,    <Myrkr>                  ; heading beside the icon
 ; the VERSIONINFO resource cheaply from here, so it is kept in step by hand:
 ; bump this WHENEVER myrkr.rc's FILEVERSION changes.  tools/constcheck.py cannot
 ; catch the drift - one side is an .rc, not an equ.
-WSTR s_ab_ver,     <Version 1.1.1.0>        ; version line (accent)
+WSTR s_ab_ver,     <Version 1.1.2.0>        ; version line (accent)
 WSTR s_ab_tag,     <AES-256-GCM authenticated encryption  -  Argon2id KDF>
 WSTR s_ab_foot,    <github.com/xxtsxx/Myrkr>
 WSTR s_close,      <Close>
@@ -10895,7 +10895,7 @@ cms_row:
     mov     rcx, qword ptr [rbp-24]
     call    row_path                        ; the entry name, with '\' separators
     mov     qword ptr [rbp-48], rax
-    WINCALL WideCharToMultiByte, 65001, 0, qword ptr [rbp-48], -1, addr g_delname2, 4000, 0, 0
+    WINCALL WideCharToMultiByte, 65001, 0, qword ptr [rbp-48], -1, addr g_delname2, 4096, 0, 0
     test    eax, eax
     jle     cms_next
     dec     eax                             ; drop the terminator

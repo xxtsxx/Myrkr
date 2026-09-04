@@ -61,6 +61,7 @@ extern tar_build_header:proc
 extern print_a:proc
 extern print_err:proc
 extern print_wz:proc
+extern print_wze:proc
 extern print_u64:proc
 extern fmt_u64:proc                     ; console.asm: digits into a buffer
 extern print_u64e:proc
@@ -200,7 +201,11 @@ CSTR e_ptoobig2,     "       (split the input, or encrypt it in parts)",13,10
 CSTR e_atoobig2,     "       This container was written without segments and cannot hold it. Nothing was added; encrypt the file into a NEW container, which can hold files of any size.",13,10
 CSTR e_pnotarch,     "error: container is not an archive (use 'decrypt' instead)",13,10
 CSTR e_pauth,        "error: authentication failed - wrong password or corrupted archive",13,10
-CSTR e_pname,        "error: archive entry name too long or unsafe (rejected)",13,10
+CSTR e_pname,        "error: invalid native entry name or name exceeds Myrkr's 4094 UTF-8 byte relative-path limit (not the Windows path limit)",13,10
+CSTR e_source_name,  "error: source path rejected; relative entry name exceeds Myrkr's 4094 UTF-8 byte limit, or the full filesystem path exceeds the supported buffer. No shortened name was stored: ",13,10
+CSTR e_index_name, "error: native index name is empty, invalid, or exceeds the reader's 4095 UTF-8 byte limit. Entry: ",13,10
+CSTR e_unsafe_name, "error: unsafe native entry name rejected. Entry: ",13,10
+CSTR e_output_path, "error: destination plus entry exceeds Myrkr's 32752 UTF-16 unit extraction-path limit (suffix space reserved). Choose a shorter destination. Entry: ",13,10
 CSTR e_pnospace,     "error: not enough free disk space",13,10
 CSTR msg_lst_hdr,    "contents:",13,10
 CSTR msg_lst_dir,    "  <dir>  "
@@ -260,6 +265,7 @@ g_pfx_head      dq ?                    ; next free offset; 0 means "not opened
 g_walk      dw 8000h dup (?)        ; UTF-16 full path during recursion
 g_walklen   dq ?
 g_childu8   db 1024 dup (?)         ; UTF-8 child name
+g_dirname   db 4096 dup (?)         ; full relative directory path + slash + NUL
 g_namebuf   db 104 dup (?)          ; ustar name field (<=100)
 g_prefixbuf db 160 dup (?)          ; ustar prefix field (<=155)
 g_pk_np     dw 8000h dup (?)
@@ -621,10 +627,15 @@ csf_done:
 csink_flush endp
 
 ; =============================================================================
-; split_name(rcx = utf8 path, rdx = len) -> eax 0 ok / 1 too long
-; Fills g_namebuf (<=100, NUL) and g_prefixbuf (<=155, NUL) for the ustar header.
+; split_name(rcx = utf8 path, rdx = len) -> eax 0 ok / 1 beyond index-name bound
+; Fills legacy header fields, using '@' if only the index can express the name.
 ; =============================================================================
 split_name proc
+    ; The authenticated inventory is authoritative (all v6-v8 readers use it).
+    ; Keep legacy ustar names when representable, otherwise use a deliberate
+    ; marker, not a truncated path. The fixed 512-byte content offset is unchanged.
+    cmp     rdx, ENTRY_NAME_MAX+1    ; directory convention may add one slash
+    ja      sp_invalid
     cmp     rdx, 100
     ja      sp_split
     lea     r10, [g_namebuf]
@@ -690,6 +701,12 @@ sp_ncd:
     xor     eax, eax
     ret
 sp_toolong:
+    mov     byte ptr [g_namebuf], '@'
+    mov     byte ptr [g_namebuf+1], 0
+    mov     byte ptr [g_prefixbuf], 0
+    xor     eax, eax
+    ret
+sp_invalid:
     mov     eax, 1
     ret
 split_name endp
@@ -1684,6 +1701,10 @@ pe_close:
     ret
 pe_toolong:
     prn     e_pname
+    lea     rcx, [g_rel]
+    mov     rdx, qword ptr [g_rellen]
+    call    print_err
+    prn     msg_lst_nl
     mov     qword ptr [g_packerr], EXIT_CORRUPT
     jmp     pe_cleanup
 pe_err:
@@ -1700,7 +1721,7 @@ pack_emit_file endp
 ; =============================================================================
 pack_emit_dirhdr proc frame
     FRAME_PROLOG 64
-    lea     r10, [g_childu8]
+    lea     r10, [g_dirname]
     lea     r11, [g_rel]
     mov     rcx, qword ptr [g_rellen]
     xor     r9, r9
@@ -1715,7 +1736,7 @@ pd_cd:
     mov     byte ptr [r10+r9], '/'
     inc     r9
     mov     byte ptr [r10+r9], 0
-    lea     rcx, [g_childu8]
+    lea     rcx, [g_dirname]
     mov     rdx, qword ptr [g_rellen]
     inc     rdx
     call    split_name
@@ -1741,6 +1762,10 @@ pd_cd:
     ret
 pdh_toolong:
     prn     e_pname
+    lea     rcx, [g_rel]
+    mov     rdx, qword ptr [g_rellen]
+    call    print_err
+    prn     msg_lst_nl
     mov     qword ptr [g_packerr], EXIT_CORRUPT
     FRAME_EPILOG
     ret
@@ -1809,6 +1834,9 @@ pn_wcpy:
     inc     r9
     cmp     rax, 7F00h
     jb      pn_wcpy
+    mov     word ptr [r10+rax*2], 0
+    cmp     word ptr [r11+r9*2], 0
+    jne     pn_name_limit
 pn_wcpyd:
     mov     word ptr [r10+rax*2], 0
     mov     qword ptr [g_walklen], rax
@@ -1829,6 +1857,12 @@ pn_wcpyd:
 pn_notexcl:
     ; child UTF-16 -> g_childu8
     WINCALL WideCharToMultiByte, CP_UTF8, 0, addr rsp+64+FIND_CFILENAME, -1, addr g_childu8, 1024, 0, 0
+    test    eax, eax
+    jz      pn_name_limit
+    ; eax includes the child terminator, which accounts for the separator.
+    add     rax, qword ptr [g_rellen]
+    cmp     rax, ENTRY_NAME_MAX
+    ja      pn_name_limit
     ; g_rel += "/" + g_childu8
     mov     rax, qword ptr [g_rellen]
     lea     r10, [g_rel]
@@ -1843,7 +1877,7 @@ pn_rcpy:
     mov     byte ptr [r10+rax], dl
     inc     rax
     inc     r9
-    cmp     rax, 4000
+    cmp     rax, ENTRY_NAME_MAX
     jb      pn_rcpy
 pn_rcpyd:
     mov     byte ptr [r10+rax], 0
@@ -1864,6 +1898,12 @@ pn_next:
     WINCALL FindNextFileW, qword ptr [rbp-24], addr rsp+64
     test    eax, eax
     jnz     pn_child
+    jmp     pn_findclose
+pn_name_limit:
+    ; Full source path identifies the failing child, not the last logged parent.
+    lea     rcx, [g_walk]
+    call    report_source_name_limit
+    mov     qword ptr [g_packerr], EXIT_CORRUPT
 pn_findclose:
     WINCALL FindClose, qword ptr [rbp-24]
 pn_ret:
@@ -1878,6 +1918,20 @@ pn_err:
     FRAME_EPILOG
     ret
 pack_node endp
+
+; Shared by native and ZIP writers. Report a real source, never a shortened
+; stored path. Caller must stop the walk after this diagnostic.
+public report_source_name_limit
+report_source_name_limit proc frame
+    FRAME_PROLOG 48
+    mov     qword ptr [rbp-24], rcx
+    prn     e_source_name
+    mov     rcx, qword ptr [rbp-24]
+    call    print_wze
+    prn     msg_lst_nl
+    FRAME_EPILOG
+    ret
+report_source_name_limit endp
 
 ; =============================================================================
 ; add_prefix_copy(rcx = dst) -> rax = bytes written.
@@ -2055,6 +2109,14 @@ pit_c:
     inc     r9
     cmp     r9, 7F00h
     jb      pit_c
+    cmp     word ptr [rcx+r9*2], 0
+    je      pit_terminate
+    call    report_source_name_limit    ; original full path still in rcx
+    mov     qword ptr [g_packerr], EXIT_CORRUPT
+    FRAME_EPILOG
+    ret
+pit_terminate:
+    mov     word ptr [r10+r9*2], 0
 pit_cd:
     mov     qword ptr [g_walklen], r9
     ; leaf start = after last separator
@@ -2094,6 +2156,8 @@ pit_scandone:
     dec     eax                         ; drop the terminator
     add     rax, qword ptr [g_add_prefixlen]
     mov     qword ptr [g_rellen], rax
+    cmp     rax, ENTRY_NAME_MAX
+    ja      pit_name_limit
     ; Check the COMBINED name, not the leaf: the prefix is what can carry '..'
     ; or an absolute path, and it comes from an archive index that a hostile
     ; zip wrote.  Only when there IS one - a prefix-free add is byte-for-byte
@@ -2110,6 +2174,16 @@ pit_go:
     FRAME_EPILOG
     ret
 pit_unsafe:
+    prn     e_pname
+    lea     rcx, [g_walk]
+    call    print_wze
+    prn     msg_lst_nl
+    mov     qword ptr [g_packerr], EXIT_CORRUPT
+    FRAME_EPILOG
+    ret
+pit_name_limit:
+    lea     rcx, [g_walk]
+    call    report_source_name_limit
     mov     qword ptr [g_packerr], EXIT_CORRUPT
     FRAME_EPILOG
     ret
@@ -3197,6 +3271,31 @@ create_parents endp
 ; =============================================================================
 public build_extract_path
 build_extract_path proc
+    ; Check the COMBINED path before copying. The old loops silently stopped
+    ; at their buffer bounds and could extract under a shortened filename.
+    lea     r10, [g_outdir_np]
+    xor     r8d, r8d
+bp_measure_out:
+    cmp     r8, MAX_PATH_CHARS-16
+    jae     bp_too_long
+    cmp     word ptr [r10+r8*2], 0
+    je      bp_measure_name_start
+    inc     r8
+    jmp     bp_measure_out
+bp_measure_name_start:
+    lea     r10, [g_namew]
+    xor     r9d, r9d
+bp_measure_name:
+    cmp     r9, 4096
+    jae     bp_too_long
+    cmp     word ptr [r10+r9*2], 0
+    je      bp_measure_done
+    inc     r9
+    jmp     bp_measure_name
+bp_measure_done:
+    lea     rax, [r8+r9+1]
+    cmp     rax, MAX_PATH_CHARS-16
+    ja      bp_too_long
     lea     r10, [g_extw]
     xor     r9, r9
     lea     r11, [g_outdir_np]
@@ -3208,8 +3307,7 @@ bp_o:
     mov     word ptr [r10+r9*2], ax
     inc     r8
     inc     r9
-    cmp     r9, 7F00h
-    jb      bp_o
+    jmp     bp_o
 bp_osep:
     mov     word ptr [r10+r9*2], 5Ch
     inc     r9
@@ -3226,15 +3324,19 @@ bp_n:
     mov     word ptr [r10+r9*2], ax
     inc     r8
     inc     r9
-    cmp     r9, 7FF0h
-    jb      bp_n
+    jmp     bp_n
 bp_done:
     mov     word ptr [r10+r9*2], 0
+    xor     eax, eax
+    ret
+bp_too_long:
+    mov     word ptr [g_extw], 0
+    mov     eax, 1
     ret
 build_extract_path endp
 
 ; =============================================================================
-; entry_path(rcx = index entry) -> eax 0 ok / 1 unsafe name / 2 unusable name
+; entry_path(rcx = index entry) -> eax 0 ok / 1 refused name (diagnostic printed)
 ;
 ; The inventory's name for an entry, turned into the full output path in g_extw.
 ; Exactly the steps the tar-walking extractor ran against the header it had just
@@ -3249,6 +3351,7 @@ build_extract_path endp
 ; =============================================================================
 entry_path proc frame
     FRAME_PROLOG 64
+    mov     qword ptr [rbp-24], rcx
     mov     eax, dword ptr [rcx+IDXE_namelen]
     test    eax, eax
     jz      ep_bad                          ; a nameless entry has nowhere to go
@@ -3261,6 +3364,8 @@ ep_copy:
     cmp     r9d, eax
     jae     ep_copied
     mov     dl, byte ptr [r11+r9]
+    test    dl, dl
+    jz      ep_bad                      ; length-delimited names cannot hide a suffix
     mov     byte ptr [r10+r9], dl
     inc     r9d
     jmp     ep_copy
@@ -3276,15 +3381,26 @@ ep_copied:
     test    eax, eax
     jz      ep_bad
     call    build_extract_path
+    test    eax, eax
+    jnz     ep_path_long
     xor     eax, eax
     FRAME_EPILOG
     ret
 ep_unsafe:
-    mov     eax, 1
-    FRAME_EPILOG
-    ret
+    prn     e_unsafe_name
+    jmp     ep_report
 ep_bad:
-    mov     eax, 2
+    prn     e_index_name
+    jmp     ep_report
+ep_path_long:
+    prn     e_output_path
+ep_report:
+    mov     r10, qword ptr [rbp-24]
+    lea     rcx, [r10+IDXE_name]
+    mov     edx, dword ptr [r10+IDXE_namelen]
+    call    print_err
+    prn     msg_lst_nl
+    mov     eax, 1
     FRAME_EPILOG
     ret
 entry_path endp
@@ -3944,7 +4060,7 @@ du_entry_err:
 @@:
     cmp     eax, EXIT_UNSUPPORTED
     jne     @F
-    prn     e_pname
+    ; entry_path already reported the exact name and the applicable limit.
     mov     dword ptr [rbp-56], EXIT_CORRUPT ; what the tar walk returned for it
     jmp     du_partial
 @@:
@@ -5241,7 +5357,7 @@ dd_arg:
     lea     r11, [g_positionals]
     mov     rcx, qword ptr [r11+rax*8]
     mov     qword ptr [rbp-80], rcx
-    WINCALL WideCharToMultiByte, 65001, 0, qword ptr [rbp-80], -1, addr g_delname, 4000, 0, 0
+    WINCALL WideCharToMultiByte, 65001, 0, qword ptr [rbp-80], -1, addr g_delname, 4096, 0, 0
     test    eax, eax
     jle     dd_notfound
     dec     eax                                 ; drop the terminator

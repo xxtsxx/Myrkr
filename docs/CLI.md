@@ -188,11 +188,16 @@ captured output stays clean.
 ## 7. Long paths
 
 Every file API used is the Unicode (`*W`) form, and each path is normalised
-internally to the extended-length `\\?\` shape, so paths up to the Windows
-maximum of 32,767 characters work — far past the legacy 260-character limit.
+internally to the extended-length `\\?\` shape, supporting paths beyond the
+legacy 260-character limit, subject to Myrkr's buffer headroom.
 Drive-absolute (`X:\…`) and UNC (`\\server\share\…`) paths are handled directly;
 relative paths resolve through `GetFullPathNameW`. The image also carries a
 `longPathAware` manifest.
+
+Stored relative names have a separate **4,094 UTF-8 byte** writer limit for
+native and ZIP archives. ZIP's format permits more; this is a Myrkr limit.
+The destination plus entry must also fit when extracting. See
+[path limits and compatibility](PATH_LIMITS.md) for details and error behavior.
 
 ---
 

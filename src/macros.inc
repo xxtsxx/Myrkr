@@ -67,6 +67,9 @@ CPUF_RDSEED         equ 32         ; leaf 7  ebx[18]
 ; ---------------------------------------------------------------------------
 MAX_ARGS            equ 256        ; argv[0] + up to 255 file inputs
 MAX_PATH_CHARS      equ 8000h      ; 32768 UTF-16 units (Windows extended-length max)
+; Shared writer/ZIP-reader ceiling, in UTF-8 bytes, excluding NUL. This is a
+; Myrkr implementation limit, NOT the Windows or ZIP file-format path limit.
+ENTRY_NAME_MAX      equ 4094
 MAX_PASSWORD_BYTES  equ 1024       ; UTF-8 bytes after conversion
 MIN_PASSWORD_BYTES  equ 1
 ; AES-GCM's per-key plaintext ceiling: 2^39 - 256 bits = 68,719,476,704 bytes

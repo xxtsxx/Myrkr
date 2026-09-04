@@ -66,6 +66,8 @@ python (Join-Path $PSScriptRoot "secsuite.py") $exe $wd
 $p1 = $LASTEXITCODE
 python (Join-Path $PSScriptRoot "zipboundstest.py") $exe
 $p1 = $p1 -bor $LASTEXITCODE
+python (Join-Path $PSScriptRoot "longnametest.py") $exe
+$p1 = $p1 -bor $LASTEXITCODE
 python (Join-Path $PSScriptRoot "nonceforktest.py") $exe
 $p1 = $p1 -bor $LASTEXITCODE
 

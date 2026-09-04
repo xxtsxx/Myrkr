@@ -33,6 +33,7 @@ extern zip_check_password:proc
 extern add_prefix_copy:proc
 extern pfx_select:proc
 extern sanitize_name:proc
+extern report_source_name_limit:proc
 externdef g_add_prefixlen:qword
 extern file_open_rw:proc
 extern file_seek:proc
@@ -809,10 +810,18 @@ zn_wc:
     inc     r9
     cmp     rax, 7F00h
     jb      zn_wc
+    mov     word ptr [r10+rax*2], 0
+    cmp     word ptr [r11+r9*2], 0
+    jne     zn_name_limit
 zn_wcd:
     mov     word ptr [r10+rax*2], 0
     mov     qword ptr [g_zwalklen], rax
     WINCALL WideCharToMultiByte, CP_UTF8, 0, addr rsp+64+FIND_CFILENAME, -1, addr g_zchildu8, 1024, 0, 0
+    test    eax, eax
+    jz      zn_name_limit
+    add     rax, qword ptr [g_zrellen]
+    cmp     rax, ENTRY_NAME_MAX
+    ja      zn_name_limit
     mov     rax, qword ptr [g_zrellen]
     lea     r10, [g_zrel]
     mov     byte ptr [r10+rax], '/'
@@ -826,7 +835,7 @@ zn_rc:
     mov     byte ptr [r10+rax], dl
     inc     rax
     inc     r9
-    cmp     rax, 4000
+    cmp     rax, ENTRY_NAME_MAX
     jb      zn_rc
 zn_rcd:
     mov     byte ptr [r10+rax], 0
@@ -846,6 +855,11 @@ zn_next:
     WINCALL FindNextFileW, qword ptr [rbp-24], addr rsp+64
     test    eax, eax
     jnz     zn_child
+    jmp     zn_findclose
+zn_name_limit:
+    lea     rcx, [g_zwalk]
+    call    report_source_name_limit
+    mov     qword ptr [g_ziperr], EXIT_CORRUPT
 zn_findclose:
     WINCALL FindClose, qword ptr [rbp-24]
 zn_ret:
@@ -874,6 +888,14 @@ zit_c:
     inc     r9
     cmp     r9, 7F00h
     jb      zit_c
+    cmp     word ptr [rcx+r9*2], 0
+    je      zit_terminate
+    call    report_source_name_limit
+    mov     qword ptr [g_ziperr], EXIT_CORRUPT
+    FRAME_EPILOG
+    ret
+zit_terminate:
+    mov     word ptr [r10+r9*2], 0
 zit_cd:
     mov     qword ptr [g_zwalklen], r9
     xor     r8, r8
@@ -911,6 +933,8 @@ zit_sd:
     dec     eax
     add     rax, qword ptr [g_add_prefixlen]
     mov     qword ptr [g_zrellen], rax
+    cmp     rax, ENTRY_NAME_MAX
+    ja      zit_name_limit
     cmp     qword ptr [g_add_prefixlen], 0
     je      zit_go
     lea     rcx, [g_zrel]
@@ -922,6 +946,12 @@ zit_go:
     FRAME_EPILOG
     ret
 zit_unsafe:
+    mov     qword ptr [g_ziperr], EXIT_CORRUPT
+    FRAME_EPILOG
+    ret
+zit_name_limit:
+    lea     rcx, [g_zwalk]
+    call    report_source_name_limit
     mov     qword ptr [g_ziperr], EXIT_CORRUPT
     FRAME_EPILOG
     ret
@@ -1225,6 +1255,12 @@ dza_usage:
     mov     eax, EXIT_USAGE
     jmp     dza_ret0
 dza_io:
+    cmp     qword ptr [g_ziperr], EXIT_CORRUPT
+    jne     @F
+    ; The walker already named the rejected path. Do not call it an I/O error.
+    mov     eax, EXIT_CORRUPT
+    jmp     dza_done
+@@:
     lea     rcx, [e_zip_io]
     mov     edx, e_zip_io_len
     call    print_a
@@ -1431,6 +1467,11 @@ dz_walkdone:
     jmp     dz_done
 dz_emitfail:
     call    progress_done
+    cmp     qword ptr [g_ziperr], EXIT_CORRUPT
+    jne     @F
+    mov     eax, EXIT_CORRUPT
+    jmp     dz_done
+@@:
     jmp     dz_io
 dz_nospace:
     lea     rcx, [e_zip_space]

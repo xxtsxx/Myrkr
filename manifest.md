@@ -105,7 +105,7 @@ Mitigation switches on the shipping link line:
 - The manifest (`myrkr.manifest`) declares `longPathAware` so the OS does not
   impose the legacy 260-character `MAX_PATH` cap (see §7).
 - A resource script (`myrkr.rc` → `rc.exe` → `obj\myrkr.res`, linked in) carries
-  a `VERSIONINFO` block — FileVersion/ProductVersion `1.1.1.0`, product name,
+  a `VERSIONINFO` block — FileVersion/ProductVersion `1.1.2.0`, product name,
   description, company and copyright (shown under Properties → Details) — and the
   application **icon** (`myrkr.ico`, a multi-resolution 16–256px set rendered from
   `logo/myrkr.svg`). Resource ID 1 makes it the shell file icon; `gui.asm` also
@@ -249,20 +249,18 @@ never written.
 | Inventory size | 2047 MiB (`IDX_MAX_BYTES`, ≈17 M files at 85-char paths) | Kept just under 2³¹ so no `imm32` bound test can sign-extend and invert | `idx_add` fails the pack; nothing is dropped silently (§4.1) |
 | In-place rewrites of one container | 2³² − 1 (`IDX_REV_MAX`, ≈4.29 billion) | The index nonce is `IDX_NONCE_BASE + revision`; wrapping would reuse revision 0's nonce | `idx_rev_bump` refuses the rewrite; a repack draws a fresh key and resets it |
 | Parts in a volume set | 4096 (`VOL_MAX_PARTS`) | Bounds the reassembly bookkeeping | A split needing more parts is refused before writing (§14.4) |
-| Filesystem path | 32,767 UTF-16 units (`MAX_PATH_CHARS`) | The Windows extended-length maximum; where a file is read from or written to (§7) | A longer path is rejected, not truncated |
-| Stored entry name | 100 B per component, 256 B total (ustar name + prefix) | The POSIX ustar header fields; there is no long-name (PAX/LongLink) extension | The entry is refused (`EXIT_CORRUPT`, "name too long") rather than stored under a lossy name |
+| Filesystem path | 32,768-unit buffers (`MAX_PATH_CHARS`), with walk/suffix headroom | Extended-length Windows paths; source walk guard 32,512, extraction combined-path guard 32,752 UTF-16 units (§7) | Over-limit walked/extracted names are refused, not shortened |
+| Stored entry name | 4,094 UTF-8 bytes (`ENTRY_NAME_MAX`) | Shared Myrkr writer/ZIP-reader implementation ceiling, not a ZIP format limit | Refused with a path-specific diagnostic; native index readers retain their prior 4,095-byte allowance |
 | CLI file inputs | 255 (`MAX_ARGS` − 1) | Fixed argument-vector width | Extra inputs beyond the cap are not taken |
 | Password | 1024 UTF-8 bytes (`MAX_PASSWORD_BYTES`) | Fixed, locked secret buffer | A longer password is rejected at entry |
 
-The two path limits are different measurements and do not contradict. The
-**filesystem** limit governs where files live on disk — the absolute path Myrkr
-reads from or extracts to, up to the full Windows maximum (§7). The **stored
-entry name** is the path *relative to the encryption root* that ustar records
-inside the container, and ustar caps it at 100 bytes per component and 256 bytes
-overall. In normal use the relative names are short even when the absolute paths
-are long, so the ustar cap is rarely met; a genuinely deep tree *within* the
-encrypted set is the case that reaches it, and it is refused rather than
-truncated.
+The filesystem and stored-name limits measure different strings and encodings.
+The native authenticated index is authoritative for relative names; the legacy
+ustar header uses `@` when a name cannot fit its 155-byte prefix / 100-byte suffix
+split. This does not shorten the index name or change the content offset.
+ZIP names remain standard ZIP names; its 16-bit length field allows 65,535 bytes,
+but Myrkr currently supports less. See [path limits](docs/PATH_LIMITS.md), including
+the limitations of reading native payloads as raw tar instead of using the index.
 
 The two nonce-driven caps — the GCM plaintext limit and the revision limit — are
 the load-bearing ones: they are not about resource use but about never letting the
@@ -632,6 +630,9 @@ tool builds a **ustar (POSIX tar)** stream in process. ustar is a trivially
 simple, universally understood format — 512-byte headers with octal fields and
 a checksum — which keeps the assembly implementation small and auditable. The
 header layout was validated byte-for-byte against GNU `tar` before use.
+Long native names now use a header marker and the authenticated index, so the
+payload alone is no longer a lossless general-purpose tar interchange stream;
+see [path limits and compatibility](docs/PATH_LIMITS.md).
 
 Directories are walked recursively with `FindFirstFileW`/`FindNextFileW`; the
 tree, including empty directories, is reproduced on extraction.
@@ -950,15 +951,15 @@ Design choices and their rationale:
 
 All file APIs are the Unicode (`*W`) variants, and every path is normalized to
 the extended-length `\\?\` form internally. Combined with the `longPathAware`
-manifest, this supports paths up to the Windows maximum of 32,767 characters,
-far beyond the legacy 260-character `MAX_PATH`. Drive-absolute and UNC paths are
+manifest, this supports extended-length paths far beyond the legacy
+260-character `MAX_PATH`, subject to internal headroom. Drive-absolute and UNC paths are
 handled directly; relative paths resolve via `GetFullPathNameW`.
 
 This is the limit on the **filesystem** path — where a file is read from or
 written to. It is distinct from the length of the entry name *stored inside* a
-container, which POSIX ustar caps at 100 bytes per component and 256 overall
-(§4, "The hard limits, in one place"); the two rarely collide because the stored
-names are relative to the encryption root.
+container, which Myrkr currently limits to 4,094 UTF-8 bytes for new entries
+(§4, "The hard limits, in one place"). This is not ZIP's format ceiling.
+See [path limits](docs/PATH_LIMITS.md) for exact guards and compatibility.
 
 ---
 

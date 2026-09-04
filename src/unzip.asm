@@ -106,6 +106,8 @@ CSTR e_uz_auth,   "myrkr: wrong password or tampered entry",13,10
 CSTR e_uz_unsup,  "myrkr: unsupported entry (only WinZip AES + store/deflate)",13,10
 CSTR e_uz_zcrypto,"myrkr: legacy ZipCrypto entries are not supported",13,10
 CSTR e_uz_name,   "myrkr: unsafe entry name rejected",13,10
+CSTR e_uz_namelimit, "myrkr: ZIP entry name exceeds Myrkr's 4094 UTF-8 byte relative-path limit (ZIP permits 65535 bytes; ZIP64 does not extend names). Rejected entry: ",13,10
+CSTR e_uz_pathlimit, "myrkr: extraction path exceeds Myrkr's 32752 UTF-16 unit combined-path limit (suffix space reserved). Choose a shorter destination. Entry: ",13,10
 CSTR e_uz_corrupt,"myrkr: corrupt ZIP structure",13,10
 CSTR e_uz_big,    "myrkr: deflate entry too large to extract (use 7-Zip/WinRAR)",13,10
 CSTR e_uz_needpw, "myrkr: this archive is encrypted; supply a password with -p",13,10
@@ -550,8 +552,8 @@ z64_done:
     mov     r10, qword ptr [rbp-24]
     add     r10, 46
     mov     r8, qword ptr [rbp-96]
-    cmp     r8, 4094
-    ja      eze_corrupt                    ; never extract under a shortened name
+    cmp     r8, ENTRY_NAME_MAX
+    ja      eze_namelimit                  ; never extract under a shortened name
     lea     r11, [uz_name8]
     xor     r9, r9
 ne_cpy:
@@ -578,6 +580,8 @@ ne_cpd:
     test    eax, eax
     jnz     eze_corrupt
     call    build_extract_path
+    test    eax, eax
+    jnz     eze_pathlimit
     cmp     qword ptr [g_uz_mem], 0     ; a folder has no bytes to hand back, and
     jne     eze_skip                    ; making one on disk is not what was asked
     lea     rcx, [g_extw]
@@ -594,6 +598,8 @@ eze_file:
     test    eax, eax
     jnz     eze_corrupt
     call    build_extract_path
+    test    eax, eax
+    jnz     eze_pathlimit
     ; ---- read the local header to find the data offset ---------------------
     mov     rcx, qword ptr [g_uz_hin]
     mov     rdx, qword ptr [rbp-48]          ; lho
@@ -1024,6 +1030,26 @@ eze_skip:
 eze_unsafe:
     lea     rcx, [e_uz_name]
     mov     edx, e_uz_name_len
+    call    print_a
+    mov     eax, EXIT_CORRUPT
+    jmp     eze_ret
+eze_namelimit:
+    lea     rcx, [e_uz_namelimit]
+    mov     edx, e_uz_namelimit_len
+    call    print_a
+    mov     rcx, qword ptr [rbp-24]
+    add     rcx, 46
+    mov     rdx, qword ptr [rbp-96]
+    call    print_a
+    mov     eax, EXIT_CORRUPT
+    jmp     eze_ret
+eze_pathlimit:
+    lea     rcx, [e_uz_pathlimit]
+    mov     edx, e_uz_pathlimit_len
+    call    print_a
+    mov     rcx, qword ptr [rbp-24]
+    add     rcx, 46
+    mov     rdx, qword ptr [rbp-96]
     call    print_a
     mov     eax, EXIT_CORRUPT
     jmp     eze_ret

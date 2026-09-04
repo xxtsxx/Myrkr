@@ -5,6 +5,7 @@ Full plan, rationale, scope, and results: [`docs/security-testing.md`](../docs/s
 
 | File | What it does |
 |------|--------------|
+| `longnametest.py` | Long native names, UTF-8, deep checkpoint paths, 4,094-byte boundary, drag-out streams, full rewrites, Python ZIP interoperability, and over-limit diagnostics. Requires `build testio`; included in `run.ps1`. |
 | `listsurfacetest.ps1` | Verifies uniformly coloured unused list space in empty and populated windows after resizing and a theme notification; checks double buffering/full-row selection stay enabled and gridlines stay off. Works with release builds. Reproduced the original Explorer-theme seam before the fix. |
 | `cmdbartest.ps1` | Checks all six command-bar buttons: background matching, distinct hover/pressed states, disabled appearance, and visible labels. Uses only its own test window; works with release builds. |
 | `secsuite.py` | **Phase 1** — adversarial crypto/input tests against the shipping binary (GCM/WinZip-AES tamper matrices, salt/nonce uniqueness, path-traversal corpus, malformed-archive robustness, password policy). |

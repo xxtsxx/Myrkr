@@ -219,8 +219,9 @@ copy_bounded endp
 ; the lot, so unpack_entry skips the 512 bytes without reading them - and a
 ; parser that no longer runs on attacker-supplied bytes is one that can never be
 ; wrong about them.  This tree still WRITES ustar headers, which is why the
-; builder above stays: a container's payload is a tar stream that other tools
-; can read.
+; builder above stays for legacy framing. Names that do not fit now use an '@'
+; marker in this ignored field; the full path lives in the authenticated index.
+; Raw payloads are NOT a lossless tar interchange stream for those entries.
 ; =============================================================================
 
 end
