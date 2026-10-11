@@ -88,9 +88,11 @@ foreach ($mode in @("stored", "compressed")) {
     # ---- the header says what the container is --------------------------------
     $hdr = [IO.File]::ReadAllBytes($mrk)
     $shift = $hdr[19]
-    if ([BitConverter]::ToUInt32($hdr,4) -ne 8 -or (1 -shl $shift) -ne $SEG) {
+    # 9 since 1.1.5 (RFC 9106 key derivation); segments arrived at 8 and every
+    # version from 8 on carries them the same way.
+    if ([BitConverter]::ToUInt32($hdr,4) -ne 9 -or (1 -shl $shift) -ne $SEG) {
         "  FAIL header: version $([BitConverter]::ToUInt32($hdr,4)), seg_shift $shift"; $fail++
-    } else { "  ok   version 8, seg_shift $shift (= $SEG bytes)" }
+    } else { "  ok   version 9, seg_shift $shift (= $SEG bytes)" }
 
     # ---- round trip ----------------------------------------------------------
     $out = Join-Path $w "out-$mode"

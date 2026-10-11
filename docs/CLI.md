@@ -85,7 +85,8 @@ with a non-zero exit.
 ### `selftest`
 
 Runs every cryptographic primitive against its official test vector — FIPS-197
-for AES, RFC 9106 for Argon2id, plus GCM, SHA-256 and a deflate round-trip — and
+for AES, RFC 9106 and a single-lane 64 MiB reference vector for Argon2id, plus
+GCM, SHA-256 and a deflate round-trip, and the key rule older containers need — and
 exits 0 only if all pass. This is the check to run after a build, an update, or
 any time you want the binary to prove itself.
 

@@ -43,7 +43,8 @@ $WANT = @{
 }
 $WANT_ONE = "DADB9A8DFB3E6C18035B14F89A6A7931C9E5EC8259D53ECAFA57B64A56387AEF"
 $FIX_VERSION    = 6       # what these fixtures were written by
-$WRITER_VERSION = 8       # what this build writes (HDR_VERSION)
+$WRITER_VERSION = 9       # what this build writes (HDR_VERSION)
+$UNREADABLE     = 10      # the first version this build must refuse
 $MIN_VERSION    = 6       # the oldest it reads (HDR_VERSION_MIN)
 
 "building dbg (decrypt is refused on the command line in release)..."
@@ -168,11 +169,11 @@ if ($r.rc -ne 0) {
 # damaged sends them looking for a backup they do not need.
 $vN = Join-Path $w "wrongversion.mrk"
 $bytes = [IO.File]::ReadAllBytes((Join-Path $fix "v6-archive-store.mrk"))
-$bytes[4] = 9                                    # a version this build cannot read
+$bytes[4] = $UNREADABLE                          # a version this build cannot read
 [IO.File]::WriteAllBytes($vN, $bytes)
 $r = Run @("list", $vN, "-p", $PW)
 if ($r.rc -eq 0) { "  FAIL a container from another format version was accepted"; $fail++ }
-elseif ($r.out -notmatch "format version 9" -or $r.out -notmatch "not damaged") {
+elseif ($r.out -notmatch "format version $UNREADABLE" -or $r.out -notmatch "not damaged") {
     "  FAIL it was refused as corrupt rather than as a version mismatch: $($r.out)"; $fail++
 } else {
     "  ok   another format version says so, and says the file is not damaged (exit $($r.rc))"
@@ -247,5 +248,12 @@ if (Test-Path $w) { [IO.Directory]::Delete($w, $true) }
 #     -> "this build writes version 7" FAILS. Everything else still passes,
 #        which is exactly why that check is there: a build that had quietly lost
 #        the new version would otherwise look perfectly healthy.
+#
+#   cmd.asm, derive_key: drop the version test, i.e. derive EVERY container
+#   with RFC 9106 Argon2id (version 9's rule).
+#     -> every check in section 1 FAILS with exit 3: the fixtures' keys came from
+#        the legacy address-block indexing (ARGON2F_LEGACY_ADDR), and since 1.1.5
+#        these files are what proves that rule still opens the containers users
+#        already have.  A round trip cannot: this build writes only version 9.
 # =============================================================================
 if ($fail -gt 0) { "$fail FAILURE(S)"; exit 1 } else { "compattest: all checks passed"; exit 0 }

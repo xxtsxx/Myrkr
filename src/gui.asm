@@ -1570,7 +1570,7 @@ WSTR t_about,     <About Myrkr>
 ; belongs to the no-args window that this replaced.  This is the short version:
 ; enough to identify the build, with the repo one click away on the version
 ; label at the bottom left of the main window.
-WSTR m_about_body, <Myrkr v1.1.4 - AES-256-GCM + Argon2id file encryption. Drop files or folders onto the window, or use Add files. Project page: github.com/xxtsxx/Myrkr>
+WSTR m_about_body, <Myrkr v1.1.5 - AES-256-GCM + Argon2id file encryption. Drop files or folders onto the window, or use Add files. Project page: github.com/xxtsxx/Myrkr>
 WSTR m_nocpu,   <This CPU lacks the required AES-NI / PCLMULQDQ instructions.>
 CSTR c_nocpu,   "error: CPU lacks required features (AES-NI, PCLMULQDQ, SSE4.1)",13,10
 WSTR m_nopass,  <Please enter a password.>
@@ -1616,7 +1616,7 @@ WSTR s_ab_name,    <Myrkr>                  ; heading beside the icon
 ; the VERSIONINFO resource cheaply from here, so it is kept in step by hand:
 ; bump this WHENEVER myrkr.rc's FILEVERSION changes.  tools/constcheck.py cannot
 ; catch the drift - one side is an .rc, not an equ.
-WSTR s_ab_ver,     <Version 1.1.4.0>        ; version line (accent)
+WSTR s_ab_ver,     <Version 1.1.5.0>        ; version line (accent)
 WSTR s_ab_tag,     <AES-256-GCM authenticated encryption  -  Argon2id KDF>
 WSTR s_ab_foot,    <github.com/xxtsxx/Myrkr>
 WSTR s_ab_url,     <https://github.com/xxtsxx/Myrkr>   ; what clicking s_ab_foot opens

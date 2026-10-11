@@ -16,11 +16,13 @@ which in pass 0 / slice 0 starts at 2.  The two agree only when a segment holds
 two blocks - which is exactly the RFC's own test vector (m=32, p=4), so the
 self-test could never see it.  Not a weakness (the same PRF values, shifted by
 two, each used once), but no standard Argon2 library derives a Myrkr key.
-Containers up to header version 8 depend on it, so it is reproduced here as the
-format's KDF for those versions (myrkr_counter=True) and pinned: the test checks
-that the standard function does NOT open them, so a change to either side is
-noticed rather than absorbed.  A version that adopts the standard function is
-expected to be decrypted with it - see kdf_for().
+Fixed in format version 9, which derives with RFC 9106 exactly.  Versions 6..8
+keep the old rule so every container already written still opens, and it is
+reproduced here as their KDF (myrkr_counter=True).  Both directions are held:
+what Myrkr writes now (version 9) must open with the standard function and NOT
+with the legacy one, and every frozen v6/v8 fixture in tests/fixtures must open
+with the legacy one and NOT with the standard - so a change to either rule, on
+either side, is noticed rather than absorbed.  See kdf_for().
 
 SHOWN TO FAIL: a mutant that wrote ordinal+1 into every entry's AAD - writer
 and reader alike, since both go through entry_stream_open - still passed
@@ -131,9 +133,9 @@ def argon2id(pwd, salt, t, m, p, tag_len, secret=b'', ad=b'', myrkr_counter=Fals
     return hprime(struct.pack('<128Q', *c), tag_len)
 
 def kdf_for(version):
-    """The container format's key derivation, by header version.  Every version
-    so far uses argon2.asm's counter indexing; when one adopts the standard
-    function, add it here rather than changing what older versions mean."""
+    """The container format's key derivation, by header version: RFC 9106 from
+    version 9, argon2.asm's legacy counter indexing for 6..8.  A future change
+    is a new version here, never a change to what an older one means."""
     return lambda pw, salt, t, m: argon2id(pw, salt, t, m, 1, 32, myrkr_counter=version <= 8)
 
 # ============================================================ the reader ====
@@ -335,14 +337,21 @@ def main():
 
     # ---- the reader has teeth ---------------------------------------------------
     print('== and this reader refuses what it should ==')
+    std_kdf = lambda p_, s_, t_, m_: argon2id(p_, s_, t_, m_, 1, 32)
+    leg_kdf = lambda p_, s_, t_, m_: argon2id(p_, s_, t_, m_, 1, 32, myrkr_counter=True)
     if first:
         target, pw, ver = first
+        check(ver >= 9, 'Myrkr writes format version %d (9 = RFC 9106 Argon2id)' % ver)
         try:
-            decrypt(target, pw, kdf=lambda p_, s_, t_, m_: argon2id(p_, s_, t_, m_, 1, 32))
-            check(ver > 8, 'standard RFC 9106 Argon2id opens a version-%d container' % ver)
+            decrypt(target, pw, kdf=std_kdf)
+            check(ver >= 9, 'standard RFC 9106 Argon2id opens what Myrkr writes now (v%d)' % ver)
         except ValueError:
-            check(ver <= 8, 'standard RFC 9106 Argon2id does NOT open a version-%d container '
-                            '(argon2.asm\'s counter indexing - see the header)' % ver)
+            check(False, 'standard RFC 9106 Argon2id does not open a version-%d container' % ver)
+        try:
+            decrypt(target, pw, kdf=leg_kdf)
+            check(False, 'the legacy indexing ALSO opens a version-%d container' % ver)
+        except ValueError:
+            check(True, 'and the legacy indexing does not')
         try:
             decrypt(target, pw + 'x'); check(False, 'a wrong password was accepted')
         except ValueError:
@@ -356,6 +365,48 @@ def main():
             check(True, 'a flipped ciphertext bit fails its GCM tag')
     else:
         check(False, 'no container decrypted, so the negative checks could not run')
+
+    # ---- the frozen older formats: still the legacy rule, and only it ----------
+    # Written by the releases that made them and never regenerated (compattest.ps1
+    # says why), so these are the containers users actually hold.  Every tag is
+    # verified; the contents are compattest's business.
+    print('== frozen v6 / v8 fixtures (legacy key rule) ==')
+    fx = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'fixtures')
+    FPW = 'Fixture-Horse-Battery-9'
+    names = sorted(f for f in os.listdir(fx) if f.endswith('.mrk') and '.part' not in f)
+    names += sorted(f for f in os.listdir(fx) if f.endswith('.part002.mrk'))   # a set, by a middle part
+    for n in names:
+        path = os.path.join(fx, n)
+        try:
+            res = decrypt(path, FPW)
+            check(res['version'] <= 8 and res['count'] > 0,
+                  '%s: v%d opens with the legacy rule, %d entries authenticated' % (n, res['version'], res['count']))
+        except Exception as ex:
+            check(False, '%s: %s' % (n, ex)); continue
+        if n == names[0]:                   # once: each derivation is ~6 s here
+            try:
+                decrypt(path, FPW, kdf=std_kdf)
+                check(False, '%s: the standard rule ALSO opens it' % n)
+            except ValueError:
+                check(True, '%s: and the standard rule does not' % n)
+    if not names:
+        check(False, 'no fixtures found in ' + fx)
+
+    # ---- an edit of an old container: read under the legacy rule, written v9 --
+    # The one path that uses both rules in one run: idx_read derives the source
+    # key with the file's version, the rewrite derives the new key with its own.
+    old = os.path.join(work, 'v8-upgraded.mrk')
+    shutil.copyfile(os.path.join(fx, 'v8-archive-store.mrk'), old)
+    extra = os.path.join(work, 'upgrade.txt'); open(extra, 'wb').write(b'added to a v8 container\n')
+    rc, log = myrkr('add', old, extra, '-p', FPW, '-m', '8', '-t', '1')
+    try:
+        res = decrypt(old, FPW)
+        got = {n_ for n_, f_, _, _ in res['files'] if not f_ & 1}
+        check(rc == 0 and res['version'] >= 9 and 'upgrade.txt' in got,
+              'add to a v8 fixture: exit %d, now v%d with %d entries, key from the standard rule'
+              % (rc, res['version'], res['count']))
+    except Exception as ex:
+        check(False, 'add to a v8 fixture (exit %d): %s %s' % (rc, ex, log.strip()[-160:]))
 
     shutil.rmtree(work, ignore_errors=True)
     print('\n%s' % ('indepdecrypttest: all checks passed' if not fails else '%d FAILURE(S)' % len(fails)))

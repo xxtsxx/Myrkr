@@ -97,7 +97,7 @@ Stated plainly, because a threat model that lists only successes is not one:
 | Choice | Value | Why |
 |---|---|---|
 | Cipher | AES-256-GCM | Authenticated encryption: confidentiality and integrity in one construction. Hardware-accelerated (AES-NI + PCLMULQDQ). |
-| Key derivation | Argon2id, RFC 9106 | Memory-hard, so a GPU or ASIC buys an attacker much less than it would against a plain hash. |
+| Key derivation | Argon2id, RFC 9106 (format version 9 on) | Memory-hard, so a GPU or ASIC buys an attacker much less than it would against a plain hash. Any standard Argon2id library derives the same key. Containers written before 1.1.5 (versions 6–8) used a variant that indexes the first segment's pseudo-random values two places off; it is equally strong and still opens them, but only Myrkr reproduces it. Editing such a container re-encrypts it as version 9. |
 | Default cost | t = 3, m = 512 MiB | Tuned to roughly 0.6–0.7 s per attempt on a modern desktop. Adjustable; the memory cost is what makes parallel guessing expensive. |
 | Salt | 32 CSPRNG bytes per container | A fresh key per container. Two encrypts of the same file with the same password share nothing. |
 | Nonces | Counters, never random | A repeated nonce under one key is fatal for GCM. A counter within a fresh-key container cannot repeat; a random nonce could. |
@@ -214,7 +214,7 @@ hand-rolled equivalent for our own dispatch.
 
 | Suite | What it measures | Run it |
 |---|---|---|
-| **Self-test** | Every primitive against official vectors (FIPS-197, RFC 9106, GCM, SHA-256, deflate round-trip) | `myrkr selftest` |
+| **Self-test** | Every primitive against official vectors (FIPS-197, RFC 9106 plus a single-lane 64 MiB reference vector, GCM, SHA-256, deflate round-trip), and the pinned key rule of format versions 6–8 | `myrkr selftest` |
 | **Phase 1 — adversarial** | GCM and WinZip-AES tamper matrices, salt and nonce uniqueness across many runs, a path-traversal corpus, malformed archives, password policy | `tests\run.ps1` |
 | **Phase 2 — fault injection** | Every memory-safety control above, each asserted to fire with its exact code, plus a no-false-positive check | `tests\run.ps1` |
 | **Feature tests** | Drag and drop in both directions, the container view, volume sets, counts, settings and their locking, the shell extension, the installer | `tests\README.md` lists all of them |

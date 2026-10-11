@@ -3090,6 +3090,7 @@ dp_size_ok:
     lea     rcx, [g_pkhdr+20]
     mov     edx, dword ptr [g_cfg_t]
     mov     r8d, dword ptr [g_cfg_m]
+    mov     r9d, dword ptr [g_pkhdr+CONTAINER_HDR.version]  ; HDR_VERSION, set above
     call    derive_key
     test    eax, eax
     jnz     dp_oom
@@ -4542,6 +4543,7 @@ do_unpack proc frame
     lea     rcx, [g_pkhdr+20]
     mov     edx, dword ptr [g_pkhdr+8]
     mov     r8d, dword ptr [g_pkhdr+12]
+    mov     r9d, dword ptr [g_pkhdr+CONTAINER_HDR.version]  ; the file's: picks the KDF
     call    derive_key
     test    eax, eax
     jnz     du_oom
@@ -5143,6 +5145,7 @@ idx_read proc frame
     lea     rcx, [g_pkhdr+20]
     mov     edx, dword ptr [g_pkhdr+8]
     mov     r8d, dword ptr [g_pkhdr+12]
+    mov     r9d, dword ptr [g_pkhdr+CONTAINER_HDR.version]  ; the file's: picks the KDF
     call    derive_key
     test    eax, eax
     jnz     ir_oom
@@ -5742,6 +5745,9 @@ nr_space:
     lea     rcx, [g_pkhdr+20]
     mov     edx, dword ptr [g_pkhdr+CONTAINER_HDR.t_cost]
     mov     r8d, dword ptr [g_pkhdr+CONTAINER_HDR.m_cost_kib]
+    mov     r9d, dword ptr [g_pkhdr+CONTAINER_HDR.version]  ; HDR_VERSION: the NEW
+                                            ; header - the source's key came from
+                                            ; idx_read, under the source's version
     call    derive_key
     test    eax, eax
     jnz     nr_oom

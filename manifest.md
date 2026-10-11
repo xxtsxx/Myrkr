@@ -8,8 +8,8 @@ authenticated, a sibling encrypted replacement is flushed, and Windows
 `ReplaceFileW` commits it while preserving metadata/ACLs. Pre-commit failures
 and cancellation leave the original unchanged; commit failures retain and
 report the completed encrypted recovery file. GUI edits warn at 100 MiB.
-No plaintext is staged to disk; v6-v8 sources remain readable; edited output is
-v8, preserving compression and segmentation policy. Volume editing remains
+No plaintext is staged to disk; v6-v9 sources remain readable; edited output is
+v9, preserving compression and segmentation policy. Volume editing remains
 unsupported. See [the current design and tests](docs/AUDIT_2026-09-04.md).
 
 **myrkr.exe** is a self-contained Windows x64 console application that encrypts,
@@ -105,7 +105,7 @@ Mitigation switches on the shipping link line:
 - The manifest (`myrkr.manifest`) declares `longPathAware` so the OS does not
   impose the legacy 260-character `MAX_PATH` cap (see §7).
 - A resource script (`myrkr.rc` → `rc.exe` → `obj\myrkr.res`, linked in) carries
-  a `VERSIONINFO` block — FileVersion/ProductVersion `1.1.4.0`, product name,
+  a `VERSIONINFO` block — FileVersion/ProductVersion `1.1.5.0`, product name,
   description, company and copyright (shown under Properties → Details) — and the
   application **icon** (`myrkr.ico`, a multi-resolution 16–256px set rendered from
   `logo/myrkr.svg`). Resource ID 1 makes it the shell file icon; `gui.asm` also
@@ -157,7 +157,7 @@ All source is in `src/`. The build order (and `SOURCES` in `build.cmd`) is:
 | `sha256.asm` | SHA-256 via the SHA-NI instructions, for the `hash` command. |
 | `aesgcm.asm` | AES-256 key expansion (AES-NI), CTR mode, GHASH (PCLMULQDQ), and the streaming GCM context API (`gcm_init/aad/crypt/final`) plus `gcm_seal`/`gcm_open` wrappers. |
 | `blake2b.asm` | BLAKE2b (RFC 7693) and the variable-length `H'` used by Argon2. |
-| `argon2.asm` | Argon2id (RFC 9106): the `G` compression function with scalar, SSE2, and AVX2 implementations behind a runtime dispatcher, plus indexing and memory fill. |
+| `argon2.asm` | Argon2id (RFC 9106): the `G` compression function with scalar, SSE2, and AVX2 implementations behind a runtime dispatcher, plus indexing and memory fill. `ARGON2F_LEGACY_ADDR` keeps the address-block indexing that format versions 6–8 were derived with (see §5.1). |
 | `fileio.asm` | Unicode (`*W`) chunked file I/O, size queries, atomic rename (`MoveFileExW`), delete, and the pre-flight free-space check (`disk_has_space`). |
 | `console.asm` | Console/stderr output helpers and hex formatting, plus `con_attach_parent` (`AttachConsole(ATTACH_PARENT_PROCESS)`) so the hybrid binary's CLI mode reaches the launching terminal. |
 | `cmd.asm` | The high-level commands `encrypt`/`decrypt`/`verify`/`hash`/`bench`, key derivation glue, path normalization (`\\?\`), temp-path construction, and password-policy enforcement. |
@@ -187,7 +187,7 @@ the instrumented build), and `run.ps1` to run both phases.
 
 ---
 
-## 4. Container format (Myrkr — design generation v4, on-disk version 8)
+## 4. Container format (Myrkr — design generation v4, on-disk version 9)
 
 An 80-byte header, used **verbatim as GCM additional authenticated data (AAD)**,
 followed by ciphertext, a 16-byte tag, and the inventory (§4.1):
@@ -195,7 +195,7 @@ followed by ciphertext, a 16-byte tag, and the inventory (§4.1):
 | off | size | field |
 |----:|-----:|-------|
 | 0 | 4 | magic `"MYRK"` (0x4B52594D LE) |
-| 4 | 4 | version: the writer emits `HDR_VERSION` (8); readers accept `HDR_VERSION_MIN`..`HDR_VERSION` (6..8) through one gate, `hdr_version_ok`. 7 = 6 byte-for-byte; 8 added the segment to the entry AAD |
+| 4 | 4 | version: the writer emits `HDR_VERSION` (9); readers accept `HDR_VERSION_MIN`..`HDR_VERSION` (6..9) through one gate, `hdr_version_ok`. 7 = 6 byte-for-byte; 8 added the segment to the entry AAD; 9 derives the key with RFC 9106 Argon2id exactly (6–8 use the legacy indexing, §5.1) and is otherwise identical to 8 |
 | 8 | 4 | Argon2id t_cost (passes) |
 | 12 | 4 | Argon2id m_cost (KiB) |
 | 16 | 1 | parallelism / lanes (=1) |
@@ -538,6 +538,19 @@ is lost is a preview, not data.
   password) and data-dependent addressing thereafter (resisting time-memory
   trade-off / GPU attacks). RFC 9106 explicitly recommends Argon2id as the
   default.
+- **Exactly RFC 9106 from format version 9 (1.1.5).** Versions 6–8 were derived
+  with a variant, found in 2026-10 by `tests/indepdecrypttest.py`: the
+  data-independent address block was indexed by a per-segment call counter
+  instead of by the block's position, which differs only in pass 0 / slice 0
+  (it starts at position 2, so the RFC takes values 2, 3, … of the first address
+  block and the variant took 0, 1, …). The RFC's own test vector (m = 32 KiB,
+  p = 4) has two-block segments, computes nothing in that slice, and so could not
+  see it. It is not a weakness — the same PRF outputs, each used once, reference
+  windows correct — but no standard library derived a Myrkr key. `derive_key`
+  takes the header version and picks the rule (`ARGON2F_LEGACY_ADDR` below 9);
+  readers pass the file's, writers write 9, and an edit re-encrypts an older
+  container as 9. `selftest` pins both: a 64 MiB single-lane reference vector for
+  the standard rule and a fixed vector for the legacy one.
 - **Parameters:** default t=3 passes, m=512 MiB, p=1 lane, 32-byte output.
   512 MiB is deliberately large — memory hardness is what defeats GPU/ASIC
   cracking rigs, so we spend memory generously. The `bench` command measures
@@ -1472,7 +1485,8 @@ not an oversight — but it means `selftest` is only assurance if someone runs i
 4. AES-256-GCM in-place + tail
 5. BLAKE2b (RFC 7693 `"abc"`)
 6. Argon2 compression block KAT
-7. Argon2id (RFC 9106 test vector)
+7. Argon2id (RFC 9106 test vector; the reference test.c single-lane 64 MiB
+   vector; and the pinned legacy rule of format versions 6–8)
 8. Password policy (length + class rules)
 9. Archive path-traversal safety
 10. Secret buffers locked (non-pageable) — a property report, not a KAT
@@ -1828,7 +1842,7 @@ outside the chosen output folder (covered by a dedicated selftest).
 Every cryptographic primitive is verified against its official test vector on
 demand via `myrkr selftest`: SHA-256 (FIPS 180-4), AES-256-GCM (NIST SP 800-38D,
 plus AAD and in-place + tail round-trips), BLAKE2b (RFC 7693), Argon2id (RFC
-9106) and an Argon2 block KAT, SHA-1, PBKDF2-HMAC-SHA1, CRC-32, AES ECB, inflate
+9106, and a single-lane 64 MiB reference vector) and an Argon2 block KAT, SHA-1, PBKDF2-HMAC-SHA1, CRC-32, AES ECB, inflate
 and deflate round-trips, the password-policy rules, and the archive
 name-sanitizer's traversal rejection. It also reports one non-KAT property — that
 the secret buffers are locked non-pageable — because a silent failure there is a

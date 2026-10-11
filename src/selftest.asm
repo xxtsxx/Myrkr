@@ -56,24 +56,6 @@ externdef g_cfg_passlen:dword
 externdef g_cfg_pwminlen:dword
 externdef g_cfg_pwminclasses:dword
 
-ARGON2REQ struct
-    t_cost      dd ?
-    m_cost      dd ?
-    lanes       dd ?
-    outlen      dd ?
-    version     dd ?
-    atype       dd ?
-    pwd         dq ?
-    pwdlen      dd ?
-    saltlen     dd ?
-    salt        dq ?
-    secret      dq ?
-    secretlen   dd ?
-    adlen       dd ?
-    ad          dq ?
-    outp        dq ?
-ARGON2REQ ends
-
 GCMREQ struct
     key     dq ?
     iv      dq ?
@@ -188,6 +170,23 @@ arg_out0    dq 0dc71308d33513477h
 ; RFC 9106 Argon2id tag (t=3,m=32,p=4,secret,ad)
 a2_exp      db 00dh,064h,00dh,0f5h,08dh,078h,076h,06ch,008h,0c0h,037h,0a3h,04ah,08bh,053h,0c9h
             db 0d0h,01eh,0f0h,045h,02dh,075h,0b6h,05eh,0b5h,025h,020h,0e9h,06bh,001h,0e6h,059h
+
+; Argon2id v1.3, t=2, m=65536 KiB, p=1, "password" / "somesalt", 32 bytes -
+; the reference implementation's test.c, and what any RFC 9106 library gives
+a2_exp_std  db 009h,031h,061h,015h,0d5h,0cfh,024h,0edh,05ah,015h,0a3h,01ah,03bh,0a3h,026h,0e5h
+            db 0cfh,032h,0edh,0c2h,047h,002h,098h,07ch,002h,0b6h,056h,06fh,061h,091h,03ch,0f7h
+; The same inputs at t=1, m=1024 KiB under ARGON2F_LEGACY_ADDR - the key rule of
+; header versions 6..8.  Not a standard vector; a PIN.  Computed with
+; tests/indepdecrypttest.py's argon2id(..., myrkr_counter=True), and equal to
+; what argon2.asm produced before version 9 existed.
+a2_exp_leg  db 084h,013h,0d0h,0adh,067h,0ddh,058h,00ah,094h,0c5h,0d0h,02fh,064h,079h,055h,03bh
+            db 05bh,04fh,094h,0a0h,0b1h,065h,01fh,00fh,0f2h,003h,0f7h,0f1h,0cbh,049h,08ch,015h
+a2_pw2      db "password"
+a2_salt2    db "somesalt"
+CSTR st_pass_a2s,  "  [PASS] argon2id  (single lane, 64 MiB: reference test.c vector)",13,10
+CSTR st_fail_a2s,  "  [FAIL] argon2id  (single lane, 64 MiB: reference test.c vector)",13,10
+CSTR st_pass_a2l,  "  [PASS] argon2id  (legacy indexing of containers v6-v8, pinned)",13,10
+CSTR st_fail_a2l,  "  [FAIL] argon2id  (legacy indexing of containers v6-v8, pinned)",13,10
 
 ; BLAKE2b-512("abc") - RFC 7693 Appendix A
 b2b_abc_exp db 0bah,080h,0a5h,03fh,098h,01ch,04dh,00dh,06ah,027h,097h,0b6h,09fh,012h,0f6h,0e9h
@@ -801,6 +800,7 @@ st_fad:
     mov     dword ptr [r12].ARGON2REQ.adlen, 12
     lea     rax, [a2_out]
     mov     qword ptr [r12].ARGON2REQ.outp, rax
+    mov     dword ptr [r12].ARGON2REQ.flags, 0
 
     lea     rcx, [a2_req]
     call    argon2id_hash
@@ -822,6 +822,75 @@ st_a2_fail:
     call    print_a
     inc     qword ptr [rbp-24]
 st_after_a2:
+
+    ; ---- argon2id, single lane: the case every container uses -------------------
+    ; The RFC vector above cannot see the address-block indexing: at m = 32 KiB
+    ; and p = 4 a segment is two blocks, so slice 0 computes nothing.  It passed
+    ; for years over a derivation that was not RFC 9106 (ARGON2F_LEGACY_ADDR).
+    ; This one is single-lane at 64 MiB, from the reference implementation's
+    ; test.c, and exercises all of it.  Then the legacy rule itself, pinned,
+    ; because containers up to header version 8 open only if it never changes.
+    lea     r12, [a2_req]
+    mov     dword ptr [r12].ARGON2REQ.t_cost, 2
+    mov     dword ptr [r12].ARGON2REQ.m_cost, 65536
+    mov     dword ptr [r12].ARGON2REQ.lanes, 1
+    lea     rax, [a2_pw2]
+    mov     qword ptr [r12].ARGON2REQ.pwd, rax
+    mov     dword ptr [r12].ARGON2REQ.pwdlen, 8
+    lea     rax, [a2_salt2]
+    mov     qword ptr [r12].ARGON2REQ.salt, rax
+    mov     dword ptr [r12].ARGON2REQ.saltlen, 8
+    mov     qword ptr [r12].ARGON2REQ.secret, 0
+    mov     dword ptr [r12].ARGON2REQ.secretlen, 0
+    mov     qword ptr [r12].ARGON2REQ.ad, 0
+    mov     dword ptr [r12].ARGON2REQ.adlen, 0
+    mov     dword ptr [r12].ARGON2REQ.flags, 0
+    lea     rcx, [a2_req]
+    call    argon2id_hash
+    test    eax, eax
+    jnz     st_a2s_fail
+    lea     rcx, [a2_out]
+    lea     rdx, [a2_exp_std]
+    mov     r8, 32
+    call    ct_memcmp
+    test    eax, eax
+    jnz     st_a2s_fail
+    lea     rcx, [st_pass_a2s]
+    mov     edx, st_pass_a2s_len
+    call    print_a
+    jmp     st_after_a2s
+st_a2s_fail:
+    lea     rcx, [st_fail_a2s]
+    mov     edx, st_fail_a2s_len
+    call    print_a
+    inc     qword ptr [rbp-24]
+st_after_a2s:
+    lea     r12, [a2_req]
+    mov     dword ptr [r12].ARGON2REQ.t_cost, 1
+    mov     dword ptr [r12].ARGON2REQ.m_cost, 1024     ; 256-block segments: past 128
+    mov     dword ptr [r12].ARGON2REQ.flags, ARGON2F_LEGACY_ADDR
+    lea     rcx, [a2_req]
+    call    argon2id_hash
+    test    eax, eax
+    jnz     st_a2l_fail
+    lea     rcx, [a2_out]
+    lea     rdx, [a2_exp_leg]
+    mov     r8, 32
+    call    ct_memcmp
+    test    eax, eax
+    jnz     st_a2l_fail
+    lea     rcx, [st_pass_a2l]
+    mov     edx, st_pass_a2l_len
+    call    print_a
+    jmp     st_after_a2l
+st_a2l_fail:
+    lea     rcx, [st_fail_a2l]
+    mov     edx, st_fail_a2l_len
+    call    print_a
+    inc     qword ptr [rbp-24]
+st_after_a2l:
+    lea     r12, [a2_req]
+    mov     dword ptr [r12].ARGON2REQ.flags, 0
 
     ; ---- password policy (default min 12 chars / 3 of 4 classes) ------------
     mov     dword ptr [g_cfg_pwminlen], 12

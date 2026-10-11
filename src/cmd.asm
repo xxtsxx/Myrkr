@@ -81,24 +81,6 @@ externdef g_file_total:qword
 
 FILE_ATTR_DIR   equ 10h
 
-ARGON2REQ struct
-    t_cost      dd ?
-    m_cost      dd ?
-    lanes       dd ?
-    outlen      dd ?
-    version     dd ?
-    atype       dd ?
-    pwd         dq ?
-    pwdlen      dd ?
-    saltlen     dd ?
-    salt        dq ?
-    secret      dq ?
-    secretlen   dd ?
-    adlen       dd ?
-    ad          dq ?
-    outp        dq ?
-ARGON2REQ ends
-
 ARGON2_VERSION  equ 13h
 ARGON2_TYPE_ID  equ 2
                                      ; KEY_LEN now lives in macros.inc: secmem.asm
@@ -196,7 +178,14 @@ prn_a macro msg
 endm
 
 ; =============================================================================
-; derive_key(rcx = salt ptr, edx = t_cost, r8d = m_cost_kib) -> eax 0/EXIT_OOM
+; derive_key(rcx = salt ptr, edx = t_cost, r8d = m_cost_kib,
+;            r9d = header version the key is for) -> eax 0/EXIT_OOM
+;
+; The VERSION picks the function, and it is a required argument rather than
+; something read from beside the salt, so a caller cannot derive a key for one
+; header with the rule of another without writing that down.  Version 9 on is
+; RFC 9106 Argon2id; 6..8 are argon2.asm's legacy indexing (ARGON2F_LEGACY_ADDR).
+; Readers pass the version in the file; writers pass the one they are writing.
 ; =============================================================================
 public derive_key
 derive_key proc frame
@@ -205,6 +194,13 @@ derive_key proc frame
     mov     dword ptr [rbp-32], edx
     mov     dword ptr [rbp-40], r8d
     lea     r10, [rsp+32]
+    xor     eax, eax
+    cmp     r9d, HDR_VERSION_KDF_STD
+    jae     @F
+    mov     eax, ARGON2F_LEGACY_ADDR
+@@:
+    mov     dword ptr [r10].ARGON2REQ.flags, eax
+    mov     dword ptr [r10].ARGON2REQ.flags_rsvd, 0
     mov     eax, dword ptr [rbp-32]
     mov     dword ptr [r10].ARGON2REQ.t_cost, eax
     mov     eax, dword ptr [rbp-40]
@@ -634,6 +630,7 @@ open_common proc frame
     lea     rcx, [g_hdr+20]
     mov     edx, dword ptr [g_hdr+8]
     mov     r8d, dword ptr [g_hdr+12]
+    mov     r9d, dword ptr [g_hdr+4]        ; the file's version: picks the KDF
     call    derive_key
     test    eax, eax
     jnz     oc_oom
@@ -1662,6 +1659,7 @@ do_bench proc frame
     lea     rcx, [rsp+32]
     mov     edx, dword ptr [g_cfg_t]
     mov     r8d, dword ptr [g_cfg_m]
+    mov     r9d, HDR_VERSION                ; time what encrypt would pay
     call    derive_key
     WINCALL QueryPerformanceCounter, addr rbp-56
     mov     rax, qword ptr [rbp-56]

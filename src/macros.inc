@@ -123,8 +123,40 @@ HDR_MAGIC           equ 4B52594Dh  ; "MYRK" little-endian
 ; live and continuously exercised (every test writes 7; tests/fixtures/v6-*.mrk
 ; are 6) BEFORE anything hangs off it, so the first real divergence lands on
 ; plumbing that is already known to work.
-HDR_VERSION         equ 8
+;
+; 9 is the first version whose key is derived with RFC 9106 Argon2id exactly.
+; 6..8 used argon2.asm's legacy address-block indexing (ARGON2F_LEGACY_ADDR -
+; the comment in argon2.asm says what it was) and still open with it; nothing
+; writes them any more, and an edit re-encrypts a container into 9.  The key is
+; the one thing a reader cannot get wrong and recover from, so the choice is made
+; in exactly one place: derive_key, from the version of the header it is handed.
+HDR_VERSION         equ 9
 HDR_VERSION_MIN     equ 6
+HDR_VERSION_KDF_STD equ 9
+ARGON2F_LEGACY_ADDR equ 1          ; ARGON2REQ.flags: the pre-9 indexing
+
+; The request argon2id_hash takes.  ONE definition: it was declared separately
+; in argon2.asm, cmd.asm and selftest.asm, and a copy that lacked `flags` would
+; have handed the derivation whatever followed the struct in memory.
+ARGON2REQ struct
+    t_cost      dd ?
+    m_cost      dd ?            ; KiB
+    lanes       dd ?            ; parallelism p
+    outlen      dd ?
+    version     dd ?            ; 0x13
+    atype       dd ?            ; 2 = argon2id
+    pwd         dq ?
+    pwdlen      dd ?
+    saltlen     dd ?
+    salt        dq ?
+    secret      dq ?
+    secretlen   dd ?
+    adlen       dd ?
+    ad          dq ?
+    outp        dq ?
+    flags       dd ?            ; ARGON2F_*; 0 = RFC 9106 exactly
+    flags_rsvd  dd ?
+ARGON2REQ ends
 KEY_LEN             equ 32         ; AES-256 file key (Argon2id output).  Shared
                                    ; rather than cmd.asm-local because secmem.asm
                                    ; must lock g_key using the same length that

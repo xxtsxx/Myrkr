@@ -33,23 +33,21 @@ rot16_mask256 db 2,3,4,5,6,7,0,1,10,11,12,13,14,15,8,9, 2,3,4,5,6,7,0,1,10,11,12
 
 .code
 
-ARGON2REQ struct
-    t_cost      dd ?
-    m_cost      dd ?            ; KiB
-    lanes       dd ?            ; parallelism p
-    outlen      dd ?
-    version     dd ?            ; 0x13
-    atype       dd ?            ; 2 = argon2id
-    pwd         dq ?
-    pwdlen      dd ?
-    saltlen     dd ?
-    salt        dq ?
-    secret      dq ?
-    secretlen   dd ?
-    adlen       dd ?
-    ad          dq ?
-    outp        dq ?
-ARGON2REQ ends
+; ARGON2REQ is in macros.inc.
+;
+; ARGON2F_LEGACY_ADDR - the address-block indexing every Myrkr container up to
+; header version 8 was derived with.  It indexed the data-independent address
+; block by g_actr, a call counter reset to 0 per segment, instead of by i % 128
+; (i = the block's position in its segment) as RFC 9106 specifies.  The two only
+; differ in pass 0 / slice 0, which starts at i = 2: the RFC takes v[2], v[3]...
+; of the first address block, the legacy rule v[0], v[1]... and regenerates two
+; blocks later.  The RFC's own test vector (m = 32 KiB, p = 4) has two-block
+; segments, so slice 0 computes nothing and it cannot tell the two apart - which
+; is how this shipped.  Not a weakness (the same PRF outputs, each used once,
+; with correct reference windows), but no standard library derives such a key.
+; Kept, and kept exact, because every older container needs it to open.
+; tests/indepdecrypttest.py and selftest's pinned vector hold it to that.
+; (ARGON2F_LEGACY_ADDR itself is in macros.inc, next to HDR_VERSION_KDF_STD.)
 
 .code
 
@@ -697,7 +695,8 @@ g_pass    dq 0
 g_slice   dq 0
 g_lane    dq 0
 g_idx     dq 0
-g_actr    dq 0            ; address counter (data-independent)
+g_actr    dq 0            ; address values taken this segment (data-independent)
+g_a2legacy dq 0           ; 1 = ARGON2F_LEGACY_ADDR for this derivation
 g_col     dq 0
 g_prevcol dq 0
 g_reflane dq 0
@@ -765,6 +764,9 @@ argon2id_hash proc frame
     mov     qword ptr [g_t], rax
     mov     eax, dword ptr [rcx].ARGON2REQ.atype
     mov     qword ptr [g_type], rax
+    mov     eax, dword ptr [rcx].ARGON2REQ.flags
+    and     eax, ARGON2F_LEGACY_ADDR
+    mov     qword ptr [g_a2legacy], rax
 
     ; ---- H0 = BLAKE2b-512 of the parameter encoding ------------------------
     lea     rcx, [g_b2bctx]
@@ -1007,10 +1009,23 @@ a2_pc_done:
     jne     a2_rnd_dep
     cmp     qword ptr [g_slice], 2
     jae     a2_rnd_dep
-    ; data-independent: regenerate addr block every 128 values
+    ; data-independent: one address value per block, from a block of 128.
+    ;
+    ; RFC 9106: the value for position i is v[i % 128], and a new address block
+    ; is made when i % 128 == 0 - plus once up front when the segment starts at
+    ; i = 2 (pass 0, slice 0), since nothing has made one yet.  Legacy (header
+    ; version <= 8, see ARGON2F_LEGACY_ADDR): the same keyed on g_actr, the count
+    ; of values taken this segment, which is i - 2 in exactly that slice.
     mov     rax, qword ptr [g_actr]
+    cmp     qword ptr [g_a2legacy], 0
+    jne     a2_addr_due
+    mov     rax, qword ptr [g_idx]
+    cmp     qword ptr [g_actr], 0
+    je      a2_addr_new                     ; the segment's first value
+a2_addr_due:
     and     rax, 127
     jnz     a2_addr_use
+a2_addr_new:
     lea     r11, [g_inp]
     inc     qword ptr [r11+48]              ; inp.v[6]++
     lea     rcx, [g_addr]
@@ -1025,6 +1040,10 @@ a2_pc_done:
     call    argon2_compress
 a2_addr_use:
     mov     rax, qword ptr [g_actr]
+    cmp     qword ptr [g_a2legacy], 0
+    jne     @F
+    mov     rax, qword ptr [g_idx]
+@@:
     and     rax, 127
     lea     r11, [g_addr]
     mov     r15, qword ptr [r11+rax*8]

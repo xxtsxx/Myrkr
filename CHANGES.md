@@ -6,6 +6,40 @@ ISO-8601 (`YYYY-MM-DD`).
 This file is maintained by hand alongside every change; each entry summarizes
 what changed and why, not a raw commit dump.
 
+## [1.1.5] - 2026-10-11
+
+### Changed - format version 9: the key is RFC 9106 Argon2id exactly
+
+- New containers are format version 9, and their key is derived with Argon2id
+  exactly as RFC 9106 specifies, so any standard Argon2 library reproduces it.
+  Versions 6-8 were derived with a variant: the first segment's pseudo-random
+  values were taken two positions off (argon2.asm indexed the address block by a
+  per-segment counter rather than by block position). It was found in 1.1.4 by
+  decrypting Myrkr's output with an independent implementation; the RFC's own
+  test vector is too small to show it. It was not a weakness - the same values,
+  each used once, the same memory-hardness - but it tied every container to
+  Myrkr.
+- **Every existing container still opens, unchanged.** The key rule is chosen
+  by the header's version, in one place (`derive_key`). Editing an older
+  container - add or delete - re-encrypts it as version 9, as edits always
+  re-encrypt.
+- Older Myrkr builds (1.1.4 and before) cannot open version 9 containers; they
+  report a newer format version rather than damage.
+
+### Tests
+
+- `myrkr selftest` adds the reference implementation's single-lane 64 MiB
+  Argon2id vector - the case every container uses, which the RFC vector cannot
+  reach - and pins the legacy rule with a fixed vector.
+- `tests/indepdecrypttest.py` checks both directions: what Myrkr writes opens
+  with standard Argon2id and not with the legacy rule, every frozen v6/v8
+  fixture opens with the legacy rule and not with the standard one, and adding
+  to a v8 fixture produces a version 9 container.
+- `compattest.ps1` and `segmenttest.ps1` expect version 9 from the writer; a
+  mutant that derived every version with the standard rule fails every
+  `compattest` fixture check with exit 3.
+- `ARGON2REQ` is defined once, in `macros.inc`, instead of three times.
+
 ## [1.1.4] - 2026-10-11
 
 ### Fixed
