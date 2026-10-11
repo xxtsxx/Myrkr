@@ -115,12 +115,23 @@ def main():
     # the key fresh per container, which is what makes counter nonces safe - and
     # the container id in the same header field the nonce used to occupy.
     print("== A5 per-file salt/container-id uniqueness ==")
+    # Four encrypts at a time, each to its own file.  This loop was 200 serial
+    # Argon2 runs - about 135 s, most of the whole suite - and the samples are
+    # independent.  Four, not one per core: each KDF holds 512 MiB.  A failed
+    # encrypt leaves no header, so it counts as a non-distinct sample rather than
+    # silently re-reading the previous run's file (which the serial version did).
+    from concurrent.futures import ThreadPoolExecutor
     N=200; salts=set(); ids=set()
-    for i in range(N):
-        m = os.path.join(work,"u.mrk")
-        run(exe,["encrypt",src,"-o",m,"-p",PW])
-        hdr = open(m,"rb").read(80)
-        salts.add(hdr[20:52]); ids.add(hdr[52:64])
+    def one(i):
+        m = os.path.join(work,f"u{i}.mrk")
+        rc,_,_ = run(exe,["encrypt",src,"-o",m,"-p",PW])
+        if rc != 0 or not os.path.exists(m): return None
+        hdr = open(m,"rb").read(80); os.remove(m)
+        return hdr
+    with ThreadPoolExecutor(4) as pool:
+        for hdr in pool.map(one, range(N)):
+            if hdr is None: continue
+            salts.add(hdr[20:52]); ids.add(hdr[52:64])
     record("CSPRNG","efficacy",f"salt uniqueness x{N}", len(salts)==N, f"distinct={len(salts)}")
     record("CSPRNG","efficacy",f"container-id uniqueness x{N}", len(ids)==N, f"distinct={len(ids)}")
 

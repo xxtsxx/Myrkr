@@ -6,6 +6,23 @@ ISO-8601 (`YYYY-MM-DD`).
 This file is maintained by hand alongside every change; each entry summarizes
 what changed and why, not a raw commit dump.
 
+## [Unreleased]
+
+### Tests and tooling
+
+- `tools/compare.ps1` runs one test against an older commit and against the
+  working tree, and passes only when the old build fails it and the new one
+  does not - the proof a regression test needs, which 1.1.3 did by hand.
+- `tests/lib/gui.psm1` holds the window helpers every GUI test used to
+  re-declare. The copies had drifted into probe bugs: a hit-test lParam packed
+  as `y*65536+x`, wrong for any negative coordinate. `guifailtest.ps1` uses it,
+  and `compare.ps1` confirms it still fails against 1.1.2.
+- `tests/all.ps1` runs every suite in sequence (`-Quick` leaves out the
+  11-minute `scaletest`) and no longer runs the four `run.ps1` hosts against a
+  build they were not written for.
+- `secsuite.py` runs its 200-sample salt check four at a time: Phase 1 went
+  from about four minutes to two and a half.
+
 ## [1.1.3] - 2026-10-11
 
 An in-depth review of 1.1.2 found that extraction could destroy files the user

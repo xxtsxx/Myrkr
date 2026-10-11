@@ -11,6 +11,8 @@ Full plan, rationale, scope, and results: [`docs/security-testing.md`](../docs/s
 | `secsuite.py` | **Phase 1** — adversarial crypto/input tests against the shipping binary (GCM/WinZip-AES tamper matrices, salt/nonce uniqueness, path-traversal corpus, malformed-archive robustness, password policy). |
 | `redteam.py` | **Phase 2** — drives the instrumented build's `redteam <case>` command to fault-inject each memory-safety control and assert it fastfails with the exact expected code. Requires `build.cmd dbg`. |
 | `run.ps1` | Builds both variants and runs both phases end to end. |
+| `all.ps1` | Every suite in sequence: `run.ps1`, then each feature test below except the four `run.ps1` already hosts. `-Quick` leaves out `scaletest` (about 11 of the 27 minutes); `-Only`/`-Skip` take test names. Logs go to `%TEMP%\myrkr-all-<time>`. |
+| `lib/gui.psm1` | Not a test - the shared helpers for GUI tests: find a window by process and class, wait for it, press a button, type a password into the prompt, hit-test at a screen point, read a list row or a dbg global from outside the process, build a variant. New GUI tests should import it rather than declare their own P/Invoke class; `guifailtest.ps1` does. |
 | `zipboundstest.py` | Targeted ZIP64 record-length and filename validation, including valid controls. Included in `run.ps1`; standalone: `python tests/zipboundstest.py bin/myrkr.exe` after `build testio`. |
 | `nonceforktest.py` | Regression for native-container edit nonce reuse. Requires `build testio`; included in `run.ps1`. Checks fresh-key add/delete across copied containers, rollback on duplicate/missing input or corruption, and stored/compressed readback. |
 | `nativeeditguitest.ps1` | Requires `build dbg`; included in `run.ps1`. Checks small GUI removal, the 100 MiB warning, declining it, and cancelling a native rewrite. |
@@ -20,8 +22,19 @@ Full plan, rationale, scope, and results: [`docs/security-testing.md`](../docs/s
 pwsh tests\run.ps1
 ```
 
-Requires Python 3 with `pyzipper` and `cryptography`. Phase 1 takes a few
-minutes (it runs Argon2id hundreds of times).
+Requires Python 3 with `pyzipper` and `cryptography`. 
+
+minutes (it runs Argon2id hundreds of times; `secsuite.py` runs its 200-sample
+salt check four at a time, each KDF holding 512 MiB).
+
+To show that a new regression test catches the bug it was written for, run it
+against an older commit and against the working tree in one step:
+
+```powershell
+powershell -File tools\compare.ps1 tests\extracthazardtest.py -Ref 166f4d4
+```
+
+It exits 0 only when the old build fails the test and the working tree passes.
 
 ## Feature tests
 
