@@ -22,6 +22,9 @@
 #    do_pack then tried a temp->final rename for a temp that never existed and
 #    reported "I/O failure" over a perfectly good container. "a split that
 #    produced one part is put back under its plain name" fails against it.
+#  - 1.1.3: an incomplete set was reported as "I/O failure" (exit 2), opened in
+#    the window as a file to ENCRYPT, and left its parts locked. The three
+#    checks after "a missing tail is refused" fail against it.
 #
 # This block exists because the suite's own rule is that a test nobody has seen
 # fail is a test nobody should believe, and until 1.0.71 this file did not say
@@ -355,8 +358,45 @@ $env:MYRKR_DBG_NOSECDESK=""
 # fail to open rather than extracting a prefix.
 Remove-Item $parts[-1].FullName -Force
 $dec = cmd /c "`"$exe`" decrypt `"$($parts[0].FullName)`" -o `"$w\back3`" -p $PW 2>&1"
-if ($LASTEXITCODE -eq 0) { "  FAIL a set missing its last part still opened"; $fail++ }
-else { "  ok   a missing tail is refused (exit $LASTEXITCODE)" }
+$rc3 = $LASTEXITCODE
+if ($rc3 -eq 0) { "  FAIL a set missing its last part still opened"; $fail++ }
+else { "  ok   a missing tail is refused (exit $rc3)" }
+# ...and refused for the right REASON.  Until 1.1.4 every reader reported this
+# as "I/O failure" (exit 2): vset_open turned every refusal into INVALID and the
+# callers could only guess.  An incomplete set is corrupt input, not a disk.
+if ($rc3 -eq 4 -and ($dec -join ' ') -match 'incomplete volume set') { "  ok   and it says the set is incomplete (exit 4), not an I/O failure" }
+else { "  FAIL a missing tail was reported as: exit $rc3, '$(($dec | Select-Object -First 1))'"; $fail++ }
+
+# ---- the WINDOW, handed a part of that incomplete set ----------------------
+# Two bugs, one fixture.  detect_op saw only INVALID, took the part for an
+# ordinary file and opened in ENCRYPT mode - offering to encrypt the part, with
+# no word about the missing one.  And vs_assemble returned without closing the
+# parts it had already opened, so the window held them (FILE_SHARE_READ only)
+# for its whole life: the user could not rename, move or delete the very files
+# they were trying to put right.  Both shown failing against 1.1.3 with
+# tools\compare.ps1.
+Import-Module (Join-Path $PSScriptRoot 'lib\gui.psm1') -Force
+$env:MYRKR_DBG_NOSECDESK = "1"
+Stop-Myrkr
+$q = Start-Process $exe -ArgumentList "`"$($parts[0].FullName)`"" -PassThru
+$box = Wait-MyrkrWindow -Process $q -Class @('myrkr_mbox', 'myrkr_secdesk', 'myrkr_window') -TimeoutMs 10000
+$cls = Get-MyrkrLastClass
+if ($box -eq [IntPtr]::Zero) { "  FAIL the window showed no error for an incomplete set (1.1.3 offered to encrypt the part)"; $fail++ }
+elseif ($cls -ne 'myrkr_mbox' -or (Get-MyrkrTitle $box) -ne 'Myrkr - error') {
+  "  FAIL an incomplete set opened as '$cls' titled '$(Get-MyrkrTitle $box)' - not an error"; $fail++
+} else { "  ok   the window reports the incomplete set instead of offering to encrypt it" }
+Start-Sleep -Milliseconds 500
+$locked = @()
+foreach ($pt in $parts[0..($parts.Count - 2)]) {
+  try {
+    Rename-Item -LiteralPath $pt.FullName -NewName ($pt.Name + '.x') -ErrorAction Stop
+    Rename-Item -LiteralPath ($pt.FullName + '.x') -NewName $pt.Name -ErrorAction Stop
+  } catch { $locked += $pt.Name }
+}
+if ($locked.Count) { "  FAIL $($locked.Count) part(s) stay locked while the window is open, e.g. $($locked[0])"; $fail++ }
+else { "  ok   and it holds none of the parts open: all $($parts.Count - 1) can be renamed" }
+Stop-Myrkr
+$env:MYRKR_DBG_NOSECDESK = ""
 
 
 # ---- MORE THAN 999 PARTS -----------------------------------------------------

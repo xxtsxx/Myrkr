@@ -42,6 +42,12 @@ extern file_open_rw:proc
 extern file_truncate:proc
 extern file_rename:proc
 externdef g_pkhdr:byte              ; pack.asm owns it; set_id is copied from it
+extern print_err:proc
+extern CompareStringOrdinal:proc
+CSTR_EQUAL      equ 2
+
+.const
+CSTR e_vset_bad, "error: incomplete volume set - a part is missing, out of order, or from a different set.",13,10,"       Put every .partNNN.mrk of the set in one folder and open any of them.",13,10
 
 INVALID         equ -1                  ; INVALID_HANDLE_VALUE, mirrored from
                                         ; cmd.asm/estream.asm - constcheck holds
@@ -70,6 +76,10 @@ g_vol_toomany dd ?                      ; 1 if a write hit VOL_MAX_PARTS
 g_vol_plain  dw VOL_PATH_CHARS dup (?)  ; the name the output would have had
                                         ; with no split - see vol_settle
 g_vol_shift  db VOL_SHIFT_CHUNK dup (?) ; buffer for the header strip
+public g_vs_badset
+g_vs_badset  dd ?                       ; 1: the last vset_open was handed a part
+                                        ; of a set that could not be assembled
+g_vs_joinbase dw VOL_PATH_CHARS dup (?) ; a joining caller's base, for comparing
 
 .code
 
@@ -487,6 +497,7 @@ public vset_open
 vset_open proc frame
     FRAME_PROLOG 96
     mov     qword ptr [rbp-16], rcx
+    mov     dword ptr [g_vs_badset], 0
     ; ---- already open?  Join it rather than reassembling ---------------------
     ; estream opens one stream PER ENTRY and keeps them all open at once - that
     ; is what drag-out is - so a second vset_open must not tear down the set the
@@ -497,8 +508,25 @@ vset_open proc frame
     ; The part table is read-only once assembled and file_read_at takes an
     ; explicit offset, so sharing it across streams needs no further locking -
     ; there is no cursor to race over.
+    ;
+    ; But only the SAME set.  The set state is process-wide - vol_get and
+    ; vset_close consult g_vs_on, not the handle they are given - so a second
+    ; container cannot be open alongside a set at all.  Joining used to happen
+    ; whatever path was asked for: a different container, or a part of a
+    ; different set, silently read the open set's bytes instead.  Nothing reaches
+    ; that today (drag-out runs to completion inside DoDragDrop before anything
+    ; else can open), so this is a refusal for the day something does, rather
+    ; than a guess about whose bytes to return.
     cmp     dword ptr [g_vs_on], 0
     je      vso_fresh
+    mov     rcx, qword ptr [rbp-16]
+    lea     rdx, [g_vs_joinbase]
+    call    vs_base_from_part
+    test    eax, eax
+    jnz     vso_no                          ; not a part at all: not this set
+    WINCALL CompareStringOrdinal, addr g_vs_joinbase, -1, addr g_vol_base, -1, 1
+    cmp     eax, CSTR_EQUAL
+    jne     vso_no
     inc     dword ptr [g_vs_refs]
     lea     r10, [g_vs_parts]
     mov     rax, qword ptr [r10+VOLP_handle]
@@ -528,12 +556,17 @@ vso_fresh:
     mov     rcx, qword ptr [rbp-24]
     call    file_close
     mov     rcx, qword ptr [rbp-16]
+    lea     rdx, [g_vol_base]
     call    vs_base_from_part
     test    eax, eax
-    jnz     vso_no                          ; not named like a member
+    jnz     vso_badset                      ; a member, but renamed: no siblings
     call    vs_assemble
     test    eax, eax
-    jnz     vso_no
+    jz      vso_have
+    cmp     eax, EXIT_CORRUPT
+    je      vso_badset
+    jmp     vso_no                          ; a part that would not READ: real I/O
+vso_have:
     mov     dword ptr [g_vs_on], 1
     mov     dword ptr [g_vs_refs], 1
     ; the handle handed back is part 1's, so a caller that closes it without
@@ -546,11 +579,40 @@ vso_plain:
     mov     rax, qword ptr [rbp-24]
     FRAME_EPILOG
     ret
+vso_badset:
+    ; The file IS a volume part, and the set it belongs to cannot be put
+    ; together.  Said separately from "could not open", because every caller
+    ; used to report this as an I/O failure - and the window, which only saw
+    ; INVALID, classified the part as a plain file and offered to ENCRYPT it.
+    mov     dword ptr [g_vs_badset], 1
 vso_no:
     mov     rax, INVALID
     FRAME_EPILOG
     ret
 vset_open endp
+
+; =============================================================================
+; vset_fail_report -> eax = EXIT_CORRUPT if the last vset_open refused an
+; incomplete or mismatched SET (message printed), else 0 (nothing printed: the
+; caller's own I/O report applies).
+;
+; One message for the three CLI readers that open containers (open_common,
+; do_unpack, idx_read), so they cannot drift into three wordings of it.
+; =============================================================================
+public vset_fail_report
+vset_fail_report proc frame
+    FRAME_PROLOG 32
+    xor     eax, eax
+    cmp     dword ptr [g_vs_badset], 0
+    je      vfr_ret
+    lea     rcx, [e_vset_bad]
+    mov     edx, e_vset_bad_len
+    call    print_err
+    mov     eax, EXIT_CORRUPT
+vfr_ret:
+    FRAME_EPILOG
+    ret
+vset_fail_report endp
 
 ; =============================================================================
 ; vol_part_suffix(rcx = wide path, rdx = length in chars with ".mrk" already
@@ -669,11 +731,13 @@ vis_no:
 vol_is_set endp
 
 ; =============================================================================
-; vs_base_from_part(rcx = a member's path) -> eax 0 ok, g_vol_base = the base
+; vs_base_from_part(rcx = a member's path, rdx = destination, VOL_PATH_CHARS)
+;   -> eax 0 ok, destination = the base
 ; Strips exactly ".partNNN.mrk".  A member that has been renamed cannot have its
 ; siblings found, and saying so beats guessing.
 ; =============================================================================
 vs_base_from_part proc
+    mov     r11, rdx                        ; destination, untouched until the copy
     mov     r10, rcx
     xor     r9, r9
 vbp_len:
@@ -712,7 +776,6 @@ vbp_widen:
     jmp     vbp_try
 vbp_match:
     mov     r9, rdx
-    lea     r11, [g_vol_base]
     xor     rax, rax
 vbp_copy:
     cmp     rax, r9
@@ -736,8 +799,11 @@ vs_base_from_part endp
 ; =============================================================================
 vs_assemble proc frame
     FRAME_PROLOG 96
+    ; [rbp-24] index  [rbp-32] part number  [rbp-40] the part being examined,
+    ; INVALID once the table owns it  [rbp-48] its size  [rbp-56] the verdict
     xor     r9d, r9d
     mov     dword ptr [rbp-24], r9d         ; index
+    mov     qword ptr [rbp-40], INVALID
     mov     qword ptr [g_vs_total], 0
 vsa_next:
     mov     eax, dword ptr [rbp-24]
@@ -781,6 +847,7 @@ vsa_next:
     add     r11, r10
     mov     rdx, qword ptr [rbp-40]
     mov     qword ptr [r11+VOLP_handle], rdx
+    mov     qword ptr [rbp-40], INVALID     ; the table owns it now
     mov     rdx, qword ptr [g_vs_total]
     mov     qword ptr [r11+VOLP_start], rdx
     mov     qword ptr [r11+VOLP_len], rax
@@ -798,16 +865,35 @@ vsa_next:
 vsa_end:
     ; ran out of parts without ever seeing the final flag: the tail is missing.
     ; Refusing here is the whole point of the flag.
-    mov     eax, EXIT_CORRUPT
-    FRAME_EPILOG
-    ret
 vsa_toomany:
 vsa_corrupt:
-    mov     eax, EXIT_CORRUPT
-    FRAME_EPILOG
-    ret
+    mov     dword ptr [rbp-56], EXIT_CORRUPT
+    jmp     vsa_release
 vsa_io:
-    mov     eax, EXIT_IO
+    mov     dword ptr [rbp-56], EXIT_IO
+vsa_release:
+    ; A refused set gives back EVERY handle it took: the part being examined and
+    ; all the parts already accepted.  These used to stay open for the life of the
+    ; process - and with FILE_SHARE_READ only, so the window kept the very parts
+    ; of an incomplete set locked against being moved, renamed or deleted while
+    ; the user tried to fix it.  g_vs_count is still 0 here, so nothing else would
+    ; ever have closed them.
+    mov     rcx, qword ptr [rbp-40]
+    cmp     rcx, INVALID
+    je      vsa_rel_tbl
+    call    file_close
+vsa_rel_tbl:
+    cmp     dword ptr [rbp-24], 0
+    je      vsa_rel_done
+    dec     dword ptr [rbp-24]
+    mov     r10d, dword ptr [rbp-24]
+    imul    r10, r10, VOL_PART_STRIDE
+    lea     r11, [g_vs_parts]
+    mov     rcx, qword ptr [r11+r10+VOLP_handle]
+    call    file_close
+    jmp     vsa_rel_tbl
+vsa_rel_done:
+    mov     eax, dword ptr [rbp-56]
     FRAME_EPILOG
     ret
 vs_assemble endp

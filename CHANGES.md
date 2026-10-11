@@ -6,9 +6,36 @@ ISO-8601 (`YYYY-MM-DD`).
 This file is maintained by hand alongside every change; each entry summarizes
 what changed and why, not a raw commit dump.
 
-## [Unreleased]
+## [1.1.4] - 2026-10-11
+
+### Fixed
+
+- **A volume set that cannot be assembled** - a part missing, out of order, or
+  from another set - went wrong three ways at once. The parts Myrkr had already
+  opened while checking were never closed, so the window kept them locked
+  (they could not be moved, renamed or deleted) until it exited; the window took
+  the part for an ordinary file and offered to encrypt it; and the CLI said
+  "I/O failure" (exit 2). It is now reported as an incomplete volume set, exit 4,
+  with an error in the window, and every part is released.
+- A second open of a container while a volume set was open joined that set
+  whatever path it named, so a different container would have read the set's
+  bytes. Nothing reached that (drag-out finishes before anything else can
+  open), but it is now a refusal unless the path names the same set.
 
 ### Tests and tooling
+
+- `tests/indepdecrypttest.py` decrypts Myrkr's containers with an
+  implementation that shares none of its code (Argon2id from RFC 9106,
+  pycryptodomex AES-GCM, the layout from `src/macros.inc`), across stored,
+  compressed, segmented, split and edited containers. It found that Myrkr's
+  Argon2id is not RFC 9106: the address block is indexed by a per-segment
+  counter rather than by block position, which differs in the first segment of
+  the first pass. Not a weakness, but no standard library derives a Myrkr key,
+  and the RFC's own vector is too small to show it. The test pins the current
+  behaviour for format versions up to 8; changing it is a format decision and
+  has not been made.
+- `volumetest.ps1` covers the three incomplete-set failures above, each shown
+  failing against 1.1.3.
 
 - `tools/compare.ps1` runs one test against an older commit and against the
   working tree, and passes only when the old build fails it and the new one

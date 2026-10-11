@@ -48,6 +48,8 @@ extern vol_discard:proc
 extern vol_finish:proc
 extern vset_open:proc                   ; volume.asm: the read side
 extern vset_close:proc
+extern vset_fail_report:proc            ; volume.asm: says WHY a set would not open
+externdef g_vs_badset:dword
 extern vol_get:proc
 extern vol_size:proc
 extern vol_is_set:proc
@@ -4469,7 +4471,7 @@ do_unpack proc frame
     lea     rcx, [g_pk_np]
     call    vset_open
     cmp     rax, INVALID
-    je      du_io
+    je      du_vsfail
     mov     qword ptr [rbp-24], rax
     mov     rcx, rax
     lea     rdx, [rbp-40]
@@ -4805,6 +4807,13 @@ du_nospace:
     prn     e_pnospace
     mov     eax, EXIT_NOSPACE
     jmp     du_done
+du_vsfail:
+    ; a part of a set that cannot be assembled is not an I/O failure
+    cmp     dword ptr [g_vs_badset], 0
+    je      du_io
+    call    progress_done
+    call    vset_fail_report
+    jmp     du_done
 du_io:
     call    progress_done
     prn     e_pio
@@ -5084,7 +5093,7 @@ idx_read proc frame
     lea     rcx, [g_pk_np]
     call    vset_open
     cmp     rax, INVALID
-    je      ir_io
+    je      ir_vsfail
     mov     qword ptr [rbp-24], rax
     mov     rcx, rax
     lea     rdx, [rbp-32]
@@ -5176,6 +5185,12 @@ ir_params:
 ir_oom:
     prn     e_poom
     mov     eax, EXIT_OOM
+    jmp     ir_close
+ir_vsfail:
+    ; a part of a set that cannot be assembled is not an I/O failure
+    cmp     dword ptr [g_vs_badset], 0
+    je      ir_io
+    call    vset_fail_report
     jmp     ir_close
 ir_io:
     prn     e_pio

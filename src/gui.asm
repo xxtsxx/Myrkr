@@ -200,6 +200,7 @@ externdef g_keep_key:dword
 externdef g_vol_limit:qword              ; volume.asm: 0 = do not split
 extern vset_open:proc                    ; volume.asm: a container may be a set
 extern vset_close:proc
+externdef g_vs_badset:dword             ; volume.asm: 1 = a part of an unassemblable set
 extern vol_get:proc
 extern vol_part_suffix:proc
 ; Where an append lands inside the archive.  Lives in pack.asm because that is
@@ -1569,11 +1570,12 @@ WSTR t_about,     <About Myrkr>
 ; belongs to the no-args window that this replaced.  This is the short version:
 ; enough to identify the build, with the repo one click away on the version
 ; label at the bottom left of the main window.
-WSTR m_about_body, <Myrkr v1.1.3 - AES-256-GCM + Argon2id file encryption. Drop files or folders onto the window, or use Add files. Project page: github.com/xxtsxx/Myrkr>
+WSTR m_about_body, <Myrkr v1.1.4 - AES-256-GCM + Argon2id file encryption. Drop files or folders onto the window, or use Add files. Project page: github.com/xxtsxx/Myrkr>
 WSTR m_nocpu,   <This CPU lacks the required AES-NI / PCLMULQDQ instructions.>
 CSTR c_nocpu,   "error: CPU lacks required features (AES-NI, PCLMULQDQ, SSE4.1)",13,10
 WSTR m_nopass,  <Please enter a password.>
 WSTR m_badpass, <The password contains invalid characters or is too long.>
+WSTR m_vset_bad, <This volume set is incomplete: a part is missing or out of order or belongs to a different set. Put every .partNNN.mrk file of the set in one folder and open any of them again.>
 WSTR m_policy,  <Password rejected: requires at least 12 characters and 3 of 4 classes (upper lower digit symbol).>
 WSTR m_nodest,  <Please choose a destination.>
 WSTR m_overwrite, <The output already exists. Overwrite it?>
@@ -1614,7 +1616,7 @@ WSTR s_ab_name,    <Myrkr>                  ; heading beside the icon
 ; the VERSIONINFO resource cheaply from here, so it is kept in step by hand:
 ; bump this WHENEVER myrkr.rc's FILEVERSION changes.  tools/constcheck.py cannot
 ; catch the drift - one side is an .rc, not an equ.
-WSTR s_ab_ver,     <Version 1.1.3.0>        ; version line (accent)
+WSTR s_ab_ver,     <Version 1.1.4.0>        ; version line (accent)
 WSTR s_ab_tag,     <AES-256-GCM authenticated encryption  -  Argon2id KDF>
 WSTR s_ab_foot,    <github.com/xxtsxx/Myrkr>
 WSTR s_ab_url,     <https://github.com/xxtsxx/Myrkr>   ; what clicking s_ab_foot opens
@@ -2072,6 +2074,8 @@ g_dbg_nodesk dd ?
 endif
 g_pw_ready   dd ?                            ; password already collected pre-window
 g_container  dd ?                            ; 1 = window shows a .mrk's contents
+g_badset_open dd ?                           ; 1 = detect_op was handed a part of a
+                                             ; set that cannot be assembled
 g_idx_bytes  dq ?                            ; bytes the inventory accounts for
 g_idx_files  dq ?                            ; inventory entries that are FILES
 g_idx_dirs   dq ?                            ; inventory entries that are DIRECTORIES
@@ -9570,10 +9574,20 @@ detect_op proc
     ; entry loop.  docs/VOLUMES.md section 8 says every path that opens a
     ; container has to go through the layer; this one was missed anyway because
     ; it does not look like a container reader - it is a classifier.
+    ;
+    ; A part whose SET cannot be assembled is still a container - not a file to
+    ; encrypt.  vset_open says which it was; without that the window took the
+    ; part for an ordinary file and offered to encrypt it, with a save dialog and
+    ; no word about the missing part.  gui_main reports it and exits.
+    mov     dword ptr [g_badset_open], 0
     lea     rcx, [g_filepath_w]
     call    vset_open
     cmp     rax, INVALID_HVAL
-    je      do_done
+    jne     do_opened
+    mov     eax, dword ptr [g_vs_badset]
+    mov     dword ptr [g_badset_open], eax
+    jmp     do_done
+do_opened:
     mov     qword ptr [rbp-8], rax       ; handle (or part 1's)
     mov     rcx, rax
     xor     rdx, rdx
@@ -14891,6 +14905,16 @@ gm_zwc:
     ; to "I changed my mind": nothing was started, so nothing is reported.
     cmp     dword ptr [g_has_file], 0
     je      gm_show
+    ; ---- a part of a set that cannot be assembled: say so, and stop ----------
+    cmp     dword ptr [g_badset_open], 0
+    je      gm_notbadset
+    lea     rcx, [m_vset_bad]
+    lea     rdx, [t_err]
+    mov     r8d, MB_OK or MB_ICONERROR
+    call    mbox
+    WINCALL DestroyWindow, qword ptr [g_hwnd]
+    jmp     gm_quit
+gm_notbadset:
     ; ---- a .mrk container OPENS; it does not extract itself ------------------
     ; Handing a container to Myrkr used to mean "decrypt this now", so the
     ; contents were gone before anyone had seen what they were.  Opening one now

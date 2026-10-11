@@ -124,7 +124,7 @@ cmd /c start /wait myrkr selftest
 | 1 | usage error - including a password that fails the policy, two inputs that would be stored under one name, an `add` of a name already in the container, and a `delete` naming something that is not there (nothing is changed) |
 | 2 | I/O failure |
 | 3 | authentication failed — wrong password, or the data was altered |
-| 4 | corrupt or invalid container |
+| 4 | corrupt or invalid container, including a volume set that cannot be assembled (a part missing, out of order, or from another set) |
 | 5 | out of memory |
 | 6 | this CPU lacks a required feature (AES-NI / PCLMULQDQ / SSE4.1) |
 | 7 | self-test failure |

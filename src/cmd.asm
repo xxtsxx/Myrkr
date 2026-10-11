@@ -51,6 +51,8 @@ extern do_pack:proc
 extern do_unpack:proc
 extern vset_open:proc                    ; volume.asm: a container may be a set
 extern vset_close:proc
+extern vset_fail_report:proc            ; volume.asm: says WHY a set would not open
+externdef g_vs_badset:dword
 extern vol_get:proc
 extern vol_size:proc
 extern vol_part_suffix:proc
@@ -580,7 +582,7 @@ open_common proc frame
     lea     rcx, [g_in_np]
     call    vset_open
     cmp     rax, INVALID
-    je      oc_io
+    je      oc_vsfail
     mov     qword ptr [rbp-24], rax
     mov     rcx, rax
     lea     rdx, [rbp-40]
@@ -830,6 +832,13 @@ oc_oom:
 oc_nospace:
     prn     e_nospace
     mov     eax, EXIT_NOSPACE
+    jmp     oc_done
+oc_vsfail:
+    ; a part of a set that cannot be assembled is not an I/O failure
+    cmp     dword ptr [g_vs_badset], 0
+    je      oc_io
+    call    progress_done
+    call    vset_fail_report
     jmp     oc_done
 oc_io:
     call    progress_done

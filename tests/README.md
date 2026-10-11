@@ -15,6 +15,7 @@ Full plan, rationale, scope, and results: [`docs/security-testing.md`](../docs/s
 | `lib/gui.psm1` | Not a test - the shared helpers for GUI tests: find a window by process and class, wait for it, press a button, type a password into the prompt, hit-test at a screen point, read a list row or a dbg global from outside the process, build a variant. New GUI tests should import it rather than declare their own P/Invoke class; `guifailtest.ps1` does. |
 | `zipboundstest.py` | Targeted ZIP64 record-length and filename validation, including valid controls. Included in `run.ps1`; standalone: `python tests/zipboundstest.py bin/myrkr.exe` after `build testio`. |
 | `nonceforktest.py` | Regression for native-container edit nonce reuse. Requires `build testio`; included in `run.ps1`. Checks fresh-key add/delete across copied containers, rollback on duplicate/missing input or corruption, and stored/compressed readback. |
+| `indepdecrypttest.py` | Decrypts containers Myrkr writes with an implementation that shares none of its code: Argon2id from RFC 9106 (checked against the RFC vector and a 64 MiB single-lane vector first), pycryptodomex AES-GCM, and the layout from `src/macros.inc`. Covers stored, compressed, single-file, segmented, split, non-ASCII-password and edited containers, and shows a wrong password and a flipped bit are refused. Pins Myrkr's one known deviation from RFC 9106 (address-block indexing in the KDF; see the file's header). Requires `build dbg`; included in Phase 2 of `run.ps1`. A symmetric mutation that Myrkr's own `verify` accepts fails it. |
 | `nativeeditguitest.ps1` | Requires `build dbg`; included in `run.ps1`. Checks small GUI removal, the 100 MiB warning, declining it, and cancelling a native rewrite. |
 
 ```powershell
@@ -22,7 +23,7 @@ Full plan, rationale, scope, and results: [`docs/security-testing.md`](../docs/s
 pwsh tests\run.ps1
 ```
 
-Requires Python 3 with `pyzipper` and `cryptography`. 
+Requires Python 3 with `pyzipper` (which brings `pycryptodomex`). 
 
 minutes (it runs Argon2id hundreds of times; `secsuite.py` runs its 200-sample
 salt check four at a time, each KDF holding 512 MiB).

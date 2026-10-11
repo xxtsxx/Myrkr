@@ -57,6 +57,11 @@ python (Join-Path $PSScriptRoot "redteam.py") $dbg
 $p2 = $LASTEXITCODE
 python (Join-Path $PSScriptRoot "nonceforktest.py") $dbg --segments
 $p2 = $p2 -bor $LASTEXITCODE
+# The format read by an implementation that shares no code with Myrkr - the one
+# check a writer and reader making the same mistake cannot pass together.  Here
+# rather than in Phase 1: its segmented and split cases need the dbg knobs.
+python (Join-Path $PSScriptRoot "indepdecrypttest.py") $dbg
+$p2 = $p2 -bor $LASTEXITCODE
 & $ps -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot "nativeeditguitest.ps1")
 $p2 = $p2 -bor $LASTEXITCODE
 & $ps -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot "cmdbartest.ps1")

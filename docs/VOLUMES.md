@@ -74,6 +74,14 @@ final flag rather than a silently short archive — which, after the inventory
 ceiling of 1.0.51, is a distinction this project has earned the right to care
 about.
 
+A set that cannot be assembled — a part missing, out of order, or from another
+set — is reported as exactly that: *incomplete volume set*, exit 4, and in the
+window an error rather than the encrypt view. Every part that was opened while
+checking is closed again, so the user can move or rename the parts to put the
+set right while Myrkr is still open. Until 1.1.4 all three went wrong: the CLI
+said "I/O failure", the window offered to encrypt the part, and the parts it had
+looked at stayed locked until it exited.
+
 ## 3. `set_id` is the membership proof
 
 Every part carries the container's `set_id`, which is 12 CSPRNG bytes drawn per
