@@ -36,7 +36,6 @@ what changed and why, not a raw commit dump.
   has not been made.
 - `volumetest.ps1` covers the three incomplete-set failures above, each shown
   failing against 1.1.3.
-
 - `tools/compare.ps1` runs one test against an older commit and against the
   working tree, and passes only when the old build fails it and the new one
   does not - the proof a regression test needs, which 1.1.3 did by hand.
