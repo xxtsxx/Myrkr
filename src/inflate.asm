@@ -4,8 +4,12 @@
 ; A direct port of the structure of Mark Adler's puff.c (public domain): a
 ; simple, auditable per-bit canonical-Huffman decoder with a 32 KiB LZ77 window
 ; realised directly in the caller's output buffer.  Used to inflate ZIP entries
-; (compression method 8) after WinZip-AES decryption.  Decompression only ever
-; runs on data that already passed HMAC authentication.
+; (compression method 8): after WinZip-AES decryption and HMAC authentication
+; for an encrypted entry - but an UNENCRYPTED zip is extracted too, and there
+; this parses attacker bytes with nothing in front of it.  Every bound below is
+; therefore load-bearing: distance against bytes produced, every write against
+; the output capacity, every read against the input, and the Huffman tables
+; refused when over-subscribed or incomplete (puff.c's rules).
 ;
 ;   inflate(rcx=src, rdx=srclen, r8=dst, r9=dstcap, [rbp+48]=*outlen) -> eax
 ;       eax = 0 success (and *outlen = bytes produced); nonzero = failure.

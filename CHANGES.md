@@ -6,6 +6,43 @@ ISO-8601 (`YYYY-MM-DD`).
 This file is maintained by hand alongside every change; each entry summarizes
 what changed and why, not a raw commit dump.
 
+## [Unreleased]
+
+### Fixed
+
+- **A zip that lied about an entry's size could make Myrkr consume that much
+  memory.** The sizes in a zip's central directory are the archive's word, and
+  three buffers were sized from them and then wiped at the claimed size on the
+  way out - touching every page of memory that had never been used. A 64 KiB
+  zip claiming a 3 GiB entry drove `unzip` (and extracting in the window, and
+  dragging the row out) to about 3 GiB of working set before it failed. Now an
+  entry's stored bytes must lie inside the archive (a compressed size past the
+  end of the file is reported as corrupt, exit 4, not as an I/O error), a
+  drag-out buffer is sized only to what the entry could hold, and every wipe
+  covers only the bytes actually written. The same zip now costs about 8 MiB.
+- **The window silently took only part of a large selection.** It holds at
+  most 256 inputs, and past that it stopped reading the command line: dropping
+  300 files onto Myrkr's icon or a shortcut, or sending them with Send To,
+  opened a window holding 256 with nothing on screen to say 44 were missing.
+  (The shell extension's menu caps a selection at 64, so its right-drag was
+  not affected; the stop would also have dropped its `--to` destination.) A
+  selection over the limit is now refused whole with an error - nothing is
+  encrypted - and a drop or picker past it keeps what fits and says some items
+  were not added.
+- **A path too long for an input slot was truncated, not refused.** A
+  4,108-character file path became its 4,095-character folder, so the folder's
+  other files would have been encrypted with it. It is now refused with an
+  error.
+
+### Tests
+
+- `tests/zipclaimtest.py` measures the peak working set of `unzip` and of the
+  drag-out data object against zips that lie about their sizes; it fails
+  against 1.1.5 and is part of Phase 1.
+- `tests/inputcaptest.ps1` covers the input limits from the command line and
+  from a drop, including the exact-256 boundary; it fails against 1.1.5 and is
+  part of Phase 2.
+
 ## [1.1.5] - 2026-10-11
 
 ### Changed - format version 9: the key is RFC 9106 Argon2id exactly

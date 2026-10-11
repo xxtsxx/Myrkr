@@ -70,6 +70,8 @@ $p2 = $p2 -bor $LASTEXITCODE
 $p2 = $p2 -bor $LASTEXITCODE
 & $ps -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot "guifailtest.ps1")
 $p2 = $p2 -bor $LASTEXITCODE
+& $ps -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot "inputcaptest.ps1")
+$p2 = $p2 -bor $LASTEXITCODE
 
 Write-Host "`n=== Phase 1: testio build (adversarial crypto/input tests) ==="
 Build "testio strict"
@@ -78,6 +80,8 @@ Remove-Item -Recurse -Force $wd -EA SilentlyContinue
 python (Join-Path $PSScriptRoot "secsuite.py") $exe $wd
 $p1 = $LASTEXITCODE
 python (Join-Path $PSScriptRoot "zipboundstest.py") $exe
+$p1 = $p1 -bor $LASTEXITCODE
+python (Join-Path $PSScriptRoot "zipclaimtest.py") $exe
 $p1 = $p1 -bor $LASTEXITCODE
 python (Join-Path $PSScriptRoot "longnametest.py") $exe
 $p1 = $p1 -bor $LASTEXITCODE

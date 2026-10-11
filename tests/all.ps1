@@ -16,7 +16,7 @@ $ps   = if (Get-Command pwsh -ErrorAction SilentlyContinue) { 'pwsh' } else { 'p
 $logs = Join-Path ([IO.Path]::GetTempPath()) ('myrkr-all-' + (Get-Date -Format 'yyyyMMdd-HHmmss'))
 New-Item -ItemType Directory $logs | Out-Null
 
-$hosted = @('nativeeditguitest', 'cmdbartest', 'listsurfacetest', 'guifailtest')   # run by run.ps1
+$hosted = @('nativeeditguitest', 'cmdbartest', 'listsurfacetest', 'guifailtest', 'inputcaptest')   # run by run.ps1
 $slow   = @('scaletest')
 $tests  = @('run') + @(Get-ChildItem (Join-Path $PSScriptRoot '*.ps1') |
           ForEach-Object BaseName | Where-Object { $_ -notin @('run', 'all') + $hosted } | Sort-Object)

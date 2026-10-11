@@ -454,6 +454,10 @@ WM_TIMER            equ 0113h
 WM_MOUSEWHEEL       equ 020Ah
 WM_APP_DONE         equ 08001h          ; WM_APP+1 posted by the worker thread
 WM_APP_INDEXED      equ 08002h          ; WM_APP+2 posted by the indexer thread
+; Posted by add_dropped / add_via_picker when items were turned away, so the
+; warning is shown AFTER IDropTarget::Drop returns: a modal box inside Drop would
+; hold the drag source (Explorer) until it was dismissed.
+WM_APP_ADDWARN      equ 08005h
 ifdef DBG_TRACE
 ; WM_APP+3, test builds only: run the registered IDropTarget against the data
 ; object currently on the clipboard.  Carries no pointer, so it crosses the
@@ -1575,6 +1579,10 @@ WSTR m_nocpu,   <This CPU lacks the required AES-NI / PCLMULQDQ instructions.>
 CSTR c_nocpu,   "error: CPU lacks required features (AES-NI, PCLMULQDQ, SSE4.1)",13,10
 WSTR m_nopass,  <Please enter a password.>
 WSTR m_badpass, <The password contains invalid characters or is too long.>
+WSTR t_notadded, <Some items were not added>
+WSTR m_notadded, <Some of the items were not added. Myrkr takes at most 256 items at once and cannot take a path longer than 4095 characters. Everything else is in the list - to include more add the folder that holds them instead.>
+WSTR m_too_many, <You selected more than 256 items - more than Myrkr can take at once. Nothing was encrypted. Select the folder that holds them instead.>
+WSTR m_too_long, <An item you selected has a path longer than 4095 characters - longer than Myrkr can take. Nothing was encrypted. Move it to a shorter path and try again.>
 WSTR m_vset_bad, <This volume set is incomplete: a part is missing or out of order or belongs to a different set. Put every .partNNN.mrk file of the set in one folder and open any of them again.>
 WSTR m_policy,  <Password rejected: requires at least 12 characters and 3 of 4 classes (upper lower digit symbol).>
 WSTR m_nodest,  <Please choose a destination.>
@@ -2076,6 +2084,10 @@ g_pw_ready   dd ?                            ; password already collected pre-wi
 g_container  dd ?                            ; 1 = window shows a .mrk's contents
 g_badset_open dd ?                           ; 1 = detect_op was handed a part of a
                                              ; set that cannot be assembled
+g_add_refused dd ?                           ; items append_input (or a drop) turned
+                                             ; away in the current add - see append_input
+g_argover    dd ?                            ; command-line inputs past MAX_ARGS
+g_arglong    dd ?                            ; command-line inputs too long for a slot
 g_idx_bytes  dq ?                            ; bytes the inventory accounts for
 g_idx_files  dq ?                            ; inventory entries that are FILES
 g_idx_dirs   dq ?                            ; inventory entries that are DIRECTORIES
@@ -2329,6 +2341,10 @@ append_input proc
     mov     eax, 1
     jmp     ai_ret
 ai_no:
+    ; Counted, so the caller can SAY so.  Refusing was always right; doing it
+    ; in silence was not - a drop of 300 files kept 256 with nothing on screen
+    ; to tell the user the other 44 were not in what they were about to encrypt.
+    inc     dword ptr [g_add_refused]
     xor     eax, eax
 ai_ret:
     add     rsp, 64
@@ -2382,6 +2398,7 @@ add_via_picker proc
     mov     dword ptr [rbp-40], ecx
     mov     qword ptr [rbp-8], 0
     mov     qword ptr [rbp-16], 0
+    mov     dword ptr [g_add_refused], 0
     WINCALL CoInitializeEx, 0, COINIT_APARTMENTTHREADED
     lea     rax, [rbp-8]
     WINCALL CoCreateInstance, addr clsid_fileopen, 0, CLSCTX_INPROC_SERVER, addr iid_ifileopen, rax
@@ -2505,6 +2522,10 @@ avp_uninit:
     jne     avp_nolist
     call    refresh_inputs
 avp_nolist:
+    cmp     dword ptr [g_add_refused], 0
+    je      @F
+    WINCALL PostMessageW, qword ptr [g_hwnd], WM_APP_ADDWARN, 0, 0
+@@:
     add     rsp, 160
     pop     rbp
     ret
@@ -2526,6 +2547,7 @@ add_dropped proc
     mov     rbp, rsp
     sub     rsp, 96
     mov     qword ptr [rbp-8], rcx
+    mov     dword ptr [g_add_refused], 0
     ; how many were dropped?
     WINCALL DragQueryFileW, qword ptr [rbp-8], 0FFFFFFFFh, 0, 0
     mov     dword ptr [rbp-16], eax
@@ -2545,7 +2567,10 @@ ad_loop:
     jz      ad_next
     inc     eax                             ; + terminator
     cmp     eax, MAX_PATH_CHARS
-    ja      ad_next                         ; longer than Windows can name
+    jbe     @F
+    inc     dword ptr [g_add_refused]       ; longer than Windows can name
+    jmp     ad_next
+@@:
     WINCALL DragQueryFileW, qword ptr [rbp-8], dword ptr [rbp-24],             addr g_dropbuf, MAX_PATH_CHARS
     test    eax, eax
     jz      ad_next
@@ -2565,6 +2590,10 @@ ad_done:
     jne     ad_nolist
     call    refresh_inputs
 ad_nolist:
+    cmp     dword ptr [g_add_refused], 0
+    je      @F
+    WINCALL PostMessageW, qword ptr [g_hwnd], WM_APP_ADDWARN, 0, 0
+@@:
     add     rsp, 96
     pop     rbp
     ret
@@ -13782,6 +13811,8 @@ wndproc proc
     je      wp_appdone
     cmp     rax, WM_APP_INDEXED
     je      wp_appindexed
+    cmp     rax, WM_APP_ADDWARN
+    je      wp_addwarn
     cmp     rax, WM_DRAWITEM
     je      wp_drawitem
     cmp     rax, WM_NOTIFY
@@ -14578,6 +14609,12 @@ wp_appdone:
 wp_appindexed:
     call    on_index_done
     jmp     wp_zero
+wp_addwarn:
+    lea     rcx, [m_notadded]
+    lea     rdx, [t_notadded]
+    mov     r8d, MB_OK or MB_ICONWARNING
+    call    mbox
+    jmp     wp_zero
 
 wp_close:
     cmp     dword ptr [g_running], 0
@@ -14744,14 +14781,27 @@ gm_chkhelp:
     call    show_about                           ; -h / --help / help
     jmp     gm_quit
 gm_gather:
-    ; argv[1..] become inputs (capped at MAX_ARGS)
+    ; argv[1..] become inputs - ALL of them or none.
+    ;
+    ; This loop used to stop at MAX_ARGS inputs and ignore the rest of argv,
+    ; which dropped files without a word - 300 files dropped on the program
+    ; icon opened a window holding 256 - and would have dropped a trailing
+    ; "--to <dir>" with them (the shell extension caps its menu at 64 files, so
+    ; it never sent that many).  And it copied each path with wcopy, which
+    ; truncates to the slot - a 4,108-char file path became its 4,095-char
+    ; FOLDER, siblings and all.
+    ;
+    ; Now it reads every argument, takes only what fits, and COUNTS what does
+    ; not (g_argover, g_arglong).  gui_main refuses the whole start if either is
+    ; set: encrypting part of what the user selected is the outcome to avoid, so
+    ; the answer is "nothing", said out loud, never "most of it".
+    mov     dword ptr [g_argover], 0
+    mov     dword ptr [g_arglong], 0
     mov     qword ptr [rbp-24], 1                ; argv index
     mov     qword ptr [rbp-32], 0                ; input index
 gm_argloop:
     mov     eax, dword ptr [g_argc]
     cmp     qword ptr [rbp-24], rax
-    jae     gm_argdone
-    cmp     qword ptr [rbp-32], MAX_ARGS
     jae     gm_argdone
     mov     rax, qword ptr [rbp-16]
     mov     r10, qword ptr [rbp-24]
@@ -14779,13 +14829,33 @@ gm_argloop:
     add     qword ptr [rbp-24], 2                ; consume both
     jmp     gm_argloop
 gm_notto:
+    cmp     qword ptr [rbp-32], MAX_ARGS
+    jb      gm_room
+    inc     dword ptr [g_argover]                ; no slot left: counted, not taken
+    jmp     gm_argnext
+gm_room:
+    ; slot 0 is g_filepath_w, the rest are g_inslots entries - smaller
+    mov     rcx, qword ptr [rbp-40]
+    call    wlen
+    inc     rax                                  ; + terminator
+    mov     r10, SLOT_CHARS
+    cmp     qword ptr [rbp-32], 0
+    jne     @F
+    mov     r10, FILEPATH_CHARS
+@@:
+    cmp     rax, r10
+    jbe     gm_fits
+    inc     dword ptr [g_arglong]                ; would be truncated: refused
+    jmp     gm_argnext
+gm_fits:
     mov     rcx, qword ptr [rbp-32]
     call    slot_addr                            ; rax = dst slot, r8 = its bound
     mov     rcx, rax
-    mov     rdx, qword ptr [rbp-40]              ; argv[i] - attacker-length path
+    mov     rdx, qword ptr [rbp-40]              ; argv[i] - known to fit now
     call    wcopy                                ; r8 still holds slot_addr's bound
-    inc     qword ptr [rbp-24]
     inc     qword ptr [rbp-32]
+gm_argnext:
+    inc     qword ptr [rbp-24]
     jmp     gm_argloop
 gm_argdone:
     ; Zero inputs is no longer a reason to quit - it is the empty window.
@@ -14903,6 +14973,22 @@ gm_zwc:
     ;
     ; Cancelling exits without ever painting a window, which is the honest answer
     ; to "I changed my mind": nothing was started, so nothing is reported.
+    ; ---- more inputs than fit, or one too long: refuse the whole start ------
+    ; Before the empty-window check: if every input was refused, g_has_file is
+    ; 0 and the window would otherwise open empty with nothing said.
+    lea     rcx, [m_too_many]
+    cmp     dword ptr [g_argover], 0
+    jne     gm_refuse_args
+    lea     rcx, [m_too_long]
+    cmp     dword ptr [g_arglong], 0
+    je      gm_args_ok
+gm_refuse_args:
+    lea     rdx, [t_err]
+    mov     r8d, MB_OK or MB_ICONERROR
+    call    mbox
+    WINCALL DestroyWindow, qword ptr [g_hwnd]
+    jmp     gm_quit
+gm_args_ok:
     cmp     dword ptr [g_has_file], 0
     je      gm_show
     ; ---- a part of a set that cannot be assembled: say so, and stop ----------

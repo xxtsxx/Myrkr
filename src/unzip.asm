@@ -493,6 +493,7 @@ extract_zip_entry proc frame
     mov     qword ptr [rbp-136], INVALID
     mov     qword ptr [rbp-152], 0
     mov     qword ptr [rbp-160], 0
+    mov     qword ptr [rbp-216], 0           ; bytes inflated: what the free wipes
     movzx   eax, word ptr [rcx+8]
     mov     qword ptr [rbp-72], rax          ; flag
     movzx   eax, word ptr [rcx+10]
@@ -654,6 +655,16 @@ eze_file:
     add     rax, r8
     add     rax, r9
     mov     qword ptr [rbp-128], rax         ; data offset
+    ; ---- the stored bytes must lie inside the archive ------------------------
+    ; csize is the archive's word, and every buffer below is sized from it: the
+    ; deflate path allocates csize for its input and reads into it.  A 64 KiB
+    ; zip claiming gigabytes committed that much, the read came up short, and
+    ; the cleanup then wiped the whole claim - every page touched.  zip_delete
+    ; has bounded exactly this from the start; extraction did not.
+    add     rax, qword ptr [rbp-32]          ; dataoff + csize
+    jc      eze_corrupt
+    cmp     rax, qword ptr [g_uz_size]
+    ja      eze_corrupt
     ; ---- compute CRC-need (AE-1 or unencrypted) ----------------------------
     mov     qword ptr [rbp-176], 0
     mov     rax, qword ptr [rbp-64]
@@ -1185,8 +1196,11 @@ eze_ret:
     call    uz_sink_close
     cmp     qword ptr [rbp-152], 0           ; free deflate output buffer
     je      @F
+    ; Wipe what inflate WROTE, not the declared usize: past that the pages are
+    ; untouched zeros from VirtualAlloc, and wiping them faulted every one in -
+    ; a 64 KiB entry declaring 500 MiB cost 500 MiB of working set to discard.
     mov     rcx, qword ptr [rbp-152]
-    mov     rdx, qword ptr [rbp-40]
+    mov     rdx, qword ptr [rbp-216]
     call    mem_free
 @@:
     cmp     qword ptr [rbp-160], 0           ; free deflate input buffer
@@ -1391,6 +1405,52 @@ ueu_zero:
 ueu_done:
     ret
 uz_entry_usize endp
+
+; =============================================================================
+; uz_entry_csize(rcx = central-dir header ptr) -> rax = compressed size, or -1
+; when the 0xFFFFFFFF sentinel points at a ZIP64 extra that is not there.
+; ZIP64 stores its fields in a fixed order and only those whose 32-bit field
+; holds the sentinel, so csize sits after usize only when usize was escaped too.
+; Leaf, like uz_entry_usize.
+; =============================================================================
+uz_entry_csize proc
+    mov     eax, dword ptr [rcx+20]          ; csize
+    cmp     eax, 0FFFFFFFFh
+    jne     uec_done
+    movzx   r8d, word ptr [rcx+28]           ; nlen
+    movzx   r9d, word ptr [rcx+30]           ; elen
+    lea     r10, [rcx+46]
+    add     r10, r8                          ; extra-field ptr = ch+46+nlen
+    xor     r11, r11
+uec_loop:
+    mov     rdx, r11
+    add     rdx, 4
+    cmp     rdx, r9
+    ja      uec_bad
+    movzx   eax, word ptr [r10+r11]
+    movzx   edx, word ptr [r10+r11+2]
+    cmp     eax, 1
+    je      uec_found
+    add     r11, 4
+    add     r11, rdx
+    jmp     uec_loop
+uec_found:
+    mov     rdx, 4                           ; past the field header
+    cmp     dword ptr [rcx+24], 0FFFFFFFFh
+    jne     @F
+    add     rdx, 8                           ; usize came first
+@@:
+    lea     rax, [r11+rdx+8]
+    cmp     rax, r9
+    ja      uec_bad
+    add     r11, rdx
+    mov     rax, qword ptr [r10+r11]
+    ret
+uec_bad:
+    mov     rax, -1
+uec_done:
+    ret
+uz_entry_csize endp
 
 ; =============================================================================
 ; do_unzip -> eax exit code
@@ -1837,9 +1897,36 @@ zem_found:
     ; length and delivers another is REFUSED by uz_mem_take rather than
     ; overflowing.  A zip that lies about a size is exactly the input this has
     ; to survive.
+    ;
+    ; But only a size this entry COULD have.  The declared size is the
+    ; archive's word, and it used to be allocated as stated: a 64 KiB entry
+    ; that claimed 3 GiB committed 3 GiB, and when it then failed (as it must)
+    ; zem_failbuf wiped all 3 GiB - touching every page, 2.9 GiB of working set
+    ; for one drag of one row, on the GUI thread.  Two facts bound it:
+    ;   - the stored bytes cannot exceed the archive they are in;
+    ;   - an entry larger than its stored bytes is compressed, and the deflate
+    ;     path refuses anything past DEFLATE_RD_CAP anyway (eze_deflate).
+    ; So the most an honest entry needs is max(csize, DEFLATE_RD_CAP), with
+    ; csize itself no larger than the file.
+    mov     rcx, qword ptr [rbp-104]
+    call    uz_entry_csize
+    mov     qword ptr [rbp-120], rax          ; csize (or -1: unreadable)
+    mov     rcx, qword ptr [g_uz_hin]
+    lea     rdx, [rbp-128]
+    call    get_file_size
+    test    eax, eax
+    jnz     zem_corrupt
+    mov     rax, qword ptr [rbp-120]
+    cmp     rax, qword ptr [rbp-128]
+    ja      zem_corrupt                       ; also catches -1
     mov     rcx, qword ptr [rbp-104]
     call    uz_entry_usize
     mov     qword ptr [rbp-88], rax
+    cmp     rax, qword ptr [rbp-120]
+    jbe     zem_sized                         ; no larger than what is stored
+    cmp     rax, DEFLATE_RD_CAP
+    ja      zem_corrupt                       ; larger, and past what inflates
+zem_sized:
     mov     rcx, rax
     call    mem_alloc                         ; mem_alloc already floors 0 at 1
     test    rax, rax
@@ -1866,12 +1953,17 @@ zem_failbuf:
     ; The tag did not pass, or the read broke part way.  What is in there is
     ; unauthenticated plaintext, so it goes back wiped and the caller is told
     ; nothing - the buffer is the .part file, and this is deleting it.
+    ;
+    ; Wiped as far as anything was WRITTEN (g_uz_memlen), not to the declared
+    ; size: past that point the pages are fresh from VirtualAlloc, zero and
+    ; never touched, and wiping them only forced every one into memory.
     mov     rcx, qword ptr [rbp-80]
-    mov     rdx, qword ptr [rbp-88]
+    mov     rdx, qword ptr [g_uz_memlen]
     call    mem_free
     mov     qword ptr [rbp-80], 0
     mov     rax, qword ptr [rbp-96]
     jmp     zem_ret
+zem_corrupt:                                  ; a size the entry cannot have
 zem_notfound:
     mov     eax, EXIT_CORRUPT
     jmp     zem_ret
@@ -2022,6 +2114,15 @@ zrc_have:
     mov     rax, qword ptr [rbp-40]
     mov     qword ptr [g_cdoff], rax
     ; ---- read the central directory into memory (cap-bounded) --------------
+    ; ...and file-bounded.  CD_CAP alone let a few hundred bytes of zip whose
+    ; end record claimed a 256 MiB directory commit 256 MiB, fail the read, and
+    ; have every caller's cleanup wipe g_cdsize bytes of untouched pages.  The
+    ; directory is IN the file, so it cannot extend past the end of it.
+    mov     rax, qword ptr [rbp-40]
+    add     rax, qword ptr [rbp-48]          ; cdoff + cdsize
+    jc      zrc_bad
+    cmp     rax, qword ptr [g_uz_size]
+    ja      zrc_bad
     mov     rax, qword ptr [rbp-48]
     cmp     rax, CD_CAP
     ja      zrc_bad
