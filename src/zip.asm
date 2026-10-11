@@ -32,6 +32,8 @@ extern zip_read_cd:proc
 extern zip_check_password:proc
 extern add_prefix_copy:proc
 extern pfx_select:proc
+extern name_clash:proc
+externdef g_edit_reason:dword
 extern sanitize_name:proc
 extern report_source_name_limit:proc
 externdef g_add_prefixlen:qword
@@ -1369,6 +1371,19 @@ dz_polok:
     call    normalize_path
     test    eax, eax
     jnz     dz_io0
+    ; the same refusal as do_pack: two inputs on one stored name (or one that
+    ; differs only in case) would make a zip whose extraction loses one of them
+    mov     dword ptr [g_edit_reason], 0
+    xor     ecx, ecx
+    xor     edx, edx
+    xor     r8d, r8d
+    mov     r9d, 1
+    call    name_clash
+    test    eax, eax
+    jz      dz_noclash
+    mov     eax, EXIT_USAGE
+    jmp     dz_ret0
+dz_noclash:
     ; sum input sizes (progress + disk pre-flight)
     mov     qword ptr [rbp-32], 0
     mov     qword ptr [rbp-24], 0

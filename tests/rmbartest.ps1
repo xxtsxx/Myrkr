@@ -117,7 +117,10 @@ try {
   [void][R]::PostMessageW($m,0x0111,[IntPtr]161,[IntPtr]::Zero)   # ID_CMD_REMOVE
   # sample the bar while it runs
   $seen=@(); for($i=0;$i -lt 120;$i++){ Start-Sleep -Milliseconds 100
-    $pct=D $p 'g_prog_pct'; if($pct -ge 0){ $seen += $pct }
+    # only while the job runs: on completion the window resets g_prog_pct to 0
+    # for the next job, and a sample of THAT reads as the bar going backwards
+    $pct=D $p 'g_prog_pct'; $run=D $p 'g_running'
+    if($pct -ge 0 -and $run -eq 1){ $seen += $pct }
     if ((D $p 'g_running') -eq 0 -and $i -gt 8) { break } }
   $done  = Q $p 'g_prog_done'
   $total = Q $p 'g_prog_total'

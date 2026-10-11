@@ -178,7 +178,8 @@ $m=[Z]::Find([uint32]$p.Id,"myrkr_window")
 if($m -eq [IntPtr]::Zero){"FAIL no main window when opening the container"; $fail++; exit 1}
 $title = [Z]::Txt($m); $action = [Z]::Txt([Z]::ById($m,104))
 "opened        : title='$title'  action='$action'"
-if ($action -ne 'Decrypt') { "  FAIL the window is not the container view - a drop will not reach the archive"; $fail++ }
+# The open-container action is "Extract all" since 1.1.1 (it was "Decrypt").
+if ($action -ne 'Extract all') { "  FAIL the window is not the container view - a drop will not reach the archive"; $fail++ }
 else { "  ok   the container opened in a window that can be worked in" }
 $lv=[Z]::ById($m,109)
 "                rows=$([int][Z]::SendMessageW($lv,0x1004,[IntPtr]::Zero,[IntPtr]::Zero))"

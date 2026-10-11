@@ -2,6 +2,9 @@
 # test windows are inspected; no desktop capture or pointer/clipboard changes.
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
+# Windows PowerShell 5.1 does not load this assembly on its own (PowerShell 7
+# does), and without it [IO.Compression.ZipFile] is an unknown type.
+Add-Type -AssemblyName System.IO.Compression.FileSystem
 Add-Type @'
 using System;
 using System.Runtime.InteropServices;

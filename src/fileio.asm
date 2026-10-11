@@ -30,6 +30,7 @@ GENERIC_WRITE       equ 40000000h
 FILE_SHARE_READ     equ 1
 OPEN_EXISTING       equ 3
 CREATE_ALWAYS       equ 2
+CREATE_NEW          equ 1
 FILE_ATTR_NORMAL    equ 80h
 MEM_COMMIT          equ 1000h
 MEM_RESERVE         equ 2000h
@@ -232,6 +233,20 @@ file_open_write proc frame
     FRAME_EPILOG
     ret
 file_open_write endp
+
+; file_open_new(rcx = wpath) -> rax = handle (or -1)
+; CREATE_NEW: fails if ANYTHING already has the name - a file, a directory, a
+; link.  Extraction writes into a fresh random sibling through this and renames
+; it over the real name only once its bytes have verified, so an existing file
+; is never truncated before that point and a pre-placed hardlink is replaced
+; rather than written through.
+public file_open_new
+file_open_new proc frame
+    FRAME_PROLOG 64
+    WINCALL CreateFileW, rcx, GENERIC_WRITE, 0, 0, CREATE_NEW, FILE_ATTR_NORMAL, 0
+    FRAME_EPILOG
+    ret
+file_open_new endp
 
 ; get_file_size(rcx = handle, rdx = *size) -> eax 0/EXIT_IO
 public get_file_size

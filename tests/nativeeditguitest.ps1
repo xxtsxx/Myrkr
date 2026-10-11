@@ -46,6 +46,11 @@ public class EditGuardUI {
   }
 }
 '@
+function Get-HashOrNull($path) {
+    # The rewrite holds a write-excluding handle on the source while it works,
+    # so a hash taken mid-rewrite is a sharing violation: that means "not yet".
+    try { return (Get-FileHash -LiteralPath $path -ErrorAction Stop).Hash } catch { return $null }
+}
 function Wait-Window($class) {
     for ($i=0; $i -lt 100; $i++) {
         if ($p.HasExited) { throw 'Test process exited unexpectedly' }
@@ -113,13 +118,18 @@ try {
             [void][EditGuardUI]::PostMessageW($main,0x111,[IntPtr]107,[IntPtr]::Zero)
             if ([EditGuardUI]::Find([uint32]$p.Id, 'myrkr_mbox') -eq [IntPtr]::Zero) { break }
         }
-        Start-Sleep -Milliseconds 500
-        if ((Get-FileHash -LiteralPath $mrk).Hash -ne $before) { throw 'Worker cancellation changed source' }
+        # Wait for the cancelled job to let go of the source.  A cancel is honoured
+        # at the next check, and the key derivation before the first one cannot be
+        # interrupted - at the default cost that alone outlasts a fixed sleep.
+        $h = $null
+        for ($i=0; $i -lt 150 -and -not $h; $i++) { Start-Sleep -Milliseconds 100; $h = Get-HashOrNull $mrk }
+        if ($h -ne $before) { throw 'Worker cancellation changed source' }
         'PASS: cancelling native removal leaves the source unchanged'
     } else {
         for ($i=0; $i -lt 100; $i++) {
             Start-Sleep -Milliseconds 100
-            if ((Get-FileHash -LiteralPath $mrk).Hash -ne $before) { break }
+            $h = Get-HashOrNull $mrk
+            if ($h -and $h -ne $before) { break }
         }
         if ((Get-FileHash -LiteralPath $mrk).Hash -eq $before) { throw 'Small GUI rewrite did not complete' }
         'PASS: small native removal rewrites without a large-file warning'

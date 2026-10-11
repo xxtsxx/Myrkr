@@ -259,23 +259,40 @@ asked for has always been authenticated.
 
 **An extraction that fails part-way leaves the files it had already finished.**
 Every one of them carries its own authentication tag and was verified before
-being written, so nothing on disk is unverified — but the *set* is short. An
+taking its name, so nothing on disk is unverified — but the *set* is short. An
 attacker who can corrupt a container therefore chooses where the extraction
 stops, and so which files you end up with. Myrkr says so — on stderr, and in the
 window with a message that replaces the usual cause box precisely because a
 folder with files in it reads as a partial success — and exits non-zero. Treat a
 run that reported a failure as having produced nothing, whatever is in the
-folder. Per-file `.part` naming would close this for archives too, at one rename
-per file; it is not done, and this entry exists so the choice is visible rather
-than implied.
+folder.
 
-**Extracting an archive replaces files in the destination, without asking.**
-Entries are written with `CREATE_ALWAYS`, so if the output folder already holds a
-file whose name an entry matches, the entry wins and the old file is gone. A
-*single-file* decrypt does prompt. The asymmetry is real and not principled — an
-archive would need the question per file, which the window has no dialog for —
-so extract into an empty folder if what is already there matters. Found during
-the 1.0.71 audit, where a code comment asserted the opposite.
+**Extracting an archive replaces files in the destination, without asking — but
+only with a verified file.** Since 1.1.3 every entry is written into a fresh,
+randomly named sibling opened with `CREATE_NEW`, and renamed over the real name
+only once all of its bytes have authenticated (or, for a plain zip entry, passed
+its CRC). So an existing file whose name an entry matches is replaced whole by
+an authentic copy, or not touched at all: a damaged entry, an I/O error or a
+Cancel leaves it exactly as it was and deletes only the temporary sibling. Up to
+1.1.2 the entry was written into the real name and deleted when it failed —
+which destroyed the user's existing file along with the archive's copy, with no
+attacker needed, only a damaged backup extracted over working files. The rename
+also *replaces* a hardlink planted at an output name instead of writing through
+it into the file it links to. A *single-file* decrypt still prompts before
+replacing its output; an archive does not ask per file, so extract into an empty
+folder if what is already there matters.
+
+**Extraction refuses to write through a junction or symbolic link inside the
+destination** (1.1.3). An archive entry `evil/x` aimed at a destination that
+already holds a junction `evil` used to land wherever the junction pointed — the
+Startup folder, say. Every folder on the way in, below the destination, is now
+checked and the run stops (exit 9) if one is a junction, symbolic link or mount
+point. The destination itself is trusted — a redirected folder is a junction,
+and extracting into it is ordinary — and cloud-file placeholders, which are
+reparse points but not links, are not refused. **The check is by path**: a
+folder swapped for a link by someone racing inside the destination *while* the
+extraction runs is not caught. A link planted beforehand, which is the case that
+matters, is.
 
 **The private desktop can be turned off** by policy (`MYRKR_SECUREDESKTOP=0`).
 Doing so restores the window-message surface it exists to remove. It is a

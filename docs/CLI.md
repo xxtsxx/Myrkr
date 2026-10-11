@@ -121,7 +121,7 @@ cmd /c start /wait myrkr selftest
 | Code | Meaning |
 |----:|---------|
 | 0 | success |
-| 1 | usage error (including a password that fails the policy) |
+| 1 | usage error - including a password that fails the policy, two inputs that would be stored under one name, an `add` of a name already in the container, and a `delete` naming something that is not there (nothing is changed) |
 | 2 | I/O failure |
 | 3 | authentication failed — wrong password, or the data was altered |
 | 4 | corrupt or invalid container |
@@ -129,7 +129,7 @@ cmd /c start /wait myrkr selftest
 | 6 | this CPU lacks a required feature (AES-NI / PCLMULQDQ / SSE4.1) |
 | 7 | self-test failure |
 | 8 | not enough free disk space (checked before anything is written) |
-| 9 | the input uses something Myrkr will not act on (e.g. editing a volume set) |
+| 9 | the input uses something Myrkr will not act on - editing a volume set, or extracting through a junction or symbolic link inside the destination |
 | 10 | partial success |
 | 11 | cancelled by the user; the archive was put back |
 

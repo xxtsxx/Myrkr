@@ -166,7 +166,7 @@ All source is in `src/`. The build order (and `SOURCES` in `build.cmd`) is:
 | `compress.asm` | Thin wrappers over the Windows Compression API (`CreateCompressor`/`Compress`, Cabinet.dll) for XPRESS block **compression**. Decompression is not here: it needs a handle per open stream rather than one in a global, because two entries can be read at once, so it lives in `estream.asm` with the rest of the entry decoder. |
 | `zip.asm` | Encrypted-ZIP **writer** reached from `zip`: recursive input walk, per-entry DEFLATE compression (store fallback), fresh-salt PBKDF2 key derivation, AES-256-CTR encryption with HMAC-SHA1 authentication, and ZIP local/central/EOCD emission with automatic ZIP64. AE-2. An interoperability compromise, not the hardened `.mrk` path. |
 | `deflate.asm` | Raw DEFLATE (RFC 1951) **encoder** used by the ZIP writer: per-32-KiB-chunk fixed-Huffman blocks with an LZ77 hash-chain matcher. Produces a standard bitstream any inflate (ours, zlib, 7-Zip) decodes; the caller stores any entry it fails to shrink. |
-| `unzip.asm` | **Streaming** encrypted-ZIP (WinZip AES-128/192/256) extractor reached from `unzip` (positioned reads, bounded memory; stored entries stream to `OUTPUT.part` then rename): EOCD/central-directory/local-header parsing (incl. ZIP64), AES extra-field (0x9901) handling, per-entry PBKDF2 key derivation, password-verify, HMAC-SHA1 authentication, AES-256-CTR decryption, DEFLATE/STORE output, CRC-32 check, and traversal-safe writing (reuses `sanitize_name`/`create_parents`). Also exports `zip_is_encrypted` — a self-contained central-directory probe (method 99 / encrypted-bit, no allocation) used by the CLI parser and the GUI to decide whether a password is needed at all. And exports `zip_entry_to_mem`, which is the same reader with its output diverted: setting `g_uz_mem` redirects all three of its sinks (the AES-stored `.part` loop, the unencrypted stored loop, and the whole-buffer deflate write) into a caller-owned buffer, so dragging an entry out of a zip does not need a second WinZip-AES implementation. The buffer is the `.part` file - it is sized from the entry's declared length and capped there, so an archive that lies about a size is refused rather than overflowing, and a failed entry is wiped and reported rather than handed back. |
+| `unzip.asm` | **Streaming** encrypted-ZIP (WinZip AES-128/192/256) extractor reached from `unzip` (positioned reads, bounded memory; every entry is written to a random `CREATE_NEW` sibling and renamed into place only once its HMAC or CRC has verified, and `extract_guard` refuses junctions and symbolic links on the way in): EOCD/central-directory/local-header parsing (incl. ZIP64), AES extra-field (0x9901) handling, per-entry PBKDF2 key derivation, password-verify, HMAC-SHA1 authentication, AES-256-CTR decryption, DEFLATE/STORE output, CRC-32 check, and traversal-safe writing (reuses `sanitize_name`/`create_parents`). Also exports `zip_is_encrypted` — a self-contained central-directory probe (method 99 / encrypted-bit, no allocation) used by the CLI parser and the GUI to decide whether a password is needed at all. And exports `zip_entry_to_mem`, which is the same reader with its output diverted: setting `g_uz_mem` redirects all three of its sinks (the AES-stored `.part` loop, the unencrypted stored loop, and the whole-buffer deflate write) into a caller-owned buffer, so dragging an entry out of a zip does not need a second WinZip-AES implementation. The buffer is the `.part` file - it is sized from the entry's declared length and capped there, so an archive that lies about a size is refused rather than overflowing, and a failed entry is wiped and reported rather than handed back. |
 | `crc32.asm` | Table-driven IEEE CRC-32 (poly 0xEDB88320) — ZIP entry integrity. (The SSE4.2 `crc32` instruction is CRC-32**C**, a different polynomial, so it can't be used.) |
 | `sha1.asm` | Software SHA-1, HMAC-SHA1 and PBKDF2-HMAC-SHA1 — used only for WinZip-AES key derivation and entry authentication. |
 | `inflate.asm` | Hand-written raw DEFLATE (RFC 1951) decompressor — a structural port of Mark Adler's puff.c (per-bit canonical-Huffman decode, 32 KiB LZ77 window). Inflates ZIP entries after they pass HMAC authentication. |
@@ -1789,15 +1789,19 @@ authenticated. This used to be provided by a whole temporary copy of the
 plaintext; a rename in the same directory buys the same property for one
 metadata operation.
 
-An **archive** writes each entry under its real name as it goes, deleting the
-one it was working on if that entry fails. It has always done this — the tar
-walk did too — and it is not free to change: a `.part` per entry is a rename per
-file, which at the scale this codebase is being taken to (see
-`docs/FORMAT_V5.md`) is a real cost. The consequence, stated rather than
-implied: an extraction that fails part way leaves the entries that had already
-been verified, so the folder is authentic but SHORT, and an attacker who can
-corrupt a container chooses where it stops. Both the CLI and the window say so
-explicitly rather than reporting only the cause — `e_pincomplete` and
+An **archive** writes each entry into a fresh, randomly named sibling
+(`make_temp_sibling`, opened `CREATE_NEW`) and renames it over the real name
+only once the entry's tag has verified (`commit_temp`). Up to 1.1.2 it wrote the
+real name directly and deleted it on failure, which made a damaged entry - or a
+Cancel - destroy a file the user already had under that name, and wrote through
+a planted hardlink; the per-entry rename this paragraph once called too costly
+was measured at 20,000 files and is not, because `extract_guard` caches the
+folder chain it has verified and so also skips the per-file `create_parents`
+the old path paid (net 9% faster). The consequence that remains, stated rather
+than implied: an extraction that fails part way leaves the entries that had
+already been verified, so the folder is authentic but SHORT, and an attacker who
+can corrupt a container chooses where it stops. Both the CLI and the window say
+so explicitly rather than reporting only the cause - `e_pincomplete` and
 `m_part_extract`, gated on `g_unpack_partial`.
 
 `verify` authenticates with no output at all and avoids this entirely — for

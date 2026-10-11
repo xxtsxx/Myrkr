@@ -528,8 +528,9 @@ that a test caught rather than a user.
 
 **There are three sinks, not two.** §7e counted `uz_write_file` and the stored
 path's chunked writes. `extract_zip_entry` actually has three: the AES-stored
-loop writes to `OUTPUT.part` and renames, the *unencrypted* stored loop writes
-straight to the output, and the deflate path writes one whole buffer. They now
+loop writes to a temporary and renames, the *unencrypted* stored loop wrote
+straight to the output (since 1.1.3 it, too, goes through a temporary renamed in
+only after its CRC passes), and the deflate path writes one whole buffer. They now
 go through `uz_sink_open`/`uz_sink_write`/`uz_sink_close`/`uz_sink_discard`,
 which check one global and otherwise call exactly what they used to. The proc
 was not restructured, which was the constraint.

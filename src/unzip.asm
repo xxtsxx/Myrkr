@@ -83,6 +83,13 @@ externdef g_cfg_passlen:dword
 externdef g_namew:word
 externdef g_extw:word
 externdef g_outdir_np:word
+externdef g_unpack_link:dword
+; pack.asm's extraction guards - one implementation for both extractors
+extern file_open_new:proc
+extern extract_guard:proc
+extern make_temp_sibling:proc
+extern commit_temp:proc
+extern extract_guard_reset:proc
 
 INVALID         equ -1
 CP_UTF8         equ 65001
@@ -109,13 +116,13 @@ CSTR e_uz_name,   "myrkr: unsafe entry name rejected",13,10
 CSTR e_uz_namelimit, "myrkr: ZIP entry name exceeds Myrkr's 4094 UTF-8 byte relative-path limit (ZIP permits 65535 bytes; ZIP64 does not extend names). Rejected entry: ",13,10
 CSTR e_uz_pathlimit, "myrkr: extraction path exceeds Myrkr's 32752 UTF-16 unit combined-path limit (suffix space reserved). Choose a shorter destination. Entry: ",13,10
 CSTR e_uz_corrupt,"myrkr: corrupt ZIP structure",13,10
+CSTR e_uz_crc,    "myrkr: checksum mismatch - a ZIP entry is damaged; nothing was written under its name",13,10
 CSTR e_uz_big,    "myrkr: deflate entry too large to extract (use 7-Zip/WinRAR)",13,10
 CSTR e_uz_needpw, "myrkr: this archive is encrypted; supply a password with -p",13,10
 CSTR m_uz_done,   "extracted "
 CSTR m_uz_done2,  " file(s)",13,10
 CSTR lbl_unzip,   "extracting"
 w_ext_zip   dw '.','z','i','p',0
-w_ext_part  dw '.','p','a','r','t',0
 w_ext_tmp   dw '.','m','r','k','t','m','p',0
 
 .data?
@@ -243,33 +250,39 @@ emw_fail:
     ret
 eze_make_wide endp
 
-; uz_build_part - uz_partpath = g_extw + ".part"
-uz_build_part proc
-    lea     r10, [g_extw]
-    lea     r11, [uz_partpath]
-    xor     r9, r9
-ubp_c:
-    mov     ax, word ptr [r10+r9*2]
-    mov     word ptr [r11+r9*2], ax
-    test    ax, ax
-    jz      ubp_d
-    inc     r9
-    cmp     r9, 7FF0h
-    jb      ubp_c
-ubp_d:
-    lea     r10, [w_ext_part]
-    xor     r8, r8
-ubp_e:
-    mov     ax, word ptr [r10+r8*2]
-    mov     word ptr [r11+r9*2], ax
-    test    ax, ax
-    jz      ubp_done
-    inc     r9
-    inc     r8
-    jmp     ubp_e
-ubp_done:
+; uz_build_part -> eax 0 / 1: uz_partpath = g_extw + "." + 8 random hex + ".tmp"
+; It was g_extw + ".part" - a fixed, predictable name opened with CREATE_ALWAYS,
+; so a user's own "x.part" beside "x" was truncated and then renamed away.
+uz_build_part proc frame
+    FRAME_PROLOG 48
+    lea     rcx, [g_extw]
+    lea     rdx, [uz_partpath]
+    call    make_temp_sibling
+    FRAME_EPILOG
     ret
 uz_build_part endp
+
+; uz_commit -> eax 0 / EXIT_IO / EXIT_UNSUPPORTED (a link; reason printed).
+; The verified temp takes the real name; on any failure the temp is deleted so
+; nothing half-done is left beside the user's files.  Memory mode has no file.
+uz_commit proc frame
+    FRAME_PROLOG 48
+    xor     eax, eax
+    cmp     qword ptr [g_uz_mem], 0
+    jne     ucm_ret
+    lea     rcx, [uz_partpath]
+    lea     rdx, [g_extw]
+    call    commit_temp
+    test    eax, eax
+    jz      ucm_ret
+    mov     dword ptr [rbp-16], eax
+    lea     rcx, [uz_partpath]
+    call    file_delete
+    mov     eax, dword ptr [rbp-16]
+ucm_ret:
+    FRAME_EPILOG
+    ret
+uz_commit endp
 
 ; =============================================================================
 ; The memory sink.
@@ -328,11 +341,18 @@ uz_sink_open proc frame
     FRAME_EPILOG
     ret
 uso_file:
+    ; Always a temp from uz_build_part, never the real name - see uz_commit.
     mov     qword ptr [rbp-24], rcx
     lea     rcx, [g_extw]
-    call    create_parents
+    call    extract_guard                   ; no junction/link on the way in
+    test    eax, eax
+    jnz     uso_refused
     mov     rcx, qword ptr [rbp-24]
-    call    file_open_write
+    call    file_open_new                   ; CREATE_NEW: clobbers nothing
+    FRAME_EPILOG
+    ret
+uso_refused:
+    mov     rax, INVALID                    ; g_unpack_link says why
     FRAME_EPILOG
     ret
 uz_sink_open endp
@@ -392,15 +412,22 @@ uz_write_file proc frame
     FRAME_EPILOG
     ret
 uw_file:
+    ; The buffer has already passed its CRC (or HMAC), but the write itself can
+    ; still fail half way - so it too goes to a temp and is renamed in.
     mov     qword ptr [rbp-24], rcx
     mov     qword ptr [rbp-32], rdx
     mov     qword ptr [rbp-40], INVALID
     lea     rcx, [g_extw]
-    call    create_parents
-    lea     rcx, [g_extw]
-    call    file_open_write
+    call    extract_guard
+    test    eax, eax
+    jnz     uw_link
+    call    uz_build_part
+    test    eax, eax
+    jnz     uw_io_none
+    lea     rcx, [uz_partpath]
+    call    file_open_new
     cmp     rax, INVALID
-    je      uw_io
+    je      uw_io_none
     mov     qword ptr [rbp-40], rax
     mov     rcx, rax
     mov     rdx, qword ptr [rbp-24]
@@ -410,13 +437,20 @@ uw_file:
     jnz     uw_io
     mov     rcx, qword ptr [rbp-40]
     call    file_close
-    xor     eax, eax
+    call    uz_commit                       ; deletes the temp itself on failure
     FRAME_EPILOG
     ret
 uw_io:
     mov     rcx, qword ptr [rbp-40]
     call    file_close
+    lea     rcx, [uz_partpath]
+    call    file_delete
+uw_io_none:
     mov     eax, EXIT_IO
+    FRAME_EPILOG
+    ret
+uw_link:
+    mov     eax, EXIT_UNSUPPORTED           ; extract_guard has named the path
     FRAME_EPILOG
     ret
 uz_write_file endp
@@ -585,7 +619,9 @@ ne_cpd:
     cmp     qword ptr [g_uz_mem], 0     ; a folder has no bytes to hand back, and
     jne     eze_skip                    ; making one on disk is not what was asked
     lea     rcx, [g_extw]
-    call    create_parents
+    call    extract_guard               ; no junction/link on the way in
+    test    eax, eax
+    jnz     eze_link
     WINCALL CreateDirectoryW, addr g_extw, 0
     xor     eax, eax
     jmp     eze_ret
@@ -751,8 +787,10 @@ eas_padd:
     lea     rcx, [uz_ctr]
     mov     rdx, 16
     call    secure_zero
-    ; open OUTPUT.part
+    ; open a fresh temp beside the output; it becomes the output once verified
     call    uz_build_part
+    test    eax, eax
+    jnz     eze_io
     lea     rcx, [uz_partpath]
     call    uz_sink_open
     cmp     rax, INVALID
@@ -842,14 +880,9 @@ eas_ok:
     mov     rcx, qword ptr [rbp-136]
     call    uz_sink_close
     mov     qword ptr [rbp-136], INVALID
-    cmp     qword ptr [g_uz_mem], 0
-    jne     eas_counted
-    lea     rcx, [uz_partpath]
-    lea     rdx, [g_extw]
-    call    file_rename
+    call    uz_commit                        ; no-op in memory mode
     test    eax, eax
-    jnz     eze_io
-eas_counted:
+    jnz     eze_commitfail                   ; the temp is already gone
     call    uz_entry_done
     xor     eax, eax
     jmp     eze_ret
@@ -865,7 +898,13 @@ eze_plain_store:
     call    file_read_at                     ; 0-length positioned read = seek
     test    eax, eax
     jnz     eze_io
-    lea     rcx, [g_extw]
+    ; Into a temp, like the AES path.  This used to stream straight into g_extw
+    ; and check the CRC only afterwards - so a damaged entry overwrote whatever
+    ; the user had under that name and then stayed there, damaged.
+    call    uz_build_part
+    test    eax, eax
+    jnz     eze_io
+    lea     rcx, [uz_partpath]
     call    uz_sink_open
     cmp     rax, INVALID
     je      eze_io
@@ -909,8 +948,17 @@ eps_fin:
     je      eps_ok
     mov     eax, dword ptr [rbp-168]
     cmp     eax, dword ptr [rbp-80]
-    jne     eze_corrupt
+    je      eps_ok
+    ; damaged: the temp goes, and the real name keeps whatever it had
+    cmp     qword ptr [g_uz_mem], 0
+    jne     eze_crc
+    lea     rcx, [uz_partpath]
+    call    file_delete
+    jmp     eze_crc
 eps_ok:
+    call    uz_commit
+    test    eax, eax
+    jnz     eze_commitfail                   ; the temp is already gone
     call    uz_entry_done
     xor     eax, eax
     jmp     eze_ret
@@ -1011,13 +1059,13 @@ ed_inflate:
     mov     r8, qword ptr [rbp-216]
     call    crc32_update
     cmp     eax, dword ptr [rbp-80]
-    jne     eze_corrupt
+    jne     eze_crc
 ed_write:
     mov     rcx, qword ptr [rbp-152]
     mov     rdx, qword ptr [rbp-216]
     call    uz_write_file
     test    eax, eax
-    jnz     eze_io
+    jnz     eze_commitfail
     mov     rcx, qword ptr [rbp-216]         ; report the inflated bytes
     call    progress_add
     call    uz_entry_done
@@ -1105,14 +1153,32 @@ eze_io_part:
     mov     qword ptr [rbp-136], INVALID
     jmp     eze_io
 eze_io_part2:
+    ; a read or write failed mid-entry: the partial temp is thrown away (it used
+    ; to be closed and kept, under the real name)
     mov     rcx, qword ptr [rbp-136]
-    call    uz_sink_close
+    call    uz_sink_discard
     mov     qword ptr [rbp-136], INVALID
+    jmp     eze_io
+eze_crc:
+    lea     rcx, [e_uz_crc]
+    mov     edx, e_uz_crc_len
+    call    print_a
+    mov     eax, EXIT_CORRUPT
+    jmp     eze_ret
+eze_commitfail:
+    cmp     eax, EXIT_UNSUPPORTED
+    je      eze_link
 eze_io:
+    ; a sink that would not open because of a junction/link is not a disk fault
+    cmp     dword ptr [g_unpack_link], 0
+    jne     eze_link
     lea     rcx, [e_uz_io]
     mov     edx, e_uz_io_len
     call    print_a
     mov     eax, EXIT_IO
+    jmp     eze_ret
+eze_link:
+    mov     eax, EXIT_UNSUPPORTED            ; extract_guard has named the path
 eze_ret:
     mov     qword ptr [rbp-184], rax
     mov     rcx, qword ptr [rbp-136]         ; close any open output sink
@@ -2782,6 +2848,7 @@ do_unzip proc frame
     FRAME_PROLOG 128
     ; [rbp-32]=count [rbp-40]=code [rbp-72]=i [rbp-80]=choff [rbp-88]=total
     mov     qword ptr [uz_count], 0
+    call    extract_guard_reset
     mov     rcx, qword ptr [g_cfg_in]
     call    zip_read_cd
     test    eax, eax

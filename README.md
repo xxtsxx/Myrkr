@@ -87,9 +87,10 @@ documented down to the byte. There is no obscurity doing any of the security
 work — the password is the only secret, exactly as it should be.
 
 **Defence in depth.** The password is typed on a private desktop other programs
-cannot reach; secrets are held in memory that cannot be swapped to disk and are
-wiped after use; the program is hardened against whole classes of memory
-attacks. No single one of these is load-bearing — they are layers.
+cannot reach; the password and the keys derived from it are wiped after use, and
+held in memory locked against being swapped to disk wherever Windows allows it
+(the large Argon2 working area is too big to lock, and is wiped instead); the
+program is hardened against whole classes of memory attacks. No single one of these is load-bearing — they are layers.
 
 **Honest about limits.** The security documentation lists what Myrkr does *not*
 protect against as plainly as what it does, and every protective claim is

@@ -25,6 +25,7 @@ extern gcm_final:proc
 extern ct_memcmp:proc
 extern file_open_read:proc
 extern file_open_write:proc
+extern file_open_new:proc
 extern get_file_size:proc
 extern file_read_exact:proc
 extern file_read_at:proc
@@ -67,6 +68,7 @@ extern fmt_u64:proc                     ; console.asm: digits into a buffer
 extern print_u64e:proc
 extern CreateDirectoryW:proc
 extern WideCharToMultiByte:proc
+extern CompareStringOrdinal:proc
 extern MultiByteToWideChar:proc
 extern GetFileAttributesW:proc
 ; Exclusions live in gui.asm because that is where the user creates them, but
@@ -113,6 +115,13 @@ externdef g_cfg_compress_set:dword
 
 FILE_ATTR_DIR   equ 10h
 FIND_CFILENAME  equ 44          ; offset of cFileName in WIN32_FIND_DATAW
+FIND_RESERVED0  equ 36          ; dwReserved0: the reparse TAG, when the attribute says so
+FILE_ATTR_REPARSE equ 400h      ; FILE_ATTRIBUTE_REPARSE_POINT
+; IsReparseTagNameSurrogate: the tag points at ANOTHER NAME - a junction, a
+; symlink, a volume mount point.  Cloud-file placeholders (OneDrive), dedup and
+; the like are reparse points too but are the file itself, so refusing every
+; reparse point would refuse extraction into an ordinary synced folder.
+REPARSE_SURROGATE equ 20000000h
 CBLOCK          equ 100000h     ; 1 MiB compression block
 
 externdef g_cfg_in:qword
@@ -214,6 +223,11 @@ CSTR msg_lst_sep,    "  "
 CSTR msg_lst_trunc,  "  (listing incomplete - the container holds more than the inventory records)",13,10
 CSTR msg_lst_none,   "  (no inventory - container predates the listing, or it was truncated)",13,10
 CSTR msg_lst_nl,     13,10
+CSTR e_link_refused, "error: refusing to extract through a junction or symbolic link inside the destination: "
+CSTR e_clash_inputs, "error: two inputs would be stored under the same name (names that differ only in case collide on Windows): "
+CSTR e_clash_existing, "error: the container already holds an entry with this name (compared without regard to case): "
+CSTR e_dup_name,     "error: already in the container: "
+CSTR e_del_none,     "error: nothing was removed - every name given must be in the container",13,10
 CSTR msg_del_moved,  "overwritten with random, then the gap closed",13,10
 CSTR e_del_nf,       "error: no such entry in the container: "
 CSTR e_del_usage,    "error: name at least one entry to remove",13,10
@@ -301,6 +315,29 @@ g_verify_only dd ?                  ; 1 = do_unpack authenticates and writes not
 ; and this is not one.
 public g_unpack_partial
 g_unpack_partial dd ?
+; 1 = an entry was refused because a junction or symbolic link sits in its path
+; below the destination.  gui.asm says so, rather than calling the archive
+; damaged - it is not; the folder it was aimed at is.
+public g_unpack_link
+g_unpack_link dd ?
+; The fresh sibling an archive entry is written into, renamed over g_extw only
+; once every byte has authenticated.  g_extw is at most MAX_PATH_CHARS-16 long
+; (build_extract_path reserves that), and the suffix is 13 characters.
+public g_extmp
+g_extmp     dw 8010h dup (?)
+g_lkfind    db 600 dup (?)          ; WIN32_FIND_DATAW for prc_component
+g_lk_okdir  dw 8000h dup (?)        ; last folder chain verified link-free this run
+g_lk_oklen  dq ?                    ; its length in chars, 0 = nothing verified yet
+; Why an encrypt or an edit refused, for the window - an exit code alone cannot
+; tell a name clash from a password-policy refusal (both EXIT_USAGE).
+; 0 none, 1 a stored name clashes, 2 an entry is too big for the container,
+; 3 a name to remove is not in the container.
+public g_edit_reason
+g_edit_reason dd ?
+g_clash_a   db 4096 dup (?)         ; name_clash: the stored name being checked
+g_clash_b   db 4096 dup (?)         ;   ...and the one it is checked against
+g_clash_wa  dw 4096 dup (?)
+g_clash_wb  dw 4096 dup (?)
 g_packtotal dq ?                    ; total input bytes (progress total, pack)
 g_biggest   dq ?                    ; largest single input the sizing walk saw.
                                     ; The AES-GCM ceiling bounds one ENTRY now,
@@ -2095,6 +2132,265 @@ apc_ret:
 add_prefix_copy endp
 
 ; =============================================================================
+; input_stored_name(rcx = positional index, rdx = 4096-byte out, r8d = 1 to
+;   select that input's own staged prefix / 0 to keep g_add_prefix)
+;   -> rax = UTF-8 byte length, or -1 if it cannot be formed (pack_input_top
+;      reports those itself, with the path).
+; Exactly the name pack_input_top will store for the input: prefix + leaf.
+; locals: [rbp-16] index [rbp-24] out [rbp-32] mode [rbp-40] prefix bytes
+; =============================================================================
+input_stored_name proc frame
+    FRAME_PROLOG 96
+    mov     qword ptr [rbp-16], rcx
+    mov     qword ptr [rbp-24], rdx
+    mov     qword ptr [rbp-32], r8
+    test    r8d, r8d
+    jz      isn_prefix
+    call    pfx_select                      ; rcx is still the index
+isn_prefix:
+    mov     rcx, qword ptr [rbp-24]
+    call    add_prefix_copy
+    mov     qword ptr [rbp-40], rax
+    mov     rax, qword ptr [rbp-16]
+    lea     r11, [g_positionals]
+    mov     r10, qword ptr [r11+rax*8]
+    xor     r8, r8                          ; leaf = after the last separator
+    xor     r9, r9
+isn_scan:
+    movzx   eax, word ptr [r10+r9*2]
+    test    eax, eax
+    jz      isn_scanned
+    cmp     eax, '\'
+    je      isn_sep
+    cmp     eax, '/'
+    jne     isn_adv
+isn_sep:
+    lea     r8, [r9+1]
+isn_adv:
+    inc     r9
+    cmp     r9, 7F00h
+    jb      isn_scan
+    jmp     isn_bad
+isn_scanned:
+    lea     r8, [r10+r8*2]
+    mov     r10, qword ptr [rbp-24]
+    add     r10, qword ptr [rbp-40]
+    mov     r11d, 4096
+    sub     r11, qword ptr [rbp-40]
+    WINCALL WideCharToMultiByte, CP_UTF8, 0, r8, -1, r10, r11d, 0, 0
+    test    eax, eax
+    jz      isn_bad
+    dec     eax                             ; drop the terminator
+    add     rax, qword ptr [rbp-40]
+    cmp     rax, ENTRY_NAME_MAX
+    ja      isn_bad
+    FRAME_EPILOG
+    ret
+isn_bad:
+    mov     rax, -1
+    FRAME_EPILOG
+    ret
+input_stored_name endp
+
+; =============================================================================
+; name_clash(rcx = first input index, rdx = existing index or 0, r8 = its
+;   length, r9d = 1 when each input selects its own staged prefix)
+;   -> eax 0 = no clash / 1 = clash (named on stderr; g_edit_reason = 1)
+;
+; Two inputs stored under one name used to be accepted: the container held both,
+; and extraction silently kept whichever came last - the other was gone, exit 0.
+; `add` compared new names to old ones byte for byte, so "Notes.txt" and
+; "notes.txt" got in too, and those are one file on Windows.  This runs BEFORE
+; anything is derived or written, and compares the way the filesystem will:
+; CompareStringOrdinal with bIgnoreCase, which is NTFS's own folding.
+;
+; Against the existing index it compares the new name with each entry's name cut
+; to the same number of components, so it catches the entry itself and anything
+; already under it.  Entries arrive in tree order, so a run of entries sharing a
+; prefix is converted once, not once per entry.
+;
+; locals: [rbp-16] first [rbp-24] old index [rbp-32] old length [rbp-40] mode
+;   [rbp-48] i [rbp-56] j [rbp-64] name length [rbp-72] separators in it
+;   [rbp-80] next cursor [rbp-88] previous prefix [rbp-96] its length
+;   [rbp-104] this entry's name [rbp-112] its prefix length / scratch length
+; =============================================================================
+public name_clash
+name_clash proc frame
+    FRAME_PROLOG 160
+    mov     qword ptr [rbp-16], rcx
+    mov     qword ptr [rbp-24], rdx
+    mov     qword ptr [rbp-32], r8
+    mov     qword ptr [rbp-40], r9
+    mov     qword ptr [rbp-48], rcx
+nc_outer:
+    mov     rax, qword ptr [rbp-48]
+    cmp     rax, qword ptr [g_poscount]
+    jae     nc_none
+    mov     rcx, rax
+    lea     rdx, [g_clash_a]
+    mov     r8, qword ptr [rbp-40]
+    call    input_stored_name
+    cmp     rax, -1
+    je      nc_next_i
+    test    rax, rax
+    jz      nc_next_i
+    mov     qword ptr [rbp-64], rax
+    WINCALL MultiByteToWideChar, CP_UTF8, 0, addr g_clash_a, qword ptr [rbp-64], addr g_clash_wa, 4095
+    test    eax, eax
+    jz      nc_next_i
+    lea     r10, [g_clash_wa]
+    mov     word ptr [r10+rax*2], 0
+    ; ---- against every earlier input ----------------------------------------
+    mov     rax, qword ptr [rbp-16]
+    mov     qword ptr [rbp-56], rax
+nc_inner:
+    mov     rax, qword ptr [rbp-56]
+    cmp     rax, qword ptr [rbp-48]
+    jae     nc_old
+    mov     rcx, rax
+    lea     rdx, [g_clash_b]
+    mov     r8, qword ptr [rbp-40]
+    call    input_stored_name
+    cmp     rax, -1
+    je      nc_next_j
+    test    rax, rax
+    jz      nc_next_j
+    mov     qword ptr [rbp-112], rax
+    WINCALL MultiByteToWideChar, CP_UTF8, 0, addr g_clash_b, qword ptr [rbp-112], addr g_clash_wb, 4095
+    test    eax, eax
+    jz      nc_next_j
+    lea     r10, [g_clash_wb]
+    mov     word ptr [r10+rax*2], 0
+    WINCALL CompareStringOrdinal, addr g_clash_wa, -1, addr g_clash_wb, -1, 1
+    cmp     eax, 2                          ; CSTR_EQUAL
+    je      nc_clash_inputs
+nc_next_j:
+    inc     qword ptr [rbp-56]
+    jmp     nc_inner
+    ; ---- against the existing index -----------------------------------------
+nc_old:
+    cmp     qword ptr [rbp-24], 0
+    je      nc_next_i
+    lea     r10, [g_clash_a]
+    xor     ecx, ecx
+    xor     r9d, r9d
+nc_count:
+    cmp     r9, qword ptr [rbp-64]
+    jae     nc_counted
+    cmp     byte ptr [r10+r9], 2Fh
+    jne     @F
+    inc     rcx
+@@:
+    inc     r9
+    jmp     nc_count
+nc_counted:
+    mov     qword ptr [rbp-72], rcx
+    mov     qword ptr [rbp-80], 0
+    mov     qword ptr [rbp-96], -1
+nc_entry:
+    mov     rax, qword ptr [rbp-80]
+    add     rax, IDXE_FIXED
+    cmp     rax, qword ptr [rbp-32]
+    ja      nc_next_i
+    mov     r10, qword ptr [rbp-24]
+    add     r10, qword ptr [rbp-80]
+    mov     r11d, dword ptr [r10+IDXE_namelen]
+    add     rax, r11
+    cmp     rax, qword ptr [rbp-32]
+    ja      nc_next_i
+    mov     qword ptr [rbp-80], rax         ; the next entry, from here on
+    lea     r10, [r10+IDXE_name]
+    mov     qword ptr [rbp-104], r10
+    ; this name, cut after as many components as the new one has
+    xor     r9d, r9d
+    xor     ecx, ecx
+nc_cut:
+    cmp     r9, r11
+    jae     nc_cutdone
+    cmp     byte ptr [r10+r9], 2Fh
+    jne     nc_cutnext
+    cmp     rcx, qword ptr [rbp-72]
+    je      nc_cutdone
+    inc     rcx
+nc_cutnext:
+    inc     r9
+    jmp     nc_cut
+nc_cutdone:
+    mov     qword ptr [rbp-112], r9
+    test    r9, r9
+    jz      nc_entry
+    ; the same prefix as the entry before it was cleared already
+    cmp     r9, qword ptr [rbp-96]
+    jne     nc_fresh
+    mov     r8, qword ptr [rbp-88]
+    xor     edx, edx
+nc_same:
+    cmp     rdx, r9
+    jae     nc_entry
+    mov     al, byte ptr [r10+rdx]
+    cmp     al, byte ptr [r8+rdx]
+    jne     nc_fresh
+    inc     rdx
+    jmp     nc_same
+nc_fresh:
+    mov     qword ptr [rbp-88], r10
+    mov     qword ptr [rbp-96], r9
+    ; cheap reject: two ASCII first letters that differ even when folded
+    movzx   eax, byte ptr [r10]
+    movzx   edx, byte ptr [g_clash_a]
+    cmp     eax, 80h
+    jae     nc_full
+    cmp     edx, 80h
+    jae     nc_full
+    cmp     eax, 'a'
+    jb      @F
+    cmp     eax, 'z'
+    ja      @F
+    sub     eax, 20h
+@@:
+    cmp     edx, 'a'
+    jb      @F
+    cmp     edx, 'z'
+    ja      @F
+    sub     edx, 20h
+@@:
+    cmp     eax, edx
+    jne     nc_entry
+nc_full:
+    WINCALL MultiByteToWideChar, CP_UTF8, 0, qword ptr [rbp-104], qword ptr [rbp-112], addr g_clash_wb, 4095
+    test    eax, eax
+    jz      nc_entry
+    lea     r10, [g_clash_wb]
+    mov     word ptr [r10+rax*2], 0
+    WINCALL CompareStringOrdinal, addr g_clash_wa, -1, addr g_clash_wb, -1, 1
+    cmp     eax, 2
+    je      nc_clash_old
+    jmp     nc_entry
+nc_next_i:
+    inc     qword ptr [rbp-48]
+    jmp     nc_outer
+nc_none:
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+nc_clash_inputs:
+    mov     dword ptr [g_edit_reason], 1
+    prn     e_clash_inputs
+    jmp     nc_say
+nc_clash_old:
+    mov     dword ptr [g_edit_reason], 1
+    prn     e_clash_existing
+nc_say:
+    lea     rcx, [g_clash_a]
+    mov     rdx, qword ptr [rbp-64]
+    call    print_err
+    prn     msg_lst_nl
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+name_clash endp
+
+; =============================================================================
 ; pack_input_top(rcx = positional path) - set up g_walk/g_rel then pack_node
 ; =============================================================================
 pack_input_top proc frame
@@ -2657,6 +2953,20 @@ dp_pol_ok:
     call    normalize_path
     test    eax, eax
     jnz     dp_io
+    ; Two inputs that would land on one stored name - two folders both called
+    ; "docs" - are refused before anything is written.  Extraction kept only the
+    ; last of them, silently.
+    mov     dword ptr [g_edit_reason], 0
+    xor     ecx, ecx
+    xor     edx, edx
+    xor     r8d, r8d
+    mov     r9d, 1                          ; each input's own staged prefix
+    call    name_clash
+    test    eax, eax
+    jz      dp_noclash
+    mov     eax, EXIT_USAGE
+    jmp     dp_done
+dp_noclash:
 
     ; pre-flight: sum input sizes and check the output drive has room (before
     ; the expensive KDF and before opening the temp).  g_packtotal is reused
@@ -3336,6 +3646,333 @@ bp_too_long:
 build_extract_path endp
 
 ; =============================================================================
+; path_reparse_check(rcx = output path beneath g_outdir_np)
+;   -> eax 0 = the parent folders are clear (caller creates them)
+;          1 = a junction / symbolic link sits on the way in (refuse)
+;          2 = the parent folder was verified AND created earlier in this run
+;
+; An archive names "evil/x"; if the destination already holds a junction or a
+; symbolic link called "evil", creating "evil\x" follows it and the file lands
+; wherever the link points - a Startup folder, say.  sanitize_name cannot see
+; this: the NAME is clean, it is the folder it is being written into that is not.
+;
+; So every existing FOLDER on the way in, below the destination, must not be a
+; name-surrogate reparse point.  The destination itself is the user's own choice
+; and is trusted - a redirected Documents folder is a junction, and extracting
+; into it is ordinary.  The leaf is not checked: it is never opened by name -
+; the entry goes into a temp sibling that is RENAMED over it, and a rename
+; replaces a link rather than following it.
+;
+; Cached per run.  Myrkr never creates a link, so a folder chain verified once
+; stays verified: a full hit costs a compare, and a partial hit checks only the
+; components below the part already known.  Without this, a guard per file made
+; extracting 20,000 small files 71% slower; with it, the run also skips
+; create_parents for every file after the first in a folder, which the code
+; before the guard paid on every file.
+;
+; By path, so a folder swapped for a link by someone racing inside the
+; destination while the extraction runs is not caught; a link planted BEFORE it
+; runs - the case that matters - is.  docs/SECURITY.md says so.
+;
+; locals: [rbp-16] path [rbp-24] index [rbp-32] root length [rbp-40] parent end
+;   [rbp-48] where checking starts
+; =============================================================================
+public path_reparse_check
+path_reparse_check proc frame
+    FRAME_PROLOG 80
+    mov     qword ptr [rbp-16], rcx
+    ; the root's length, and the parent's: the last separator in the path
+    lea     r10, [g_outdir_np]
+    xor     eax, eax
+prc_root:
+    cmp     word ptr [r10+rax*2], 0
+    je      prc_rooted
+    inc     rax
+    cmp     rax, MAX_PATH_CHARS
+    jb      prc_root
+    jmp     prc_bad
+prc_rooted:
+    mov     qword ptr [rbp-32], rax
+    mov     r10, qword ptr [rbp-16]
+    xor     r9d, r9d
+    xor     r8d, r8d                        ; last separator seen
+prc_end:
+    cmp     r9, MAX_PATH_CHARS
+    jae     prc_bad                         ; no terminator: refuse, do not guess
+    movzx   ecx, word ptr [r10+r9*2]
+    test    ecx, ecx
+    jz      prc_ended
+    cmp     ecx, 5Ch
+    jne     @F
+    mov     r8, r9
+@@:
+    inc     r9
+    jmp     prc_end
+prc_ended:
+    mov     qword ptr [rbp-40], r8
+    cmp     r8, qword ptr [rbp-32]
+    jbe     prc_fresh_ok                    ; directly in the destination
+    ; ---- what the cache already covers --------------------------------------
+    mov     rax, qword ptr [rbp-32]
+    mov     qword ptr [rbp-48], rax         ; by default, check from the root
+    mov     r11, qword ptr [g_lk_oklen]
+    test    r11, r11
+    jz      prc_check
+    lea     rdx, [g_lk_okdir]
+    xor     r9d, r9d
+prc_cmp:
+    cmp     r9, r8
+    jae     prc_cmp_end
+    cmp     r9, r11
+    jae     prc_cmp_end
+    mov     ax, word ptr [r10+r9*2]
+    cmp     ax, word ptr [rdx+r9*2]
+    jne     prc_cmp_end
+    inc     r9
+    jmp     prc_cmp
+prc_cmp_end:
+    ; Full hit: the parent IS the cached folder, or a folder above it.
+    cmp     r9, r8
+    jne     prc_partial
+    cmp     r9, r11
+    je      prc_hit
+    cmp     word ptr [rdx+r9*2], 5Ch
+    je      prc_hit
+prc_partial:
+    ; Back to the last separator both share; everything before it is known.
+    ; (A whole cached folder that is a prefix ends AT a separator in the path.)
+    cmp     r9, r11
+    jne     prc_back
+    cmp     word ptr [r10+r9*2], 5Ch
+    je      prc_from
+prc_back:
+    cmp     r9, qword ptr [rbp-32]
+    jbe     prc_check
+    dec     r9
+    cmp     word ptr [r10+r9*2], 5Ch
+    jne     prc_back
+prc_from:
+    mov     qword ptr [rbp-48], r9
+prc_check:
+    ; every separator after the known part, up to and including the parent's
+    mov     rax, qword ptr [rbp-48]
+    mov     qword ptr [rbp-24], rax
+prc_scan:
+    inc     qword ptr [rbp-24]
+    mov     rax, qword ptr [rbp-24]
+    cmp     rax, qword ptr [rbp-40]
+    ja      prc_verified
+    mov     r10, qword ptr [rbp-16]
+    cmp     word ptr [r10+rax*2], 5Ch
+    jne     prc_scan
+    mov     word ptr [r10+rax*2], 0         ; the path up to this folder
+    mov     rcx, r10
+    call    prc_component
+    mov     r10, qword ptr [rbp-16]
+    mov     rcx, qword ptr [rbp-24]
+    mov     word ptr [r10+rcx*2], 5Ch
+    test    eax, eax
+    jnz     prc_bad
+    jmp     prc_scan
+prc_verified:
+    ; remember this parent for the entries that follow it
+    mov     r10, qword ptr [rbp-16]
+    lea     r11, [g_lk_okdir]
+    mov     r8, qword ptr [rbp-40]
+    xor     r9d, r9d
+prc_save:
+    cmp     r9, r8
+    jae     prc_saved
+    mov     ax, word ptr [r10+r9*2]
+    mov     word ptr [r11+r9*2], ax
+    inc     r9
+    jmp     prc_save
+prc_saved:
+    mov     word ptr [r11+r9*2], 0
+    mov     qword ptr [g_lk_oklen], r8
+prc_fresh_ok:
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+prc_hit:
+    mov     eax, 2
+    FRAME_EPILOG
+    ret
+prc_bad:
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+path_reparse_check endp
+
+; prc_component(rcx = path) -> eax 1 = it exists and is a junction, symbolic
+; link or mount point; 0 = it does not exist, or is not one.
+; FindFirstFileW on a name with no wildcard returns that entry WITHOUT following
+; it, and dwReserved0 holds its reparse tag.
+prc_component proc frame
+    FRAME_PROLOG 48
+    mov     qword ptr [rbp-16], rcx
+    WINCALL GetFileAttributesW, rcx
+    cmp     eax, -1
+    je      pcc_no                          ; not there yet: nothing to follow
+    test    eax, FILE_ATTR_REPARSE
+    jz      pcc_no
+    WINCALL FindFirstFileW, qword ptr [rbp-16], addr g_lkfind
+    cmp     rax, INVALID
+    je      pcc_yes                         ; a reparse point we cannot classify
+    mov     qword ptr [rbp-24], rax
+    WINCALL FindClose, qword ptr [rbp-24]
+    test    dword ptr [g_lkfind+FIND_RESERVED0], REPARSE_SURROGATE
+    jz      pcc_no                          ; a cloud placeholder and the like
+pcc_yes:
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+pcc_no:
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+prc_component endp
+
+; =============================================================================
+; extract_guard(rcx = output path) -> eax 0 ok / 1 refused (reason printed)
+; Verify the folders on the way in, then create them - in that order, so a
+; folder is never created THROUGH a link either.  A cached parent was created
+; when it was verified, and is not created again.
+; =============================================================================
+public extract_guard
+extract_guard proc frame
+    FRAME_PROLOG 48
+    mov     qword ptr [rbp-16], rcx
+    call    path_reparse_check
+    cmp     eax, 1
+    je      eg_bad
+    cmp     eax, 2
+    je      eg_ok                           ; verified and made earlier this run
+    mov     rcx, qword ptr [rbp-16]
+    call    create_parents
+eg_ok:
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+eg_bad:
+    mov     rcx, qword ptr [rbp-16]
+    call    report_link
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+extract_guard endp
+
+; extract_guard_reset - forget the verified-folder cache and the link flag.
+; At the start of every extraction run: the cache is only sound for the
+; destination it was built against.
+public extract_guard_reset
+extract_guard_reset proc
+    mov     dword ptr [g_unpack_link], 0
+    mov     qword ptr [g_lk_oklen], 0
+    ret
+extract_guard_reset endp
+
+; report_link(rcx = path) - say which output was refused, and why
+public report_link
+report_link proc frame
+    FRAME_PROLOG 48
+    mov     qword ptr [rbp-16], rcx
+    mov     dword ptr [g_unpack_link], 1
+    prn     e_link_refused
+    mov     rcx, qword ptr [rbp-16]
+    call    print_wz
+    prn     msg_lst_nl
+    FRAME_EPILOG
+    ret
+report_link endp
+
+; =============================================================================
+; make_temp_sibling(rcx = path, rdx = out) -> eax 0 ok / 1 failed
+; out = path + "." + 8 random hex + ".tmp".  Random so it cannot be predicted
+; and planted; opened with CREATE_NEW by the caller so even a collision
+; clobbers nothing.  The source is bounded at MAX_PATH_CHARS-16, the headroom
+; build_extract_path reserved for exactly this.
+; locals: [rbp-16] path [rbp-24] out [rbp-32] 4 random bytes
+; =============================================================================
+public make_temp_sibling
+make_temp_sibling proc frame
+    FRAME_PROLOG 64
+    mov     qword ptr [rbp-16], rcx
+    mov     qword ptr [rbp-24], rdx
+    lea     rcx, [rbp-32]
+    mov     edx, 4
+    call    rng_fill
+    test    eax, eax
+    jz      mts_fail
+    mov     r10, qword ptr [rbp-16]
+    mov     r11, qword ptr [rbp-24]
+    xor     r9d, r9d
+mts_copy:
+    cmp     r9, MAX_PATH_CHARS-16
+    jae     mts_fail
+    movzx   eax, word ptr [r10+r9*2]
+    test    eax, eax
+    jz      mts_suffix
+    mov     word ptr [r11+r9*2], ax
+    inc     r9
+    jmp     mts_copy
+mts_suffix:
+    mov     word ptr [r11+r9*2], '.'
+    inc     r9
+    xor     ecx, ecx
+mts_hex:
+    movzx   eax, byte ptr [rbp-32+rcx]
+    mov     edx, eax
+    shr     eax, 4
+    and     edx, 15
+    add     eax, '0'
+    cmp     eax, '9'
+    jbe     @F
+    add     eax, 'a' - '0' - 10
+@@:
+    add     edx, '0'
+    cmp     edx, '9'
+    jbe     @F
+    add     edx, 'a' - '0' - 10
+@@:
+    mov     word ptr [r11+r9*2], ax
+    mov     word ptr [r11+r9*2+2], dx
+    add     r9, 2
+    inc     ecx
+    cmp     ecx, 4
+    jb      mts_hex
+    mov     word ptr [r11+r9*2], '.'
+    mov     word ptr [r11+r9*2+2], 't'
+    mov     word ptr [r11+r9*2+4], 'm'
+    mov     word ptr [r11+r9*2+6], 'p'
+    mov     word ptr [r11+r9*2+8], 0
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+mts_fail:
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+make_temp_sibling endp
+
+; =============================================================================
+; commit_temp(rcx = verified temp, rdx = final) -> eax 0 / EXIT_IO
+; The verified bytes take the real name.  The rename REPLACES the directory
+; entry, so an existing file is swapped out whole and a hardlink - or a link
+; planted as the leaf - is replaced rather than written through.  No folder
+; re-check here: extract_guard ran before the temp was created in that same
+; folder, and a later swap is the race path_reparse_check documents.  The caller
+; deletes the temp on failure.
+; =============================================================================
+public commit_temp
+commit_temp proc frame
+    FRAME_PROLOG 48
+    call    file_rename                     ; rcx, rdx are already from, to
+    FRAME_EPILOG
+    ret
+commit_temp endp
+
+; =============================================================================
 ; entry_path(rcx = index entry) -> eax 0 ok / 1 refused name (diagnostic printed)
 ;
 ; The inventory's name for an entry, turned into the full output path in g_extw.
@@ -3549,6 +4186,7 @@ unpack_entry proc frame
     mov     qword ptr [rbp-32], r8
     mov     qword ptr [rbp-40], INVALID
     mov     dword ptr [rbp-64], EXIT_OK
+    mov     dword ptr [rbp-72], 0           ; 1 = g_extmp exists and is ours
     ; ---- point the decoder at this entry ------------------------------------
     lea     r8, [g_key]                     ; rcx = ctx, rdx = entry already
     call    es_bind
@@ -3577,17 +4215,38 @@ unpack_entry proc frame
     test    dword ptr [r10+IDXE_flags], IDXEF_DIR
     jz      ue_openout
     lea     rcx, [g_extw]
-    call    create_parents
+    call    extract_guard                   ; no junction/link on the way in
+    test    eax, eax
+    jnz     ue_link
     WINCALL CreateDirectoryW, addr g_extw, 0
     jmp     ue_stream
 ue_openout:
+    ; NOT the real name.  The entry is written into a fresh random sibling and
+    ; renamed over g_extw only once every byte has authenticated (ue_close).
+    ; Writing g_extw directly - as this did - meant a file already there was
+    ; truncated first, and a failed tag or a Cancel then deleted it: the user's
+    ; existing file AND the archive's copy both gone.  It also wrote straight
+    ; through a pre-placed hardlink into a file outside the destination.
     lea     rcx, [g_extw]
-    call    create_parents
+    call    extract_guard
+    test    eax, eax
+    jnz     ue_link
     lea     rcx, [g_extw]
-    jmp     ue_open
+    lea     rdx, [g_extmp]
+    call    make_temp_sibling
+    test    eax, eax
+    jnz     ue_io
+    lea     rcx, [g_extmp]
+    call    file_open_new                   ; CREATE_NEW: clobbers nothing
+    cmp     rax, INVALID
+    je      ue_io
+    mov     qword ptr [rbp-40], rax
+    mov     dword ptr [rbp-72], 1
+    jmp     ue_stream
 ue_named:
+    ; a single-file container: rbp-32 is already its .part name, and
+    ; do_unpack renames that once the whole stream has verified
     mov     rcx, qword ptr [rbp-32]
-ue_open:
     call    file_open_write
     cmp     rax, INVALID
     je      ue_io
@@ -3646,6 +4305,19 @@ ue_close:
     mov     rcx, qword ptr [rbp-40]
     call    file_close
     mov     qword ptr [rbp-40], INVALID
+    cmp     dword ptr [rbp-72], 0
+    je      ue_logged                       ; the .part case: do_unpack renames
+    ; Every byte authenticated: only now does the entry take its real name.
+    lea     rcx, [g_extmp]
+    lea     rdx, [g_extw]
+    call    commit_temp
+    test    eax, eax
+    jz      ue_committed
+    mov     dword ptr [rbp-64], eax         ; EXIT_IO, or a link (already said)
+    jmp     ue_fail
+ue_committed:
+    mov     dword ptr [rbp-72], 0
+ue_logged:
     ; One line in the window's action log per file written out, AFTER the close:
     ; the name is only claimed once the bytes are on disk.
     mov     r10, qword ptr [rbp-24]
@@ -3669,8 +4341,13 @@ ue_esfail:
     mov     dword ptr [rbp-64], eax
     jmp     ue_fail
 ue_cancel:
-    ; The same code the streaming loop this replaced returned for a cancel.
-    mov     dword ptr [rbp-64], EXIT_IO
+    ; A cancel is a cancel.  It used to come back as EXIT_IO, so the action log
+    ; recorded "I/O failure" for the user's own decision.
+    mov     dword ptr [rbp-64], EXIT_CANCELLED
+    jmp     ue_fail
+ue_link:
+    ; extract_guard has named the path and set g_unpack_link
+    mov     dword ptr [rbp-64], EXIT_UNSUPPORTED
     jmp     ue_fail
 ue_io:
     mov     dword ptr [rbp-64], EXIT_IO
@@ -3687,16 +4364,24 @@ ue_fail:
     ; its tag failed is not a shorter version of the user's file; it is a
     ; fragment of something unauthenticated, sitting on disk under the real
     ; name, which is how it ends up being used.
+    ;
+    ; And only ever OUR file goes: the random sibling, or a single-file .part.
+    ; Never g_extw - that name still belongs to whatever the user had there.
     cmp     qword ptr [rbp-40], INVALID
-    je      ue_failed
+    je      ue_nothandle
     mov     rcx, qword ptr [rbp-40]
     call    file_close
+    mov     qword ptr [rbp-40], INVALID
     mov     rcx, qword ptr [rbp-32]
     test    rcx, rcx
-    jnz     @F
-    lea     rcx, [g_extw]
-@@:
+    jz      ue_nothandle
+    call    file_delete                     ; the single-file .part
+ue_nothandle:
+    cmp     dword ptr [rbp-72], 0
+    je      ue_failed
+    lea     rcx, [g_extmp]
     call    file_delete
+    mov     dword ptr [rbp-72], 0
 ue_failed:
     mov     eax, dword ptr [rbp-64]
     FRAME_EPILOG
@@ -3770,6 +4455,7 @@ do_unpack proc frame
     mov     qword ptr [rbp-24], INVALID
     mov     qword ptr [rbp-32], 0
     mov     dword ptr [g_unpack_partial], 0
+    call    extract_guard_reset
 
     mov     rcx, qword ptr [g_cfg_in]
     lea     rdx, [g_pk_np]
@@ -4060,6 +4746,11 @@ du_entry_err:
 @@:
     cmp     eax, EXIT_UNSUPPORTED
     jne     @F
+    ; A link in the destination keeps EXIT_UNSUPPORTED: the archive is fine,
+    ; the folder it was pointed at is not, and "corrupt" would send the user
+    ; looking in the wrong place.  extract_guard has named the path.
+    cmp     dword ptr [g_unpack_link], 0
+    jne     du_partial
     ; entry_path already reported the exact name and the applicable limit.
     mov     dword ptr [rbp-56], EXIT_CORRUPT ; what the tar walk returned for it
     jmp     du_partial
@@ -4069,6 +4760,8 @@ du_entry_err:
     prn     e_pcorrupt
     jmp     du_partial
 @@:
+    cmp     eax, EXIT_CANCELLED
+    je      du_partial                       ; the user's decision, not a fault
     prn     e_pio
 du_partial:
     ; What is already on disk, said out loud.  verify writes nothing, and a
@@ -4852,6 +5545,7 @@ native_rewrite proc frame
     mov     qword ptr [rbp-80], INVALID
     mov     dword ptr [rbp-392], 0
     mov     qword ptr [g_packerr], 0
+    mov     dword ptr [g_edit_reason], 0
     mov     qword ptr [rbp-96], 0
     lea     rcx, [rbp-160]
     lea     rdx, [g_key]
@@ -4956,6 +5650,17 @@ nr_inputs:
     mov     qword ptr [rbp-104], 1
     cmp     dword ptr [rbp-16], 0
     jne     nr_sized
+    ; A name already in the container - or one differing only in case - is
+    ; refused HERE, before a key is derived or a byte written.  The backstop
+    ; after each input (idx_dup_since) used to be the only check: it ran after
+    ; the whole container had been re-encrypted into the temp, and said nothing.
+    mov     rcx, 1
+    mov     rdx, qword ptr [rbp-32]
+    mov     r8, qword ptr [rbp-40]
+    xor     r9d, r9d                        ; the drop's one prefix, as set
+    call    name_clash
+    test    eax, eax
+    jnz     nr_usage
 nr_sum:
     mov     rax, qword ptr [rbp-104]
     cmp     rax, qword ptr [g_poscount]
@@ -5004,6 +5709,21 @@ nr_space:
     call    rng_fill
     test    eax, eax
     jz      nr_io
+    ; The new key costs at least what the current settings ask for - including
+    ; an administrator's raised floor.  It used to inherit the source's cost
+    ; unchanged, so a container made at a weak cost stayed weak through every
+    ; edit, although each edit derives a new key and pays a derivation anyway.
+    ; Never lowered: a container stronger than the settings stays as strong.
+    mov     eax, dword ptr [g_cfg_t]
+    cmp     eax, dword ptr [g_pkhdr+CONTAINER_HDR.t_cost]
+    jbe     @F
+    mov     dword ptr [g_pkhdr+CONTAINER_HDR.t_cost], eax
+@@:
+    mov     eax, dword ptr [g_cfg_m]
+    cmp     eax, dword ptr [g_pkhdr+CONTAINER_HDR.m_cost_kib]
+    jbe     @F
+    mov     dword ptr [g_pkhdr+CONTAINER_HDR.m_cost_kib], eax
+@@:
     lea     rcx, [g_pkhdr+20]
     mov     edx, dword ptr [g_pkhdr+CONTAINER_HDR.t_cost]
     mov     r8d, dword ptr [g_pkhdr+CONTAINER_HDR.m_cost_kib]
@@ -5199,9 +5919,21 @@ nr_add_loop:
     mov     rcx, qword ptr [rbp-112]
     call    idx_dup_since
     cmp     rax, -1
-    jne     nr_usage
+    jne     nr_dupname
     inc     qword ptr [rbp-104]
     jmp     nr_add_loop
+nr_dupname:
+    ; the backstop: name it, which it never did
+    add     rax, qword ptr [g_idxptr]
+    mov     qword ptr [rbp-112], rax
+    mov     dword ptr [g_edit_reason], 1
+    prn     e_dup_name
+    mov     r10, qword ptr [rbp-112]
+    lea     rcx, [r10+IDXE_name]
+    mov     edx, dword ptr [r10+IDXE_namelen]
+    call    print_err
+    prn     msg_lst_nl
+    jmp     nr_usage
 nr_finish:
     ; Older readers require at least one payload tag, even for an empty index.
     ; Reserve an empty stream under this fresh key; it is not a listed entry.
@@ -5242,6 +5974,9 @@ nr_recovery:
     mov     eax, EXIT_PARTIAL
     jmp     nr_cleanup
 nr_too_big:
+    ; EXIT_USAGE like a duplicate, so the window needs the reason to tell them
+    ; apart - it used to say "already in the archive" for this.
+    mov     dword ptr [g_edit_reason], 2
     prn     e_ptoobig
     prn     e_atoobig2
     jmp     nr_usage
@@ -5349,6 +6084,8 @@ do_delete proc frame
     ; ---- mark what is to go -------------------------------------------------
     ; Keep source records intact: even removed entries must authenticate before
     ; committing the replacement, but they do not enter its new inventory.
+    mov     qword ptr [rbp-88], 0               ; names not found
+    mov     dword ptr [g_edit_reason], 0
     mov     qword ptr [rbp-48], 1
 dd_arg:
     mov     rax, qword ptr [rbp-48]
@@ -5375,10 +6112,21 @@ dd_notfound:
     mov     rcx, qword ptr [rbp-80]
     call    print_wz
     prn     msg_lst_nl
+    inc     qword ptr [rbp-88]
     jmp     dd_next
 dd_marked:
+    ; ANY name not found refuses the whole removal.  It used to say "no such
+    ; entry" and then exit 0 after rewriting the container anyway - so a script
+    ; that removed a sensitive file by a mistyped name was told it had worked.
+    cmp     qword ptr [rbp-88], 0
+    jne     dd_missing
     call    do_remove_marked
     jmp     dd_ret_code
+dd_missing:
+    mov     dword ptr [g_edit_reason], 3
+    prn     e_del_none
+    mov     eax, EXIT_USAGE
+    jmp     dd_wipekey
 dd_usage:
     prn     e_del_usage
     mov     eax, EXIT_USAGE

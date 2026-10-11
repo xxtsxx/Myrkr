@@ -11,7 +11,7 @@
 # package such a build, and this script asserts bin\ is left holding a release
 # binary - a test build left behind would be wrapped by the next packaging run.
 #
-# Usage:  pwsh tests\run.ps1   (from the repo root)
+# Usage:  pwsh tests\run.ps1  or  powershell tests\run.ps1   (from the repo root)
 $ErrorActionPreference = "Stop"
 $root = Split-Path $PSScriptRoot -Parent
 $exe = Join-Path $root "bin\myrkr.exe"
@@ -27,6 +27,12 @@ $vcCandidates = @(
 )
 $vc = $vcCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
 if (-not $vc) { throw "no vcvars64.bat found; edit `$vcCandidates in tests\run.ps1" }
+
+# The GUI suites run in a child PowerShell.  PowerShell 7 (pwsh) when it is
+# installed, Windows PowerShell 5.1 otherwise: hard-coding pwsh made this whole
+# runner throw at the first GUI suite on a machine without it - skipping every
+# Phase 1 adversarial test AND the release restore, leaving a test build in bin.
+$ps = if (Get-Command pwsh -ErrorAction SilentlyContinue) { "pwsh" } else { "powershell" }
 
 function Build($buildArgs) {
     cmd /c "`"$vc`" >nul 2>&1 && `"$root\build.cmd`" $buildArgs" | Out-Null
@@ -51,11 +57,13 @@ python (Join-Path $PSScriptRoot "redteam.py") $dbg
 $p2 = $LASTEXITCODE
 python (Join-Path $PSScriptRoot "nonceforktest.py") $dbg --segments
 $p2 = $p2 -bor $LASTEXITCODE
-& pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot "nativeeditguitest.ps1")
+& $ps -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot "nativeeditguitest.ps1")
 $p2 = $p2 -bor $LASTEXITCODE
-& pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot "cmdbartest.ps1")
+& $ps -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot "cmdbartest.ps1")
 $p2 = $p2 -bor $LASTEXITCODE
-& pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot "listsurfacetest.ps1")
+& $ps -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot "listsurfacetest.ps1")
+$p2 = $p2 -bor $LASTEXITCODE
+& $ps -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot "guifailtest.ps1")
 $p2 = $p2 -bor $LASTEXITCODE
 
 Write-Host "`n=== Phase 1: testio build (adversarial crypto/input tests) ==="
@@ -67,6 +75,8 @@ $p1 = $LASTEXITCODE
 python (Join-Path $PSScriptRoot "zipboundstest.py") $exe
 $p1 = $p1 -bor $LASTEXITCODE
 python (Join-Path $PSScriptRoot "longnametest.py") $exe
+$p1 = $p1 -bor $LASTEXITCODE
+python (Join-Path $PSScriptRoot "extracthazardtest.py") $exe
 $p1 = $p1 -bor $LASTEXITCODE
 python (Join-Path $PSScriptRoot "nonceforktest.py") $exe
 $p1 = $p1 -bor $LASTEXITCODE

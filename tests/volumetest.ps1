@@ -316,7 +316,10 @@ else {
       # TITLE is the box's caption, and a top-level caption reads fine
       # cross-process - unlike an EDIT, per afterencrypttest's Edit() note.
       $t=[V]::Txt($mb)
-      if ($t -match "split across volumes") { "  ok   the window says the container is split, not that the disk is full" }
+      # 1.1.1 retitled this box "Volume sets cannot be edited"; the older title
+      # said "split across volumes".  Either says the container is a set - which
+      # is the point - and neither says the disk is full.
+      if ($t -match "split across volumes|Volume sets cannot be edited") { "  ok   the window says the container is split, not that the disk is full" }
       else { "  FAIL the box was titled: '$t'"; $fail++ }
       # ...and the window must still be USABLE afterwards. Reported: Exit stopped
       # working after this dialog while Decrypt still did. mbox disables the parent

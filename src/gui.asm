@@ -185,6 +185,8 @@ externdef g_pick_active:dword
 ; Set by do_unpack when an extraction failed AFTER writing entries out.  The
 ; error box says something different in that case - see m_part_extract.
 externdef g_unpack_partial:dword
+externdef g_unpack_link:dword           ; pack.asm: an entry refused over a link
+externdef g_edit_reason:dword           ; pack.asm: why an encrypt/edit refused
 
 .data?
 ALIGN 8
@@ -1127,6 +1129,7 @@ IDOK                equ 1
 
 SW_HIDE             equ 0
 SW_SHOW             equ 5
+SW_SHOWNORMAL       equ 1
 IDC_ARROW           equ 32512
 IDC_HAND            equ 32649                ; the statistics line is clickable
 WM_SETCURSOR        equ 020h
@@ -1193,6 +1196,7 @@ CRUMB_SHORT_CHARS   equ 1000h       ; g_crumb_short
 BASEBUF_CHARS       equ 8010h       ; g_basebuf
 SUMMBUF_CHARS       equ 160         ; g_summbuf
 STATUSW_CHARS       equ 256         ; g_statusw
+RECOV_CHARS         equ 8200h       ; g_recov_msg: heading + a full temp path + tail
 SIZETXT_CHARS       equ 48          ; g_sizetxt
 ; fmt_size writes at most "1234.5 TB" + NUL; every caller must pass a
 ; destination of at least this many wide chars (checked by inspection).
@@ -1251,6 +1255,7 @@ WSTR cls_scrollbar, <SCROLLBAR>
 WSTR t_add_fail,    <Could not add to the archive>
 WSTR m_add_fail,    <Nothing was added and the archive is unchanged. It may be open in another program, or on a drive with no room left.>
 WSTR m_add_dup,     <One of those is already in the archive, under the same name. Nothing was added and the archive is unchanged.>
+WSTR m_add_toobig,  <That file is larger than this older container can hold in one piece - about 64 GiB. Nothing was added and the archive is unchanged. Extract it and encrypt a new container, which has no such limit.>
 ; Native editing is refused by pack.asm before writes. Explain the remedy in
 ; the window too; EXIT_UNSUPPORTED no longer means only a split volume set.
 WSTR t_vol_edit,    <Volume sets cannot be edited>
@@ -1330,9 +1335,9 @@ WSTR s_lvl_warning,   <warning>
 WSTR s_lvl_full,      <full>
 WSTR s_lvl_debug,     <debug>
 WSTR s_info_i,        <i>
-; Third place the version appears, and the one on the main window.  Kept in step
-; with myrkr.rc and s_ab_ver by tools/constcheck.py, which compares the
-; major.minor.patch of every site regardless of how each one formats it.
+; The ShellExecuteW verb for the About window's link.  (This comment used to
+; describe a main-window version label that opened the project page - the label
+; went, the claim stayed in m_about_body, and this verb sat unused.)
 WSTR s_open,          <open>
 ; Two paragraphs rather than one run-on sentence: the first says what the four
 ; classes ARE, the second says what the slider next to it does with them.  Split
@@ -1564,7 +1569,7 @@ WSTR t_about,     <About Myrkr>
 ; belongs to the no-args window that this replaced.  This is the short version:
 ; enough to identify the build, with the repo one click away on the version
 ; label at the bottom left of the main window.
-WSTR m_about_body, <Myrkr v1.1.2 - AES-256-GCM + Argon2id file encryption. Drop files or folders onto the window, or use Add files. The version label at the bottom left opens the project page.>
+WSTR m_about_body, <Myrkr v1.1.3 - AES-256-GCM + Argon2id file encryption. Drop files or folders onto the window, or use Add files. Project page: github.com/xxtsxx/Myrkr>
 WSTR m_nocpu,   <This CPU lacks the required AES-NI / PCLMULQDQ instructions.>
 CSTR c_nocpu,   "error: CPU lacks required features (AES-NI, PCLMULQDQ, SSE4.1)",13,10
 WSTR m_nopass,  <Please enter a password.>
@@ -1574,6 +1579,10 @@ WSTR m_nodest,  <Please choose a destination.>
 WSTR m_overwrite, <The output already exists. Overwrite it?>
 WSTR m_rewrite_fail, <The full re-encryption could not be completed. Check the password, file integrity, free space, and permissions. The original container was not replaced.>
 WSTR t_rewrite_recovery, <Replacement failed - keep this encrypted recovery file>
+WSTR m_recov_head, <The edited container was written in full, but it could not be put in place of the original. Your data is safe in this encrypted file - it opens with the same password:>
+WSTR m_recov_tail, <Rename it over the original container to use it. Do not delete it until you have.>
+WSTR m_name_clash, <Two inputs would be stored under the same name - names that differ only in capitals are the same on Windows - so one would replace the other when extracted. Nothing was written. Rename one, or use different folders.>
+WSTR m_link, <Stopped: a folder in the destination is a junction or symbolic link, and following it would write outside the destination. Nothing was written through it. Files extracted before this are authentic, but the folder is incomplete.>
 WSTR m_reencrypt, <This edit rewrites the entire container with a fresh encryption key. Large files may take a while and need space for a second container. You can cancel before replacement; the original stays unchanged. Continue?>
 WSTR m_slow_remove, <Removing from an archive this large means moving a lot of data, which will take a while. The window will not respond until it finishes, and nothing is changed if you stop now. Remove the selected items?>
 WSTR t_slow, <Myrkr - this will take a while>
@@ -1605,9 +1614,10 @@ WSTR s_ab_name,    <Myrkr>                  ; heading beside the icon
 ; the VERSIONINFO resource cheaply from here, so it is kept in step by hand:
 ; bump this WHENEVER myrkr.rc's FILEVERSION changes.  tools/constcheck.py cannot
 ; catch the drift - one side is an .rc, not an equ.
-WSTR s_ab_ver,     <Version 1.1.2.0>        ; version line (accent)
+WSTR s_ab_ver,     <Version 1.1.3.0>        ; version line (accent)
 WSTR s_ab_tag,     <AES-256-GCM authenticated encryption  -  Argon2id KDF>
 WSTR s_ab_foot,    <github.com/xxtsxx/Myrkr>
+WSTR s_ab_url,     <https://github.com/xxtsxx/Myrkr>   ; what clicking s_ab_foot opens
 WSTR s_close,      <Close>
 ; --- themed message box -------------------------------------------------------
 WSTR wc_mbox,      <myrkr_mbox>             ; message-box window class
@@ -2012,6 +2022,7 @@ public g_passw, g_confirmw
 g_passw      dw PWBUF_CHARS dup (?)
 g_confirmw   dw PWBUF_CHARS dup (?)
 g_statusw    dw STATUSW_CHARS dup (?)
+g_recov_msg  dw RECOV_CHARS dup (?)  ; the replacement-failed box, composed
 g_hdrbuf     db 32 dup (?)
 g_argc       dd ?
 ; --- themed message box state (UI thread only; mbox never nests) --------------
@@ -11557,6 +11568,12 @@ enter_running proc
     mov     dword ptr [g_running], 1
     mov     dword ptr [g_cancelled], 0
     mov     dword ptr [g_prog_abort], 0 ; reset before publishing the worker
+    ; The reasons on_done reads are about THIS job.  Each is set only by the
+    ; routine that detects it, so without this a refusal that never reached that
+    ; routine - a password-policy refusal, say - showed the previous job's reason.
+    mov     dword ptr [g_unpack_partial], 0
+    mov     dword ptr [g_unpack_link], 0
+    mov     dword ptr [g_edit_reason], 0
     mov     qword ptr [g_prog_total], 0
     mov     qword ptr [g_prog_done], 0
     ; The action log covers ONE operation.  Started here, on the UI thread and
@@ -12420,6 +12437,9 @@ od_err:
     cmp     eax, EXIT_USAGE
     jne     @F
     lea     rcx, [m_policy]
+    cmp     dword ptr [g_edit_reason], 1    ; EXIT_USAGE is not always the password
+    jne     @F
+    lea     rcx, [m_name_clash]
 @@:
     cmp     eax, EXIT_NOSPACE
     jne     @F
@@ -12433,9 +12453,21 @@ od_err:
     je      @F
     lea     rcx, [m_part_extract]
 @@:
+    ; ...except a link in the destination, whose message says the folder is
+    ; incomplete too AND why: "the archive is damaged" would be wrong.
+    cmp     dword ptr [g_unpack_link], 0
+    je      @F
+    lea     rcx, [m_link]
+@@:
     lea     rdx, [t_err]
     mov     r8d, MB_OK or MB_ICONERROR
     call    mbox
+    ; Into the same restore a SUCCESSFUL decrypt takes - not on into the
+    ; container-edit tail below, which this used to fall through to: a failed
+    ; encrypt or decrypt then showed a second, unrelated dialog ("The full
+    ; re-encryption could not be completed") and skipped od_restore, leaving
+    ; the typed password in its field and in g_cfg_pass.
+    jmp     od_restore
 ; ---- a container edit finished ---------------------------------------------
 ; Deliberately NOT od_restore: that path wipes g_cfg_pass, and the container view
 ; holds the password for the life of the window so a second add does not prompt
@@ -12477,7 +12509,23 @@ od_container:
     jne     od_c_choose
     cmp     dword ptr [g_op_result], EXIT_PARTIAL
     jne     od_c_choose
-    lea     rcx, [g_temppath]
+    ; The path WITH what to do about it - this box used to be the bare path,
+    ; leaving the user to work out from the title alone that it was their data.
+    lea     rcx, [g_recov_msg]
+    lea     rdx, [m_recov_head]
+    WBOUND  r8, g_recov_msg, RECOV_CHARS
+    call    wcopy
+    mov     word ptr [rax], 0Ah
+    lea     rcx, [rax+2]
+    lea     rdx, [g_temppath]
+    WBOUND  r8, g_recov_msg, RECOV_CHARS
+    call    wcopy
+    mov     word ptr [rax], 0Ah
+    lea     rcx, [rax+2]
+    lea     rdx, [m_recov_tail]
+    WBOUND  r8, g_recov_msg, RECOV_CHARS
+    call    wcopy
+    lea     rcx, [g_recov_msg]
     lea     rdx, [t_rewrite_recovery]
     mov     r8d, MB_OK or MB_ICONWARNING
     call    mbox
@@ -12494,6 +12542,9 @@ od_c_choose:
     cmp     dword ptr [g_op_result], EXIT_USAGE
     jne     @F
     lea     rcx, [m_add_dup]
+    cmp     dword ptr [g_edit_reason], 2    ; too big, not a duplicate
+    jne     @F
+    lea     rcx, [m_add_toobig]
 @@:
     ; Volume sets still refuse edits before writes.
     cmp     dword ptr [g_op_result], EXIT_UNSUPPORTED
@@ -15048,8 +15099,8 @@ draw_about proc
     sub     edx, 44
     mov     dword ptr [rbp-44], edx
     WINCALL DrawTextW, qword ptr [rbp-16], addr ab_body, -1, addr rbp-56, <DT_LEFT or DT_NOPREFIX or DT_WORDBREAK>
-    ; --- footer URL (hint grey) at (30, B-30) -------------------------------
-    WINCALL SetTextColor, qword ptr [rbp-16], CLR_HINT
+    ; --- footer URL at (30, B-30): accent, because it is a link now (ab_on_link)
+    WINCALL SetTextColor, qword ptr [rbp-16], CLR_ACCENT
     mov     eax, dword ptr [rbp-20]
     sub     eax, 30
     mov     dword ptr [rbp-56], 30
@@ -15106,7 +15157,9 @@ make_about_controls endp
 about_wndproc proc
     push    rbp
     mov     rbp, rsp
-    sub     rsp, 64
+    sub     rsp, 96                              ; 96: ShellExecuteW takes six
+                                                 ; arguments, and the POINT at
+                                                 ; [rbp-40] must sit above them
     mov     qword ptr [rbp-8], rcx
     mov     qword ptr [rbp-16], rdx
     mov     qword ptr [rbp-24], r8
@@ -15120,6 +15173,10 @@ about_wndproc proc
     je      ab_cmd
     cmp     rax, WM_NCHITTEST
     je      ab_hit
+    cmp     rax, WM_SETCURSOR
+    je      ab_cursor
+    cmp     rax, WM_LBUTTONUP
+    je      ab_click
     cmp     rax, WM_NCLBUTTONDBLCLK
     je      ab_zero                              ; swallow body double-click
     cmp     rax, WM_CLOSE
@@ -15162,8 +15219,44 @@ ab_hit:
     WINCALL DefWindowProcW, qword ptr [rbp-8], qword ptr [rbp-16], qword ptr [rbp-24], qword ptr [rbp-32]
     cmp     rax, HTCLIENT
     jne     ab_ret
+    ; The footer link stays HTCLIENT, so it can be pointed at and clicked;
+    ; everywhere else is the caption, which is what drags the borderless body.
+    movsx   eax, word ptr [rbp-32]               ; lParam: screen x
+    mov     dword ptr [rbp-40], eax
+    movsx   eax, word ptr [rbp-30]               ;         screen y
+    mov     dword ptr [rbp-36], eax
+    WINCALL ScreenToClient, qword ptr [rbp-8], addr rbp-40
+    mov     ecx, dword ptr [rbp-40]
+    mov     edx, dword ptr [rbp-36]
+    call    ab_on_link
+    test    eax, eax
+    mov     eax, HTCLIENT                        ; (mov leaves the flags alone)
+    jnz     ab_ret
     mov     rax, HTCAPTION                       ; drag the borderless body
     jmp     ab_ret
+ab_cursor:
+    ; a hand over the link, and only there: wParam is the window under the
+    ; cursor, so the Close button keeps its own
+    mov     rax, qword ptr [rbp-24]
+    cmp     rax, qword ptr [rbp-8]
+    jne     ab_def
+    mov     eax, dword ptr [rbp-32]
+    and     eax, 0FFFFh                          ; the hit-test code
+    cmp     eax, HTCLIENT
+    jne     ab_def
+    WINCALL LoadCursorW, 0, IDC_HAND
+    mov     rcx, rax
+    WINCALL SetCursor, rcx
+    mov     rax, 1
+    jmp     ab_ret
+ab_click:
+    movsx   ecx, word ptr [rbp-32]               ; client x
+    movsx   edx, word ptr [rbp-30]               ; client y
+    call    ab_on_link
+    test    eax, eax
+    jz      ab_zero
+    WINCALL ShellExecuteW, qword ptr [rbp-8], addr s_open, addr s_ab_url, 0, 0, SW_SHOWNORMAL
+    jmp     ab_zero
 ab_close:
     WINCALL DestroyWindow, qword ptr [g_hwnd]
 ab_zero:
@@ -15176,10 +15269,29 @@ ab_destroy:
 ab_def:
     WINCALL DefWindowProcW, qword ptr [rbp-8], qword ptr [rbp-16], qword ptr [rbp-24], qword ptr [rbp-32]
 ab_ret:
-    add     rsp, 64
+    add     rsp, 96                              ; MUST match the sub above
     pop     rbp
     ret
 about_wndproc endp
+
+; ab_on_link(ecx = client x, edx = client y) -> eax 1 if on the footer link.
+; The rectangle draw_about paints s_ab_foot into: x from 30, y from ABOUT_H-30 to
+; ABOUT_H-10 (the body static spans the whole client).  200 px wide - the text,
+; not the 360 px DrawText box - so empty space beside it does not click.
+ab_on_link proc
+    xor     eax, eax
+    cmp     ecx, 30
+    jl      aol_ret
+    cmp     ecx, 230
+    jge     aol_ret
+    cmp     edx, ABOUT_H - 30
+    jl      aol_ret
+    cmp     edx, ABOUT_H - 10
+    jge     aol_ret
+    mov     eax, 1
+aol_ret:
+    ret
+ab_on_link endp
 
 ; =============================================================================
 ; draw_secdesk(rcx = DRAWITEMSTRUCT*) - owner-draw body of the password prompt.
