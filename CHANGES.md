@@ -29,6 +29,10 @@ what changed and why, not a raw commit dump.
   selection over the limit is now refused whole with an error - nothing is
   encrypted - and a drop or picker past it keeps what fits and says some items
   were not added.
+- **A path too long for an input slot was truncated, not refused.** A
+  4,108-character file path became its 4,095-character folder, so the folder's
+  other files would have been encrypted with it. It is now refused with an
+  error.
 - **Argon2 changed registers its callers rely on.** The Windows x64 ABI makes
   r12-r15 callee-saved; the key derivation used three of them as scratch
   without saving them, so every derivation returned to its caller - including
@@ -59,10 +63,6 @@ what changed and why, not a raw commit dump.
 
   These four came from comparing Myrkr with Vordr, which shares its crypto core
   and had fixed all of them - as it had the Argon2 indexing bug that 1.1.5 fixed.
-- **A path too long for an input slot was truncated, not refused.** A
-  4,108-character file path became its 4,095-character folder, so the folder's
-  other files would have been encrypted with it. It is now refused with an
-  error.
 
 ### Tests
 
