@@ -46,6 +46,11 @@ FLOORS = {
     "aligncheck": {
         "scalars": 48,                   # 53 measured
     },
+    "nvcheck": {
+        # procs whose writes to callee-saved registers were checked for a save
+        # and a restore.
+        "procs": 600,                    # 670 measured
+    },
     "wstrcheck": {
         # call sites whose bound-carrying register was checked.  Nearly doubled
         # when wapp_lim joined wcopy in the CONTRACTS table, so the old floor of

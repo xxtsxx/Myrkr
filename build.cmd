@@ -148,6 +148,18 @@ if errorlevel 1 (
     )
     echo aligncheck: WARNING - misaligned labels above; build continues. Use "build strict" to gate.
 )
+echo === nvcheck ===
+rem A proc that writes rbx/rsi/rdi/r12-r15/xmm6-15 must save and restore it -
+rem the Windows x64 ABI makes them callee-saved.  argon2id_hash did not, for
+rem years, and nothing noticed (tools\nvcheck.py says how it was found).
+python tools\nvcheck.py
+if errorlevel 1 (
+    if "%STRICT%"=="1" (
+        echo nvcheck: a callee-saved register is clobbered - failing strict build
+        goto :failed
+    )
+    echo nvcheck: WARNING - findings above; build continues. Use "build strict" to gate.
+)
 echo === menu bitmap ===
 rem menu16.bmp is GENERATED from myrkr.ico and committed, so it can silently stop
 rem matching: change the icon, forget the step, and the context menu keeps the

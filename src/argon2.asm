@@ -17,6 +17,8 @@ extern blake2b_long:proc
 extern secure_zero:proc
 extern VirtualAlloc:proc
 extern VirtualFree:proc
+extern VirtualLock:proc                 ; best-effort pin of the final block
+extern VirtualUnlock:proc
 
 MEM_COMMIT      equ 1000h
 MEM_RESERVE     equ 2000h
@@ -706,6 +708,9 @@ g_refidx  dq 0
 align 16
 g_b2bctx  db 256 dup (?)
 g_hbuf    db 80 dup (?)   ; H0(64) || LE32(blk) || LE32(lane)
+align 8
+g_lastblk dq ?            ; B[0][q-1]: pinned while the KDF runs
+g_lastlk  dd ?            ; 1 = that VirtualLock succeeded
 g_le4     db 8 dup (?)
 align 16
 g_inp     db 1024 dup (?)
@@ -756,6 +761,15 @@ public argon2id_hash
 argon2id_hash proc frame
     FRAME_PROLOG 64
     mov     qword ptr [rbp-24], rcx     ; req
+    ; r12, r13 and r15 are scratch below (ref block, prev block, the pseudo-
+    ; random word) and the Windows x64 ABI makes them CALLEE-saved.  They were
+    ; used without being saved, so a caller - ours, or user32/kernel32 above a
+    ; window procedure or a thread start - that kept a value in one across a key
+    ; derivation got it back corrupted.  Nothing visibly broke; that was luck.
+    ; tools/nvcheck.py now holds every proc to this.
+    mov     qword ptr [rbp-32], r12
+    mov     qword ptr [rbp-40], r13
+    mov     qword ptr [rbp-48], r15
 
     ; ---- read params -------------------------------------------------------
     mov     eax, dword ptr [rcx].ARGON2REQ.lanes
@@ -870,6 +884,18 @@ endif
     test    rax, rax
     jz      a2_fail
     mov     qword ptr [g_arena], rax
+    ; The arena is far too large to lock and it is pageable, but one block in it
+    ; is key-equivalent on its own: B[0][q-1] after the last pass is the input to
+    ; the final H', so recovering it from the pagefile recovers the key.  Pin that
+    ; block's page - 1 KiB, always within quota.  Best effort: a refusal changes
+    ; nothing about the result.  (From Vordr's argon2.asm.)
+    xor     ecx, ecx
+    mov     rdx, qword ptr [g_q]
+    dec     rdx
+    call    a2_blkptr
+    mov     qword ptr [g_lastblk], rax
+    WINCALL VirtualLock, rax, 1024
+    mov     dword ptr [g_lastlk], eax
 
     ; ---- initial blocks B[i][0], B[i][1] ----------------------------------
     mov     qword ptr [g_lane], 0
@@ -1268,19 +1294,26 @@ endif
     mov     rdx, qword ptr [g_mb]
     shl     rdx, 10
     call    secure_zero
+    cmp     dword ptr [g_lastlk], 0
+    je      @F
+    WINCALL VirtualUnlock, qword ptr [g_lastblk], 1024
+@@:
     mov     rcx, qword ptr [g_arena]
     xor     edx, edx
     mov     r8d, MEM_RELEASE
     call    VirtualFree
 
     xor     eax, eax
-    FRAME_EPILOG
-    ret
+    jmp     a2_restore
 a2_fail:
     lea     rcx, [g_hbuf]
     mov     rdx, 80
     call    secure_zero
     mov     eax, 1
+a2_restore:
+    mov     r12, qword ptr [rbp-32]     ; callee-saved, see the prologue
+    mov     r13, qword ptr [rbp-40]
+    mov     r15, qword ptr [rbp-48]
     FRAME_EPILOG
     ret
 argon2id_hash endp

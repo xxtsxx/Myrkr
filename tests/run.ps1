@@ -62,6 +62,8 @@ $p2 = $p2 -bor $LASTEXITCODE
 # rather than in Phase 1: its segmented and split cases need the dbg knobs.
 python (Join-Path $PSScriptRoot "indepdecrypttest.py") $dbg
 $p2 = $p2 -bor $LASTEXITCODE
+python (Join-Path $PSScriptRoot "crashtest.py") $dbg
+$p2 = $p2 -bor $LASTEXITCODE
 & $ps -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot "nativeeditguitest.ps1")
 $p2 = $p2 -bor $LASTEXITCODE
 & $ps -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot "cmdbartest.ps1")

@@ -499,7 +499,11 @@ public run_selftest
 run_selftest proc frame
     FRAME_PROLOG 96
     ; [rbp-24] = failure count
+    ; [rbp-56] [rbp-64] = r12, r13: the vector blocks below use them as scratch,
+    ; and they are callee-saved (tools/nvcheck.py)
     mov     qword ptr [rbp-24], 0
+    mov     qword ptr [rbp-56], r12
+    mov     qword ptr [rbp-64], r13
 
     lea     rcx, [st_hdr]
     mov     edx, st_hdr_len
@@ -1653,6 +1657,8 @@ st_rl_fail:
     inc     qword ptr [rbp-24]
 st_after_rlog:
 
+    mov     r12, qword ptr [rbp-56]
+    mov     r13, qword ptr [rbp-64]
     mov     rax, qword ptr [rbp-24]
     FRAME_EPILOG
     ret

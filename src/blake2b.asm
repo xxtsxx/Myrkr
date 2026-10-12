@@ -407,6 +407,12 @@ bl_tail:
     call    blake2b_hash
 
 bl_done:
+    ; ctx + V: Argon2 runs H' over password-derived blocks, and the last V of a
+    ; 1024-byte block is that block's tail.  Nothing else clears this stack area
+    ; before the next deep call reuses it - or does not.  (From Vordr.)
+    lea     rcx, [rsp+32]
+    mov     edx, BLAKE2B_CTX_SIZE + 64
+    call    secure_zero
     FRAME_EPILOG
     ret
 blake2b_long endp

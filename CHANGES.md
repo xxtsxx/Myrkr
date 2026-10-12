@@ -6,7 +6,7 @@ ISO-8601 (`YYYY-MM-DD`).
 This file is maintained by hand alongside every change; each entry summarizes
 what changed and why, not a raw commit dump.
 
-## [Unreleased]
+## [1.1.6] - 2026-10-12
 
 ### Fixed
 
@@ -29,6 +29,36 @@ what changed and why, not a raw commit dump.
   selection over the limit is now refused whole with an error - nothing is
   encrypted - and a drop or picker past it keeps what fits and says some items
   were not added.
+- **Argon2 changed registers its callers rely on.** The Windows x64 ABI makes
+  r12-r15 callee-saved; the key derivation used three of them as scratch
+  without saving them, so every derivation returned to its caller - including
+  Windows code above a window procedure or thread start - with them changed.
+  Nothing visibly broke, but only by luck. They are saved and restored now, and
+  a new build checker, `tools/nvcheck.py`, holds every procedure to the rule
+  (it also found the self-test doing the same).
+- **A crash left secrets for the crash dump.** Myrkr had no crash handling: a
+  fault went to Windows Error Reporting with the password, key and any
+  decrypted data still in memory, and a fault while the password prompt held
+  the private desktop left the user on an empty screen. A fatal fault in Myrkr
+  now wipes every registered secret first, switches back to the user's desktop,
+  suppresses the crash dialog, writes a 24-byte breadcrumb
+  (`%TEMP%\myrkr_crash.bin`: code and address, never register contents) and
+  ends the process.
+- **Replacing an existing file was not safe against power loss.** Extraction
+  writes a temporary file and renames it over the existing one, but the rename
+  could reach the disk before the data, so a power cut shortly after could
+  leave the user's file zero-filled. When a rename replaces a file, the new
+  data is now flushed first and the rename is written through. A rename to a
+  new name is unchanged, so extracting into an empty folder costs no more.
+- **Key material left on the stack and in buffers:** the AES-GCM partial-block
+  keystream, the last WinZip-AES keystream block and BLAKE2b's working state
+  (which Argon2 fills with password-derived data) are now wiped; a failed tag
+  check in the one-shot `gcm_open` scrubs the plaintext it already wrote; and
+  the final Argon2 block, which alone is enough to recreate the key, is pinned
+  in RAM while the derivation runs.
+
+  These four came from comparing Myrkr with Vordr, which shares its crypto core
+  and had fixed all of them - as it had the Argon2 indexing bug that 1.1.5 fixed.
 - **A path too long for an input slot was truncated, not refused.** A
   4,108-character file path became its 4,095-character folder, so the folder's
   other files would have been encrypted with it. It is now refused with an
@@ -39,6 +69,10 @@ what changed and why, not a raw commit dump.
 - `tests/zipclaimtest.py` measures the peak working set of `unzip` and of the
   drag-out data object against zips that lie about their sizes; it fails
   against 1.1.5 and is part of Phase 1.
+- `tests/crashtest.py` (Phase 2) drives the crash containment with a new
+  `redteam crash` case and checks the exit status and the breadcrumb.
+- `tools/nvcheck.py` gates `build strict` on callee-saved registers; on the
+  1.1.5 sources it reports exactly the five unsaved registers fixed above.
 - `tests/inputcaptest.ps1` covers the input limits from the command line and
   from a drop, including the exact-256 boundary; it fails against 1.1.5 and is
   part of Phase 2.

@@ -18,6 +18,8 @@
 ;   myrkr redteam typemagic  -> FF_TYPE_MAGIC   (0xF003)
 ;   myrkr redteam heaptag    -> FF_HEAP_TAG     (0xF002)
 ;   myrkr redteam iat        -> 0xFADE1A70 (AV on the locked IAT slot, observed)
+;   myrkr redteam crash      -> 0xC0000409 via crash containment, and a
+;                               %TEMP%\myrkr_crash.bin naming the AV (tests/crashtest.py)
 ;
 ; If a case RETURNS (the control failed to fire), cmd_redteam exits non-zero so
 ; the harness records a FAIL.  Compiled only into the instrumented build
@@ -62,8 +64,9 @@ WSTR rc_bounds,    <bounds>
 WSTR rc_typemagic, <typemagic>
 WSTR rc_heaptag,   <heaptag>
 WSTR rc_iat,       <iat>
+WSTR rc_crash,     <crash>
 CSTR rt_msg_nofire, "redteam: control did NOT fire - FAIL",13,10
-CSTR rt_msg_unkn,   "redteam: unknown case (canary|shadow|dlpv|overflow|bounds|typemagic|heaptag|iat)",13,10
+CSTR rt_msg_unkn,   "redteam: unknown case (canary|shadow|dlpv|overflow|bounds|typemagic|heaptag|iat|crash)",13,10
 
 .data?
 align 16
@@ -97,6 +100,7 @@ cmd_redteam proc frame
     RTCASE  rt_do_type,      rc_typemagic
     RTCASE  rt_do_heap,      rc_heaptag
     RTCASE  rt_do_iat,       rc_iat
+    RTCASE  rt_do_crash,     rc_crash
     jmp     rt_unknown
 
 rt_do_canary:   call rt_v_canary
@@ -114,6 +118,8 @@ rt_do_type:     call rt_v_type
 rt_do_heap:     call rt_v_heap
     jmp     rt_nofire
 rt_do_iat:      call rt_v_iat
+    jmp     rt_nofire
+rt_do_crash:    call rt_v_crash
     jmp     rt_nofire
 
 rt_nofire:
@@ -295,6 +301,19 @@ rt_iat_nofire:
     FRAME_EPILOG
     ret
 rt_v_iat endp
+
+; Crash containment: an ordinary access violation raised inside this image,
+; with a secret planted first.  Not a mitigation trap - a plain bug, which is
+; what crash_veh exists for.  tests/crashtest.py checks the exit status and the
+; breadcrumb; the secret is gone with the process, so what proves the wipe ran
+; is that the breadcrumb (written just before it) exists and names this AV.
+rt_v_crash proc frame
+    FRAME_PROLOG 32
+    xor     eax, eax
+    mov     qword ptr [rax+8], rax           ; write to address 8 -> AV in our image
+    FRAME_EPILOG
+    ret
+rt_v_crash endp
 
 endif ; DBG_TRACE
 

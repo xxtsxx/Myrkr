@@ -434,6 +434,10 @@ gx_tb_next:
     GHASH_MEM r10
 gx_done:
     movdqu  xmmword ptr [r12+GC_Y], xmm1
+    pxor    xmm0, xmm0                          ; wipe the partial-block keystream
+    movdqu  xmmword ptr [rsp+144], xmm0         ;   [rsp+144] and the zero-padded tail
+    movdqu  xmmword ptr [rsp+160], xmm0         ;   [rsp+160]: keystream XOR the tail is
+                                                ;   the plaintext (from Vordr)
 
     movdqu  xmm6,  xmmword ptr [rsp+32]
     movdqu  xmm7,  xmmword ptr [rsp+48]
@@ -578,6 +582,16 @@ gcm_open proc frame
     lea     rcx, [rsp+32]
     mov     rdx, GCM_CTX_SIZE + 16
     call    secure_zero
+    cmp     dword ptr [rbp-40], 0
+    je      go_ok
+    ; Tag mismatch: the plaintext is already in outp, decrypted from bytes that
+    ; did not authenticate.  Scrub it, so a caller that neglects the return value
+    ; cannot go on to use forged data.  (From Vordr.)
+    mov     r10, qword ptr [rbp-24]
+    mov     rcx, qword ptr [r10].GCMREQ.outp
+    mov     rdx, qword ptr [r10].GCMREQ.inlen
+    call    secure_zero
+go_ok:
     mov     eax, dword ptr [rbp-40]
     FRAME_EPILOG
     ret
@@ -804,6 +818,8 @@ acx_pb:
     inc     r11
     jmp     acx_pb
 acx_done:
+    pxor    xmm0, xmm0                       ; the last keystream block stays on
+    movdqu  xmmword ptr [rbp-80], xmm0       ;   the stack otherwise (from Vordr)
     FRAME_EPILOG
     ret
 aes_ctr_xor endp

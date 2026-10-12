@@ -35,6 +35,7 @@ externdef g_prog_abort:dword
 ; ---- our runtime (shared with the CLI build) --------------------------------
 extern cpu_gate:proc
 extern hardening_init:proc
+extern crash_install:proc               ; hardening.asm: fatal-fault containment
 extern con_init:proc
 extern con_attach_parent:proc
 extern iat_lockdown:proc
@@ -1574,7 +1575,7 @@ WSTR t_about,     <About Myrkr>
 ; belongs to the no-args window that this replaced.  This is the short version:
 ; enough to identify the build, with the repo one click away on the version
 ; label at the bottom left of the main window.
-WSTR m_about_body, <Myrkr v1.1.5 - AES-256-GCM + Argon2id file encryption. Drop files or folders onto the window, or use Add files. Project page: github.com/xxtsxx/Myrkr>
+WSTR m_about_body, <Myrkr v1.1.6 - AES-256-GCM + Argon2id file encryption. Drop files or folders onto the window, or use Add files. Project page: github.com/xxtsxx/Myrkr>
 WSTR m_nocpu,   <This CPU lacks the required AES-NI / PCLMULQDQ instructions.>
 CSTR c_nocpu,   "error: CPU lacks required features (AES-NI, PCLMULQDQ, SSE4.1)",13,10
 WSTR m_nopass,  <Please enter a password.>
@@ -1624,7 +1625,7 @@ WSTR s_ab_name,    <Myrkr>                  ; heading beside the icon
 ; the VERSIONINFO resource cheaply from here, so it is kept in step by hand:
 ; bump this WHENEVER myrkr.rc's FILEVERSION changes.  tools/constcheck.py cannot
 ; catch the drift - one side is an .rc, not an equ.
-WSTR s_ab_ver,     <Version 1.1.5.0>        ; version line (accent)
+WSTR s_ab_ver,     <Version 1.1.6.0>        ; version line (accent)
 WSTR s_ab_tag,     <AES-256-GCM authenticated encryption  -  Argon2id KDF>
 WSTR s_ab_foot,    <github.com/xxtsxx/Myrkr>
 WSTR s_ab_url,     <https://github.com/xxtsxx/Myrkr>   ; what clicking s_ab_foot opens
@@ -2086,6 +2087,9 @@ g_badset_open dd ?                           ; 1 = detect_op was handed a part o
                                              ; set that cannot be assembled
 g_add_refused dd ?                           ; items append_input (or a drop) turned
                                              ; away in the current add - see append_input
+public g_gui_active
+g_gui_active dd ?                            ; 1 once gui_main runs: crash_contain may
+                                             ; show a box (never in the CLI)
 g_argover    dd ?                            ; command-line inputs past MAX_ARGS
 g_arglong    dd ?                            ; command-line inputs too long for a slot
 g_idx_bytes  dq ?                            ; bytes the inventory accounts for
@@ -14764,6 +14768,7 @@ gui_main proc
     sub     rsp, 256                     ; large frame: keep locals clear of the
                                          ; CreateWindowExW outgoing-arg area so W/H
                                          ; survive for the post-create rounding
+    mov     dword ptr [g_gui_active], 1
     WINCALL GetCommandLineW
     WINCALL CommandLineToArgvW, rax, addr g_argc
     mov     qword ptr [rbp-16], rax              ; argv
@@ -17976,6 +17981,9 @@ wstart proc
     call    hardening_init               ; canary + shadow stack live
     test    eax, eax
     jz      ws_oom
+    ; Before any secret exists: a fatal fault from here on wipes them and leaves
+    ; without a crash dump or a stranded private desktop (hardening.asm).
+    call    crash_install
     ; ---- settings, weakest source first -------------------------------------
     ; 1. HKLM\Software\Myrkr\Defaults - what an administrator DEPLOYED.  Read with
     ;    g_loading_hklm clear, so it sets the value and locks nothing: a starting

@@ -178,6 +178,8 @@ after `build dbg`.
 | Type confusion | 32-bit type magic on the heap block header, checked on access | `redteam typemagic` → `FF_TYPE_MAGIC` ✔ |
 | Use-after-free / double-free | Tagged heap: header {magic, size, generation, canary} plus a trailing canary; freed blocks poisoned `0xDD` and the generation bumped | `redteam heaptag` → `FF_HEAP_TAG` ✔ |
 | IAT lockdown ("RELRO") | The import address table is made `PAGE_READONLY` immediately after startup, before any user input is parsed | `redteam iat` → access violation on the locked slot ✔ |
+| Crash containment | A fatal fault raised in Myrkr's own code wipes every registered secret before anything else, switches back from the private password desktop, suppresses the Windows crash dialog and ends the process, leaving a 24-byte breadcrumb (code and address, never registers) - so a crash dump never holds the password, key or decrypted data. Faults other DLLs raise and handle themselves are left alone | `redteam crash` → `0xC0000409` + breadcrumb ✔ (`tests/crashtest.py`) |
+| Callee-saved registers | Every procedure that uses rbx, rsi, rdi, r12-r15 or xmm6-15 saves and restores it, as the Windows x64 ABI requires | `tools/nvcheck.py` gates `build strict` ✔ |
 | ASLR / DEP / NX | `/DYNAMICBASE /HIGHENTROPYVA /NXCOMPAT` | `dumpbin /headers` reports all three ✔ |
 | SEH unwind data | `.pushreg` / `.setframe` / `.allocstack` on every framed procedure | `framecheck` gates the build ✔ |
 | Secret erasure | `secure_zero` (volatile stores + fence) on keys, passwords, derived material and the Argon2 arena before release | 34 call sites; no fault-injection case — see §6 |

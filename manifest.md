@@ -105,7 +105,7 @@ Mitigation switches on the shipping link line:
 - The manifest (`myrkr.manifest`) declares `longPathAware` so the OS does not
   impose the legacy 260-character `MAX_PATH` cap (see §7).
 - A resource script (`myrkr.rc` → `rc.exe` → `obj\myrkr.res`, linked in) carries
-  a `VERSIONINFO` block — FileVersion/ProductVersion `1.1.5.0`, product name,
+  a `VERSIONINFO` block — FileVersion/ProductVersion `1.1.6.0`, product name,
   description, company and copyright (shown under Properties → Details) — and the
   application **icon** (`myrkr.ico`, a multi-resolution 16–256px set rendered from
   `logo/myrkr.svg`). Resource ID 1 makes it the shell file icon; `gui.asm` also

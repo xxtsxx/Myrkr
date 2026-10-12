@@ -21,9 +21,14 @@ extern VirtualFree:proc
 extern MoveFileExW:proc
 extern DeleteFileW:proc
 extern GetDiskFreeSpaceExW:proc
+extern GetFileAttributesW:proc
+extern FlushFileBuffers:proc
 extern secure_zero:proc
 
 MOVEFILE_REPLACE_EXISTING equ 1
+MOVEFILE_WRITE_THROUGH    equ 8
+INVALID_FILE_ATTRIBUTES   equ 0FFFFFFFFh
+FILE_SHARE_ALL            equ 7          ; read | write | delete
 
 GENERIC_READ        equ 80000000h
 GENERIC_WRITE       equ 40000000h
@@ -430,8 +435,39 @@ file_close endp
 ; file_rename(rcx = from, rdx = to) -> eax 0/EXIT_IO  (atomic replace)
 public file_rename
 file_rename proc frame
-    FRAME_PROLOG 48
-    WINCALL MoveFileExW, rcx, rdx, MOVEFILE_REPLACE_EXISTING
+    FRAME_PROLOG 96
+    ; [rbp-24] from  [rbp-32] to  [rbp-40] handle
+    ;
+    ; REPLACING a file is the case that needs care.  NTFS journals the rename
+    ; but writes the file's data lazily, so after a power cut a rename that
+    ; reached the disk can name a file whose data did not - the user's existing
+    ; file replaced by zeros, which is exactly what temp-then-rename (1.1.3)
+    ; promised could not happen.  So when the destination exists: flush the new
+    ; file's data first, and rename with MOVEFILE_WRITE_THROUGH so the call does
+    ; not return before the rename is on disk.  (Vordr's fileio does the same.)
+    ;
+    ; A NEW name gets neither.  Losing a file that did not exist before costs
+    ; nothing a re-run cannot restore, and a flush per file would make a 20,000-
+    ; file extraction into a fresh folder many times slower.
+    mov     qword ptr [rbp-24], rcx
+    mov     qword ptr [rbp-32], rdx
+    WINCALL GetFileAttributesW, rdx
+    cmp     eax, INVALID_FILE_ATTRIBUTES
+    je      frn_plain
+    ; Best effort: a source somebody holds without sharing write cannot be
+    ; reopened, and then only the write-through rename is had.
+    WINCALL CreateFileW, qword ptr [rbp-24], GENERIC_WRITE, FILE_SHARE_ALL, 0, OPEN_EXISTING, FILE_ATTR_NORMAL, 0
+    cmp     rax, -1
+    je      frn_through
+    mov     qword ptr [rbp-40], rax
+    WINCALL FlushFileBuffers, qword ptr [rbp-40]
+    WINCALL CloseHandle, qword ptr [rbp-40]
+frn_through:
+    WINCALL MoveFileExW, qword ptr [rbp-24], qword ptr [rbp-32], <MOVEFILE_REPLACE_EXISTING or MOVEFILE_WRITE_THROUGH>
+    jmp     frn_check
+frn_plain:
+    WINCALL MoveFileExW, qword ptr [rbp-24], qword ptr [rbp-32], MOVEFILE_REPLACE_EXISTING
+frn_check:
     test    eax, eax
     jz      frn_io
     xor     eax, eax

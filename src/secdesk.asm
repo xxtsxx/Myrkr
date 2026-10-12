@@ -61,6 +61,7 @@ GENERIC_ALL         equ 10000000h
 WSTR wsd_name, <Myrkr-Secure>
 
 .data?
+public g_sd_prev_input                  ; hardening.asm's crash containment reads it
 g_sd_prev_input dq ?                ; input desktop that was active before us
 g_sd_prev_thread dq ?               ; calling thread's desktop before us
 

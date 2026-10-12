@@ -7,6 +7,7 @@
 ;   tagged_alloc      : heap allocator with temporal tag + canaries
 ;   tagged_free       : verifying, poisoning free
 ;   ct_memcmp         : constant-time comparison (timing safe)
+;   crash_install     : wipe secrets and leave cleanly on a fatal fault
 ; =============================================================================
 
 include macros.inc
@@ -19,6 +20,27 @@ extern VirtualProtect:proc
 extern GetModuleHandleW:proc
 extern rng_fill:proc                    ; random.asm: rcx=buf, rdx=len -> eax=1 ok
 extern secmem_init:proc                 ; secmem.asm: lock the secret buffers
+extern secmem_wipe_all:proc             ; secmem.asm: zero every registered secret
+extern SetUnhandledExceptionFilter:proc
+extern AddVectoredExceptionHandler:proc
+extern SetErrorMode:proc
+extern TerminateProcess:proc
+extern GetCurrentProcess:proc
+extern SwitchDesktop:proc               ; give the user's desktop back before dying
+extern MessageBoxW:proc
+extern CreateFileW:proc
+extern WriteFile:proc
+extern CloseHandle:proc
+extern GetTempPathW:proc
+externdef g_sd_prev_input:qword         ; secdesk.asm: the user's desktop while the
+                                        ;   password prompt holds input, else 0
+externdef g_gui_active:dword            ; gui.asm: 1 once gui_main is running
+
+SEM_FAILCRITICALERRORS  equ 0001h
+SEM_NOGPFAULTERRORBOX   equ 0002h
+CRASH_GENERIC_WRITE     equ 40000000h
+CRASH_CREATE_ALWAYS     equ 2
+CRASH_MB_ICONERROR      equ 10h
 
 MEM_COMMIT          equ 1000h
 MEM_RESERVE         equ 2000h
@@ -60,6 +82,29 @@ g_stack_canary  dq 0
 g_sstk_tls      dd 0
 g_cpu_features  dd 0
 g_heap_gen      dd 1                    ; global generation counter
+
+.data?
+; crash breadcrumb, written in this order to %TEMP%\myrkr_crash.bin:
+;   code (4) | pad (4) | faulting address (8) | image base (8) = 24 bytes.
+; No register contents, ever: at a crash during crypto they can hold key or
+; password bytes, and %TEMP% is readable by everything running as this user.
+align 8
+g_crash_code    dd ?
+                dd ?                    ; pad: the address below is 8-aligned
+g_crash_addr    dq ?
+g_crash_base    dq ?
+g_img_lo        dq ?                    ; this image's range: crash_veh acts only
+g_img_hi        dq ?                    ;   on faults raised inside it
+g_crash_h       dq ?
+g_crash_nw      dd ?
+g_crash_dumped  db ?
+align 2
+g_crashpath     dw MAX_PATH_CHARS dup (?)
+
+.const
+WSTR crash_title,   <Myrkr>
+WSTR crash_apology, <Myrkr stopped because of an internal error. Its passwords and keys were wiped from memory first. An operation that was running did not finish - files it had not yet replaced are unchanged.>
+WSTR crash_fname,   <myrkr_crash.bin>
 
 .code
 
@@ -445,5 +490,168 @@ tagged_free proc frame
     FRAME_EPILOG
     ret
 tagged_free endp
+
+; =============================================================================
+; CRASH CONTAINMENT (ported from Vordr's hardening.asm, 2026-10-11)
+;
+; Without it a fault anywhere in Myrkr went to Windows Error Reporting with
+; everything still in memory - the password in g_cfg_pass, the key in g_key,
+; decrypted plaintext in the stream buffers - and a crash dump is a file.  And a
+; fault while the password prompt held the private desktop left the user on an
+; empty screen, because the only SwitchDesktop back is in code a dead process
+; never reaches.
+;
+; crash_veh is the primary path: a vectored handler runs first-chance, before
+; any dump writer.  It acts only on ERROR-severity codes raised inside this
+; image - a vectored handler sees every first-chance exception in the process,
+; and DLLs loaded into the file dialogs (shell extensions) raise and handle
+; their own.  crash_filter is the backstop for a fatal fault outside the image.
+;
+; __fastfail (every FASTFAIL in this tree, the 0xFADE redteam codes, the
+; shadow-stack and canary traps) is NOT an exception and reaches neither: the
+; kernel ends the process at once, which is already the containment wanted.
+;
+; FRAME_PROLOG is safe here on any thread: on a thread Myrkr never set up, the
+; shadow-stack slot is null and the macro skips it (see sstk_thread_init).
+; =============================================================================
+
+; crash_contain - wipe every registered secret, give the desktop back, say
+; something if a window is up, terminate.  Never returns.
+crash_contain proc frame
+    FRAME_PROLOG 48
+    call    secmem_wipe_all                     ; secrets gone before anything else
+    ; The password prompt holds the private desktop: switch the user back
+    ; BEFORE any UI, and then raise none - the prompt's thread is attached to
+    ; the desktop just left, so a box from it would be invisible and would block
+    ; the termination below for ever.
+    mov     rcx, qword ptr [g_sd_prev_input]
+    test    rcx, rcx
+    jz      cc_ui
+    WINCALL SwitchDesktop, rcx
+    jmp     cc_kill
+cc_ui:
+    cmp     dword ptr [g_gui_active], 0          ; a box only when a window is up -
+    je      cc_kill                             ;   the CLI must never block on one
+    WINCALL MessageBoxW, 0, addr crash_apology, addr crash_title, CRASH_MB_ICONERROR
+cc_kill:
+    WINCALL GetCurrentProcess
+    WINCALL TerminateProcess, rax, 0C0000409h
+    FRAME_EPILOG                                ; unreached
+    ret
+crash_contain endp
+
+; crash_dump - best-effort breadcrumb, %TEMP%\myrkr_crash.bin, 24 bytes:
+; code, faulting address, image base.  Once per process.
+crash_dump proc frame
+    FRAME_PROLOG 64
+    cmp     byte ptr [g_crash_dumped], 0
+    jne     cd_ret
+    mov     byte ptr [g_crash_dumped], 1
+    mov     rax, qword ptr [g_img_lo]
+    mov     qword ptr [g_crash_base], rax
+    WINCALL GetTempPathW, MAX_PATH_CHARS-32, addr g_crashpath
+    test    eax, eax
+    jz      cd_ret
+    cmp     eax, MAX_PATH_CHARS-32
+    jae     cd_ret
+    lea     r10, [g_crashpath]
+cd_scan:
+    cmp     word ptr [r10], 0
+    je      cd_app
+    add     r10, 2
+    jmp     cd_scan
+cd_app:
+    lea     r11, [crash_fname]
+cd_cp:
+    mov     ax, word ptr [r11]
+    mov     word ptr [r10], ax
+    add     r10, 2
+    add     r11, 2
+    test    ax, ax
+    jnz     cd_cp
+    WINCALL CreateFileW, addr g_crashpath, CRASH_GENERIC_WRITE, 0, 0, CRASH_CREATE_ALWAYS, 0, 0
+    cmp     rax, -1
+    je      cd_ret
+    mov     qword ptr [g_crash_h], rax
+    WINCALL WriteFile, qword ptr [g_crash_h], addr g_crash_code, 24, addr g_crash_nw, 0
+    WINCALL CloseHandle, qword ptr [g_crash_h]
+cd_ret:
+    FRAME_EPILOG
+    ret
+crash_dump endp
+
+; crash_veh(rcx = EXCEPTION_POINTERS*) -> eax = EXCEPTION_CONTINUE_SEARCH (0)
+;
+; RAW, like redteam's rt_iat_veh: it runs inside the OS exception dispatcher for
+; EVERY first-chance exception in the process, nearly all of which it passes on,
+; and the pass path should disturb nothing - no canary, no shadow-stack entry.
+; The framed code (crash_dump, crash_contain) runs only once a fault is fatal.
+crash_veh proc
+    push    rbp
+    mov     rbp, rsp
+    sub     rsp, 48
+    mov     rax, qword ptr [rcx]                ; -> EXCEPTION_RECORD
+    mov     r10d, dword ptr [rax]               ; ExceptionCode
+    mov     r11d, r10d
+    and     r11d, 0F0000000h
+    cmp     r11d, 0C0000000h                    ; ERROR severity only: guard-page
+    jne     cv_pass                             ;   growth, breakpoints, single
+                                                ;   steps and C++/RPC exceptions pass
+    mov     r11, qword ptr [rax+16]             ; ExceptionAddress
+    cmp     r11, qword ptr [g_img_lo]
+    jb      cv_pass                             ; raised outside this image: some
+    cmp     r11, qword ptr [g_img_hi]           ;   DLL's own business - crash_filter
+    jae     cv_pass                             ;   catches it if nobody handles it
+    mov     dword ptr [g_crash_code], r10d
+    mov     qword ptr [g_crash_addr], r11
+    call    crash_dump                          ; breadcrumb first: it survives a
+    call    crash_contain                       ;   containment step that fails
+cv_pass:
+    xor     eax, eax
+    add     rsp, 48
+    pop     rbp
+    ret
+crash_veh endp
+
+; crash_filter(rcx = EXCEPTION_POINTERS*) - the last-chance backstop.  Raw for
+; the same reason as crash_veh.
+crash_filter proc
+    push    rbp
+    mov     rbp, rsp
+    sub     rsp, 48
+    mov     rax, qword ptr [rcx]
+    mov     r10d, dword ptr [rax]
+    mov     dword ptr [g_crash_code], r10d
+    mov     r10, qword ptr [rax+16]
+    mov     qword ptr [g_crash_addr], r10
+    call    crash_dump
+    call    crash_contain
+    xor     eax, eax                            ; unreached
+    add     rsp, 48
+    pop     rbp
+    ret
+crash_filter endp
+
+; =============================================================================
+; crash_install - arm the above.  Call once, early in wstart, before any secret
+; exists.  SetErrorMode suppresses the WER fault dialog for this process (no
+; registry change); the vectored handler goes FIRST in the chain so it runs
+; before anything else gets the chance to write a dump.
+; =============================================================================
+public crash_install
+crash_install proc frame
+    FRAME_PROLOG 32
+    WINCALL GetModuleHandleW, 0
+    mov     qword ptr [g_img_lo], rax
+    mov     r10d, dword ptr [rax+3Ch]           ; e_lfanew
+    mov     r10d, dword ptr [rax+r10+50h]       ; OptionalHeader.SizeOfImage
+    add     rax, r10
+    mov     qword ptr [g_img_hi], rax
+    WINCALL SetErrorMode, <SEM_FAILCRITICALERRORS or SEM_NOGPFAULTERRORBOX>
+    WINCALL AddVectoredExceptionHandler, 1, addr crash_veh
+    WINCALL SetUnhandledExceptionFilter, addr crash_filter
+    FRAME_EPILOG
+    ret
+crash_install endp
 
 end
