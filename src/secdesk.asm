@@ -43,27 +43,53 @@ extern SetThreadDesktop:proc
 extern GetThreadDesktop:proc
 extern OpenInputDesktop:proc
 extern SwitchDesktop:proc
+extern SetUserObjectSecurity:proc
 extern GetCurrentThreadId:proc
+extern OpenProcessToken:proc
+extern GetTokenInformation:proc
+extern CreateWellKnownSid:proc
+extern InitializeAcl:proc
+extern AddAccessAllowedAce:proc
+extern InitializeSecurityDescriptor:proc
+extern SetSecurityDescriptorDacl:proc
+extern SetSecurityDescriptorControl:proc
+extern CloseHandle:proc
+extern rng_fill:proc
+extern secure_zero:proc
 ifdef DBG_TRACE
 extern CreateThread:proc
 extern WaitForSingleObject:proc
-extern CloseHandle:proc
 extern Sleep:proc
 extern print_a:proc
+extern sstk_thread_init:proc
+extern sstk_thread_free:proc
 endif
 
-GENERIC_ALL         equ 10000000h
+GENERIC_ALL             equ 10000000h
+DESKTOP_CREATE_ACCESS_  equ 000601FFh   ; READ_CONTROL | WRITE_DAC | DESKTOP_ALL(01FFh)
+DESKTOP_USER_STRIPPED_  equ 00020146h   ; READ_CONTROL | SWITCH | ENUM | CREATEMENU | CREATEWINDOW
+                                        ; (strips READOBJECTS, WRITEOBJECTS, HOOKCONTROL, JOURNAL*)
+ACL_REVISION_           equ 2
+SD_REVISION_            equ 1
+SE_DACL_PROTECTED_      equ 1000h
+WIN_LOCAL_SYSTEM_SID_   equ 22
 
 .const
-; A fixed name is fine: CreateDesktopW opens the existing one if a desktop of
-; this name is already present in the window station, and only this process ever
-; switches to it.
-WSTR wsd_name, <Myrkr-Secure>
+align 4
+sd_dacl_si  dd 4                        ; DACL_SECURITY_INFORMATION (passed by pointer)
+sd_hex      db "0123456789abcdef"
 
 .data?
 public g_sd_prev_input                  ; hardening.asm's crash containment reads it
-g_sd_prev_input dq ?                ; input desktop that was active before us
-g_sd_prev_thread dq ?               ; calling thread's desktop before us
+align 8
+g_sd_prev_input  dq ?                   ; input desktop that was active before us
+g_sd_prev_thread dq ?                   ; calling thread's desktop before us
+g_sd_tokbuf      db 128 dup (?)         ; TOKEN_USER scratch
+g_sd_syssid      db 68 dup (?)          ; WinLocalSystemSid scratch
+g_sd_acl         db 256 dup (?)         ; explicit protected ACL
+g_sd_sd          db 40 dup (?)          ; SECURITY_DESCRIPTOR (40 bytes on x64)
+align 2
+g_sd_name        dw 40 dup (?)          ; "Myrkr-" + 32 hex chars + NUL
 
 .code
 
@@ -76,26 +102,118 @@ endm
 endif
 
 ; =============================================================================
-; secdesk_open -> rax = HDESK, or 0 if a private desktop cannot be created.
-; The caller decides what a failure means; nothing here falls back silently,
-; because a silent fallback to the interactive desktop is the whole control
-; quietly turning itself off.
+; secdesk_open -> rax = HDESK, or 0 if a private desktop cannot be created and
+; locked down.
+;
+; Hardening (ported from Vordr VDR-12 / VDR2-12):
+;   1. Per-invocation 128-bit CSPRNG name ("Myrkr-<32 hex>") prevents pre-squat.
+;   2. Opens with DESKTOP_CREATE_ACCESS_ (preserving full handle rights for our
+;      own process), then applies an explicit SE_DACL_PROTECTED DACL granting
+;      SYSTEM GENERIC_ALL and TokenUser ONLY 0x00020146 — stripping
+;      DESKTOP_HOOKCONTROL, DESKTOP_READOBJECTS, DESKTOP_WRITEOBJECTS, and
+;      DESKTOP_JOURNALRECORD/PLAYBACK so a peer process running as the same UID
+;      cannot OpenDesktopW to hook keystrokes or read/inject window messages
+;      without first calling SetUserObjectSecurity(WRITE_DAC).
+;   3. Fails closed (closes desktop and returns 0) if RNG or DACL setup fails.
 ; =============================================================================
 public secdesk_open
 secdesk_open proc frame
-    FRAME_PROLOG 64
-    ; CreateDesktopW(name, NULL device, NULL devmode, flags 0, GENERIC_ALL, NULL sa)
-    ;
-    ; flags is 0 rather than DF_ALLOWOTHERACCOUNTHOOK (1): that flag would let
-    ; processes of OTHER accounts install hooks on this desktop, which is the
-    ; opposite of the point.
-    ;
-    ; The security attributes are NULL, so the desktop gets the default DACL for
-    ; this token.  That is deliberate and not an oversight - see the header: an
-    ; ACL cannot separate us from a same-user attacker, so there is nothing
-    ; useful to write here, and inventing one would suggest a boundary that does
-    ; not exist.
-    WINCALL CreateDesktopW, addr wsd_name, 0, 0, 0, GENERIC_ALL, 0
+    FRAME_PROLOG 112
+    ; [rbp-24]=hDesk [rbp-32]=hToken [rbp-40]=cbRet/cbSid [rbp-64..rbp-49]=rand(16)
+
+    lea     rcx, [rbp-64]
+    mov     edx, 16
+    call    rng_fill
+    test    eax, eax
+    jz      sdo_fail
+
+    ; Format "Myrkr-" + 32 lowercase hex wide chars into g_sd_name
+    lea     r10, [g_sd_name]
+    mov     word ptr [r10+0],  'M'
+    mov     word ptr [r10+2],  'y'
+    mov     word ptr [r10+4],  'r'
+    mov     word ptr [r10+6],  'k'
+    mov     word ptr [r10+8],  'r'
+    mov     word ptr [r10+10], '-'
+    lea     r11, [r10+12]
+    lea     r8,  [sd_hex]
+    xor     ecx, ecx
+sdo_hex:
+    movzx   eax, byte ptr [rbp+rcx-64]
+    mov     edx, eax
+    shr     eax, 4
+    and     edx, 0Fh
+    movzx   eax, byte ptr [r8+rax]
+    mov     word ptr [r11], ax
+    movzx   edx, byte ptr [r8+rdx]
+    mov     word ptr [r11+2], dx
+    add     r11, 4
+    inc     ecx
+    cmp     ecx, 16
+    jb      sdo_hex
+    mov     word ptr [r11], 0
+
+    lea     rcx, [rbp-64]
+    mov     edx, 16
+    call    secure_zero
+
+    WINCALL CreateDesktopW, addr g_sd_name, 0, 0, 0, DESKTOP_CREATE_ACCESS_, 0
+    test    rax, rax
+    jz      sdo_fail
+    mov     qword ptr [rbp-24], rax
+
+    ; Query TokenUser SID
+    mov     qword ptr [rbp-32], 0
+    WINCALL OpenProcessToken, -1, 8, addr rbp-32    ; GetCurrentProcess()=-1, TOKEN_QUERY=8
+    test    eax, eax
+    jz      sdo_close_fail
+    mov     dword ptr [rbp-40], 0
+    WINCALL GetTokenInformation, qword ptr [rbp-32], 1, addr g_sd_tokbuf, 128, addr rbp-40
+    mov     dword ptr [rbp-44], eax
+    WINCALL CloseHandle, qword ptr [rbp-32]
+    cmp     dword ptr [rbp-44], 0
+    je      sdo_close_fail
+
+    ; Build WinLocalSystemSid
+    mov     dword ptr [rbp-40], 68
+    WINCALL CreateWellKnownSid, WIN_LOCAL_SYSTEM_SID_, 0, addr g_sd_syssid, addr rbp-40
+    test    eax, eax
+    jz      sdo_close_fail
+
+    ; Build protected explicit DACL: TokenUser (stripped) + SYSTEM (GENERIC_ALL)
+    WINCALL InitializeAcl, addr g_sd_acl, 256, ACL_REVISION_
+    test    eax, eax
+    jz      sdo_close_fail
+    mov     r9, qword ptr [g_sd_tokbuf]             ; TOKEN_USER.User.Sid
+    WINCALL AddAccessAllowedAce, addr g_sd_acl, ACL_REVISION_, DESKTOP_USER_STRIPPED_, r9
+    test    eax, eax
+    jz      sdo_close_fail
+    WINCALL AddAccessAllowedAce, addr g_sd_acl, ACL_REVISION_, GENERIC_ALL, addr g_sd_syssid
+    test    eax, eax
+    jz      sdo_close_fail
+
+    WINCALL InitializeSecurityDescriptor, addr g_sd_sd, SD_REVISION_
+    test    eax, eax
+    jz      sdo_close_fail
+    WINCALL SetSecurityDescriptorDacl, addr g_sd_sd, 1, addr g_sd_acl, 0
+    test    eax, eax
+    jz      sdo_close_fail
+    WINCALL SetSecurityDescriptorControl, addr g_sd_sd, SE_DACL_PROTECTED_, SE_DACL_PROTECTED_
+    test    eax, eax
+    jz      sdo_close_fail
+
+    WINCALL SetUserObjectSecurity, qword ptr [rbp-24], addr sd_dacl_si, addr g_sd_sd
+    test    eax, eax
+    jz      sdo_close_fail
+
+    mov     rax, qword ptr [rbp-24]
+    jmp     sdo_done
+
+sdo_close_fail:
+    WINCALL CloseDesktop, qword ptr [rbp-24]
+sdo_fail:
+    xor     eax, eax
+sdo_done:
     FRAME_EPILOG
     ret
 secdesk_open endp
@@ -207,6 +325,9 @@ sd_test_thread proc
     mov     rbp, rsp
     sub     rsp, 48
     mov     dword ptr [g_sd_test_rc], 0
+    call    sstk_thread_init
+    test    eax, eax
+    jz      sdt_out
     mov     rcx, qword ptr [g_sd_test_h]
     call    secdesk_enter
     test    eax, eax
@@ -215,6 +336,8 @@ sd_test_thread proc
     call    secdesk_leave
     mov     dword ptr [g_sd_test_rc], 1
 sdt_fail:
+    call    sstk_thread_free
+sdt_out:
     xor     eax, eax
     add     rsp, 48
     pop     rbp

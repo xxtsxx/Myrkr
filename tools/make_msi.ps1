@@ -92,11 +92,16 @@ $DefaultsKey   = "SOFTWARE\Myrkr\Defaults"   # gui.asm w_regkey_def - deployed, 
 # Guid is the COMPONENT id and must never change: it is what lets an upgrade
 # recognise the value it already owns instead of orphaning it.
 $Policies = @(
-    @{ Prop="MYRKR_MINLEN";     Value="MinLen";     Comp="PolMinLen";     Guid="{3E9A1C74-2D5B-4F86-9C03-7B1E5A8D2F60}"; Range="1-256"; Default="12"; Doc="minimum password length" }
-    @{ Prop="MYRKR_MINCLASSES"; Value="MinClasses"; Comp="PolMinClasses"; Guid="{5B2D7F91-8A4C-4E30-B6D5-1F9C3E7A0B48}"; Range="0-4";   Default="3";  Doc="character classes a password must mix (0 disables the policy)" }
-    @{ Prop="MYRKR_LOGLEVEL";   Value="LogLevel";   Comp="PolLogLevel";   Guid="{7C4E0A26-9F31-4B85-8D72-2A6B4F1E9C53}"; Range="0-4";   Default="0";  Doc="audit-log verbosity: 0 off, 1 error, 2 warning, 3 full, 4 debug (paths)" }
-    @{ Prop="MYRKR_COMPRESS";   Value="Compress";   Comp="PolCompress";   Guid="{2F8B6D40-1E7A-4C93-A5B8-9D0C3E6F2A71}"; Range="0/1";   Default="size-based"; Doc="force compression on (1) or off (0), overriding the 50 MiB default" }
-    @{ Prop="MYRKR_FORMAT";     Value="Format";     Comp="PolFormat";     Guid="{8D3C5E72-4B90-4A16-92F7-6E1A8C5D0B39}"; Range="0/1";   Default="0";  Doc="output format: 0 = .mrk container, 1 = WinZip-AES .zip" }
+    @{ Prop="MYRKR_MINLEN";       Value="MinLen";             Comp="PolMinLen";     Guid="{3E9A1C74-2D5B-4F86-9C03-7B1E5A8D2F60}"; Range="1-256";        Default="12";         Doc="minimum password length" }
+    @{ Prop="MYRKR_MINCLASSES";   Value="MinClasses";         Comp="PolMinClasses"; Guid="{5B2D7F91-8A4C-4E30-B6D5-1F9C3E7A0B48}"; Range="0-4";          Default="3";          Doc="character classes a password must mix (0 disables the policy)" }
+    @{ Prop="MYRKR_LOGLEVEL";     Value="LogLevel";           Comp="PolLogLevel";   Guid="{7C4E0A26-9F31-4B85-8D72-2A6B4F1E9C53}"; Range="0-4";          Default="0";          Doc="audit-log verbosity: 0 off, 1 error, 2 warning, 3 full, 4 debug (paths)" }
+    @{ Prop="MYRKR_COMPRESS";     Value="Compress";           Comp="PolCompress";   Guid="{2F8B6D40-1E7A-4C93-A5B8-9D0C3E6F2A71}"; Range="0/1";          Default="size-based"; Doc="force compression on (1) or off (0), overriding the 50 MiB default" }
+    @{ Prop="MYRKR_FORMAT";       Value="Format";             Comp="PolFormat";     Guid="{8D3C5E72-4B90-4A16-92F7-6E1A8C5D0B39}"; Range="0/1";          Default="0";          Doc="output format: 0 = .mrk container, 1 = WinZip-AES .zip" }
+    @{ Prop="MYRKR_KDFTIME";      Value="KdfTime";            Comp="PolKdfTime";    Guid="{A41F2E63-7B90-4C58-8E12-3D6B9A0C4F75}"; Range="1-16";         Default="3";          Doc="minimum Argon2id time cost (passes)" }
+    @{ Prop="MYRKR_KDFMEMORY";    Value="KdfMemory";          Comp="PolKdfMemory";  Guid="{D72B9A48-3E16-4F05-9C61-8A4E2D7B1F90}"; Range="8192-4194304"; Default="524288";     Doc="minimum Argon2id memory cost, KiB (524288 = 512 MiB)" }
+    @{ Prop="MYRKR_SPLITSIZE";    Value="SplitSize";          Comp="PolSplitSize";  Guid="{F18C6D35-5A29-4B74-8F03-2E9D1C5A7B68}"; Range="0-6";          Default="0";          Doc="file-split preset index (0 = off)" }
+    @{ Prop="MYRKR_ALLOWCAPTURE"; Value="AllowScreenCapture"; Comp="PolAllowCap";   Guid="{B53E8C19-6D42-4A97-91E4-4C0F7B2D8A31}"; Range="0/1";          Default="0";          Doc="allow screen capture of Myrkr windows (0 = WDA_EXCLUDEFROMCAPTURE)" }
+    @{ Prop="MYRKR_ALLOWUNC";     Value="AllowUnc";           Comp="PolAllowUnc";   Guid="{E64A9F27-1C83-4D51-A7B6-9F3C5E1A6D82}"; Range="0/1";          Default="1";          Doc="allow UNC network shares (1 = allow, 0 = block)" }
 )
 
 # --- the DEFAULTS surface, one row per value, HKLM\SOFTWARE\Myrkr\Defaults ----
@@ -115,15 +120,17 @@ $Policies = @(
 # self-repair, which is a lot of moving parts to deliver one default.  A value
 # here is read by every user and overridden by any of them.
 $Defaults = @(
-    @{ Prop="MYRKR_DEF_MINLEN";      Value="MinLen";        Comp="DefMinLen";      Guid="{6B1D4A83-0C57-4E92-9A38-D5F27C4E1B60}"; Doc="starting minimum password length" }
-    @{ Prop="MYRKR_DEF_MINCLASSES";  Value="MinClasses";    Comp="DefMinClasses";  Guid="{9E3F7C21-4D68-40B5-8172-A6C0B9D53E47}"; Doc="starting character-class requirement" }
-    @{ Prop="MYRKR_DEF_LOGLEVEL";    Value="LogLevel";      Comp="DefLogLevel";    Guid="{2A8C5E90-7B14-4F63-B0D9-3E5A1C7F8B26}"; Doc="starting audit-log verbosity" }
-    @{ Prop="MYRKR_DEF_COMPRESS";    Value="Compress";      Comp="DefCompress";    Guid="{4D0B9F35-1A62-4C87-95E3-8B7C2D6A0F51}"; Doc="starting compression choice (0/1)" }
-    @{ Prop="MYRKR_DEF_FORMAT";      Value="Format";        Comp="DefFormat";      Guid="{7F5A2C68-3E90-4B14-A7D6-0C9E4B8F3A25}"; Doc="starting output format: 0 = .mrk, 1 = .zip" }
-    @{ Prop="MYRKR_DEF_SECUREDESK";  Value="SecureDesktop"; Comp="DefSecureDesk";  Guid="{1C6E8B47-52A0-4D39-86F5-7A3D9C0E2B84}"; Doc="starting private-desktop choice (0/1)" }
-    @{ Prop="MYRKR_DEF_KDFTIME";     Value="KdfTime";       Comp="DefKdfTime";     Guid="{8A4D0F72-6C31-4E58-B9A2-5D1F7B3C9E60}"; Doc="starting Argon2 time cost" }
-    @{ Prop="MYRKR_DEF_KDFMEMORY";   Value="KdfMemory";     Comp="DefKdfMemory";   Guid="{3B9C7E14-0A85-4F26-91D7-6E2A8C5B4D03}"; Doc="starting Argon2 memory cost, MiB" }
-    @{ Prop="MYRKR_DEF_SPLITSIZE";   Value="SplitSize";     Comp="DefSplitSize";   Guid="{5E2A8D06-9F43-4B71-A85C-0D7B6E1F4C92}"; Doc="starting File split preset INDEX (0 = off)" }
+    @{ Prop="MYRKR_DEF_MINLEN";       Value="MinLen";             Comp="DefMinLen";      Guid="{6B1D4A83-0C57-4E92-9A38-D5F27C4E1B60}"; Range="1-256";        Doc="starting minimum password length" }
+    @{ Prop="MYRKR_DEF_MINCLASSES";   Value="MinClasses";         Comp="DefMinClasses";  Guid="{9E3F7C21-4D68-40B5-8172-A6C0B9D53E47}"; Range="0-4";          Doc="starting character-class requirement" }
+    @{ Prop="MYRKR_DEF_LOGLEVEL";     Value="LogLevel";           Comp="DefLogLevel";    Guid="{2A8C5E90-7B14-4F63-B0D9-3E5A1C7F8B26}"; Range="0-4";          Doc="starting audit-log verbosity" }
+    @{ Prop="MYRKR_DEF_COMPRESS";     Value="Compress";           Comp="DefCompress";    Guid="{4D0B9F35-1A62-4C87-95E3-8B7C2D6A0F51}"; Range="0/1";          Doc="starting compression choice (0/1)" }
+    @{ Prop="MYRKR_DEF_FORMAT";       Value="Format";             Comp="DefFormat";      Guid="{7F5A2C68-3E90-4B14-A7D6-0C9E4B8F3A25}"; Range="0/1";          Doc="starting output format: 0 = .mrk, 1 = .zip" }
+    @{ Prop="MYRKR_DEF_SECUREDESK";   Value="SecureDesktop";      Comp="DefSecureDesk";  Guid="{1C6E8B47-52A0-4D39-86F5-7A3D9C0E2B84}"; Range="0/1";          Doc="starting private-desktop choice (0/1)" }
+    @{ Prop="MYRKR_DEF_KDFTIME";      Value="KdfTime";            Comp="DefKdfTime";     Guid="{8A4D0F72-6C31-4E58-B9A2-5D1F7B3C9E60}"; Range="1-16";         Doc="starting Argon2id time cost" }
+    @{ Prop="MYRKR_DEF_KDFMEMORY";    Value="KdfMemory";          Comp="DefKdfMemory";   Guid="{3B9C7E14-0A85-4F26-91D7-6E2A8C5B4D03}"; Range="8192-4194304"; Doc="starting Argon2id memory cost, KiB (524288 = 512 MiB)" }
+    @{ Prop="MYRKR_DEF_SPLITSIZE";    Value="SplitSize";          Comp="DefSplitSize";   Guid="{5E2A8D06-9F43-4B71-A85C-0D7B6E1F4C92}"; Range="0-6";          Doc="starting File split preset INDEX (0 = off)" }
+    @{ Prop="MYRKR_DEF_ALLOWCAPTURE"; Value="AllowScreenCapture"; Comp="DefAllowCap";    Guid="{C27D4B86-8F15-4E39-B4A1-7D5E0C9B2F43}"; Range="0/1";          Doc="starting screen-capture choice (0 = exclude, 1 = allow)" }
+    @{ Prop="MYRKR_DEF_ALLOWUNC";     Value="AllowUnc";           Comp="DefAllowUnc";    Guid="{915F3A62-2B74-4C80-8D59-1A6C8E4F3B79}"; Range="0/1";          Doc="starting UNC network-share choice (1 = allow, 0 = block)" }
 )
 
 # --- SecureDesktop: the one policy value written whether or not it is named ---
@@ -271,6 +278,71 @@ foreach ($e in @("DllGetClassObject", "DllCanUnloadNow")) {
     }
 }
 
+# --- verify normalised PE headers + /CETCOMPAT + DependentLoadFlags ----------
+function Resolve-Rva([byte[]]$pe, [int]$sectOff, [int]$nSect, [uint32]$rva) {
+    for ($si = 0; $si -lt $nSect; $si++) {
+        $s    = $sectOff + $si * 40
+        $va   = [BitConverter]::ToUInt32($pe, $s + 12)
+        $vsz  = [BitConverter]::ToUInt32($pe, $s + 8)
+        $raw  = [BitConverter]::ToUInt32($pe, $s + 20)
+        $rsz  = [BitConverter]::ToUInt32($pe, $s + 16)
+        $span = if ($vsz -gt 0 -and $vsz -lt $rsz) { $vsz } else { $rsz }
+        if ($rva -ge $va -and $rva -lt ($va + $span)) {
+            return [int]($raw + ($rva - $va))
+        }
+    }
+    return -1
+}
+
+function Assert-ReleasePe([byte[]]$pe, [string]$path, [bool]$requireLoadCfg) {
+    $peOff  = [BitConverter]::ToInt32($pe, 0x3C)
+    $coffTs = [BitConverter]::ToInt32($pe, $peOff + 8)
+    if ($coffTs -ne 0) {
+        throw "$path has non-zero COFF TimeDateStamp (0x$($coffTs.ToString('X8'))) - not a normalised 'build.cmd release' binary."
+    }
+    $nSect   = [BitConverter]::ToUInt16($pe, $peOff + 6)
+    $optSize = [BitConverter]::ToUInt16($pe, $peOff + 20)
+    $optOff  = $peOff + 24
+    $ddOff   = $optOff + 112                  # PE32+ DataDirectory[0]
+    $sectOff = $optOff + $optSize
+    $dbgRva  = [BitConverter]::ToUInt32($pe, $ddOff + 6 * 8)
+    $dbgSz   = [BitConverter]::ToUInt32($pe, $ddOff + 6 * 8 + 4)
+    $hasCet  = $false
+    if ($dbgRva -ne 0 -and $dbgSz -ge 28) {
+        $dbgFileOff = Resolve-Rva $pe $sectOff $nSect $dbgRva
+        if ($dbgFileOff -ge 0) {
+            for ($di = 0; $di -lt [int]($dbgSz / 28); $di++) {
+                $de    = $dbgFileOff + $di * 28
+                $dtype = [BitConverter]::ToUInt32($pe, $de + 12)
+                $dptr  = [BitConverter]::ToUInt32($pe, $de + 24)
+                if ($dtype -eq 20 -and $dptr -gt 0 -and ($dptr + 4) -le $pe.Length) {
+                    $exFlags = [BitConverter]::ToUInt32($pe, [int]$dptr)
+                    if (($exFlags -band 1) -ne 0) { $hasCet = $true }
+                }
+            }
+        }
+    }
+    if (-not $hasCet) {
+        throw "$path lacks IMAGE_DEBUG_TYPE_EX_DLLCHARACTERISTICS (/CETCOMPAT) - never package an unhardened build."
+    }
+    if ($requireLoadCfg) {
+        $lcRva = [BitConverter]::ToUInt32($pe, $ddOff + 10 * 8)
+        $lcSz  = [BitConverter]::ToUInt32($pe, $ddOff + 10 * 8 + 4)
+        if ($lcRva -eq 0 -or $lcSz -lt 0x50) {
+            throw "$path lacks IMAGE_LOAD_CONFIG_DIRECTORY64."
+        }
+        $lcOff = Resolve-Rva $pe $sectOff $nSect $lcRva
+        if ($lcOff -lt 0) { throw "$path LOAD_CONFIG RVA did not map to any section." }
+        $depFlags = [BitConverter]::ToUInt16($pe, $lcOff + 0x4E)
+        if ($depFlags -ne 0x0800) {
+            throw ("$path LOAD_CONFIG.DependentLoadFlags is 0x{0:X4}, expected 0x0800 (LOAD_LIBRARY_SEARCH_SYSTEM32)." -f $depFlags)
+        }
+    }
+}
+
+Assert-ReleasePe $bytes    $exePath $true
+Assert-ReleasePe $dllBytes $dllPath $false
+
 # --- version comes from the binary, never typed twice ------------------------
 $vi = (Get-Item $exePath).VersionInfo
 $fv = $vi.FileVersion
@@ -355,6 +427,7 @@ try {
     Exec "CREATE TABLE ``AdminExecuteSequence`` (``Action`` CHAR(72) NOT NULL, ``Condition`` CHAR(255), ``Sequence`` SHORT PRIMARY KEY ``Action``)"
     Exec "CREATE TABLE ``AdvtExecuteSequence`` (``Action`` CHAR(72) NOT NULL, ``Condition`` CHAR(255), ``Sequence`` SHORT PRIMARY KEY ``Action``)"
     Exec "CREATE TABLE ``Upgrade`` (``UpgradeCode`` CHAR(38) NOT NULL, ``VersionMin`` CHAR(20), ``VersionMax`` CHAR(20), ``Language`` CHAR(255), ``Attributes`` LONG NOT NULL, ``Remove`` CHAR(255), ``ActionProperty`` CHAR(72) NOT NULL PRIMARY KEY ``UpgradeCode``, ``VersionMin``, ``VersionMax``, ``Language``, ``Attributes``)"
+    Exec "CREATE TABLE ``LaunchCondition`` (``Condition`` CHAR(255) NOT NULL, ``Description`` CHAR(255) NOT NULL PRIMARY KEY ``Condition``)"
     Exec "CREATE TABLE ``Shortcut`` (``Shortcut`` CHAR(72) NOT NULL, ``Directory_`` CHAR(72) NOT NULL, ``Name`` CHAR(128) NOT NULL, ``Component_`` CHAR(72) NOT NULL, ``Target`` CHAR(72) NOT NULL, ``Arguments`` CHAR(255), ``Description`` CHAR(255), ``Hotkey`` SHORT, ``Icon_`` CHAR(72), ``IconIndex`` SHORT, ``ShowCmd`` SHORT, ``WkDir`` CHAR(72) PRIMARY KEY ``Shortcut``)"
     Exec "CREATE TABLE ``Registry`` (``Registry`` CHAR(72) NOT NULL, ``Root`` SHORT NOT NULL, ``Key`` CHAR(255) NOT NULL, ``Name`` CHAR(255), ``Value`` CHAR(0), ``Component_`` CHAR(72) NOT NULL PRIMARY KEY ``Registry``)"
     Exec "CREATE TABLE ``CustomAction`` (``Action`` CHAR(72) NOT NULL, ``Type`` SHORT NOT NULL, ``Source`` CHAR(72), ``Target`` CHAR(255) PRIMARY KEY ``Action``)"
@@ -370,7 +443,7 @@ try {
         $productCode = $ProductCodeOverride.ToUpper()
         Write-Host ("  ProductCode    : PINNED to {0} (repair build)" -f $productCode)
     }
-    $secureProps = @("OLDERVERSIONBEINGUPGRADED", $AssocProp, $CtxProp, $ShellProp, $SdProp) +
+    $secureProps = @("OLDERVERSIONBEINGUPGRADED", "NEWERVERSIONDETECTED", $AssocProp, $CtxProp, $ShellProp, $SdProp) +
                    ($Policies | ForEach-Object { $_.Prop }) +
                    ($Defaults | ForEach-Object { $_.Prop })
     $props = @{
@@ -433,12 +506,46 @@ try {
     Exec "INSERT INTO ``Feature`` (``Feature``,``Feature_Parent``,``Title``,``Description``,``Display``,``Level``,``Directory_``,``Attributes``) VALUES ('Main','','Myrkr','Myrkr file encryption',1,1,'INSTALLDIR',0)"
     Exec "INSERT INTO ``FeatureComponents`` (``Feature_``,``Component_``) VALUES ('Main','MyrkrExe')"
 
+    function Add-RangeLaunchCondition([string]$prop, [string]$range, [bool]$alwaysSet) {
+        if ($range -eq "0/1") {
+            if ($alwaysSet) {
+                $cond = "({0} = `"0`") OR ({0} = `"1`")" -f $prop
+            } else {
+                $cond = "(NOT {0}) OR ({0} = `"0`") OR ({0} = `"1`")" -f $prop
+            }
+        } elseif ($range -match '^(\d+)-(\d+)$') {
+            $lo = [int]$Matches[1]; $hi = [int]$Matches[2]
+            if (($hi - $lo) -le 16) {
+                $terms = @()
+                if (-not $alwaysSet) { $terms += "NOT $prop" }
+                $terms += ($lo..$hi | ForEach-Object { "($prop = `"$_`")" })
+                $cond = $terms -join " OR "
+            } else {
+                # Reject signs, spaces, '#' (## -> REG_SZ, #x -> REG_BINARY, #% -> REG_EXPAND_SZ),
+                # '%', and ASCII letters so #[PROP] can never coerce into a non-REG_DWORD type.
+                $badSub = @("-","+"," ","#","%","a","b","c","d","e","f","g","h","i","j","k","l","m","n","o","p","q","r","s","t","u","v","w","x","y","z") |
+                          ForEach-Object { "(NOT ({0} >< `"{1}`"))" -f $prop, $_ }
+                if ($alwaysSet) {
+                    $cond = $badSub -join " AND "
+                } else {
+                    $cond = "(NOT {0}) OR ({1})" -f $prop, ($badSub -join " AND ")
+                }
+            }
+        } else {
+            throw ("property {0} has unrecognised Range '{1}'" -f $prop, $range)
+        }
+        $desc    = ("{0} must be a valid integer in {1}." -f $prop, $range) -replace "'", "''"
+        $condSql = $cond -replace "'", "''"
+        Exec ("INSERT INTO ``LaunchCondition`` (``Condition``,``Description``) VALUES ('{0}','{1}')" -f $condSql, $desc)
+    }
+
     # --- one component per policy value --------------------------------------
     # Attributes 4 = the registry row is the key path; 256 = write to the 64-bit
     # view.  Without 256 an x64 package puts these under WOW6432Node, where the
     # 64-bit myrkr.exe would never look - the install appears to succeed and the
     # policy simply does not take effect.
     foreach ($p in $Policies) {
+        Add-RangeLaunchCondition $p.Prop $p.Range $false
         $reg = "Reg" + $p.Comp
         Exec ("INSERT INTO ``Component`` (``Component``,``ComponentId``,``Directory_``,``Attributes``,``Condition``,``KeyPath``) VALUES ('{0}','{1}','INSTALLDIR',260,'{2}','{3}')" -f $p.Comp, $p.Guid, $p.Prop, $reg)
         Exec ("INSERT INTO ``FeatureComponents`` (``Feature_``,``Component_``) VALUES ('Main','{0}')" -f $p.Comp)
@@ -454,6 +561,7 @@ try {
     # policy rows are - a default nobody asked for is still a value written into
     # every user's settings, and the built-in default is the better answer.
     foreach ($d in $Defaults) {
+        Add-RangeLaunchCondition $d.Prop $d.Range $false
         $reg = "Reg" + $d.Comp
         Exec ("INSERT INTO ``Component`` (``Component``,``ComponentId``,``Directory_``,``Attributes``,``Condition``,``KeyPath``) VALUES ('{0}','{1}','INSTALLDIR',260,'{2}','{3}')" -f $d.Comp, $d.Guid, $d.Prop, $reg)
         Exec ("INSERT INTO ``FeatureComponents`` (``Feature_``,``Component_``) VALUES ('Main','{0}')" -f $d.Comp)
@@ -465,6 +573,7 @@ try {
     # Condition is EMPTY, unlike every entry in $Policies: this one installs
     # whether or not the admin names it, so the estate is protected by default
     # rather than by remembering.
+    Add-RangeLaunchCondition $SdProp "0/1" $true
     Exec ("INSERT INTO ``Component`` (``Component``,``ComponentId``,``Directory_``,``Attributes``,``Condition``,``KeyPath``) VALUES ('{0}','{1}','INSTALLDIR',260,'','Reg{0}')" -f $SdComp, $SdGuid)
     Exec ("INSERT INTO ``FeatureComponents`` (``Feature_``,``Component_``) VALUES ('Main','{0}')" -f $SdComp)
     Exec ("INSERT INTO ``Registry`` (``Registry``,``Root``,``Key``,``Name``,``Value``,``Component_``) VALUES ('Reg{0}',2,'{1}','{2}','#[{3}]','{0}')" -f $SdComp, $PolicyKey, $SdValue, $SdProp)
@@ -599,15 +708,20 @@ try {
     # always skips our own ProductCode, so "including this version" can only match
     # a different build of it.
     $UPG_ATTR = 768
+    $DOWNGRADE_ATTR = 2
     Exec "INSERT INTO ``Upgrade`` (``UpgradeCode``,``VersionMin``,``VersionMax``,``Language``,``Attributes``,``Remove``,``ActionProperty``) VALUES ('$UpgradeCode','0.0.0','$productVersion','',$UPG_ATTR,'','OLDERVERSIONBEINGUPGRADED')"
+    Exec "INSERT INTO ``Upgrade`` (``UpgradeCode``,``VersionMin``,``VersionMax``,``Language``,``Attributes``,``Remove``,``ActionProperty``) VALUES ('$UpgradeCode','$productVersion','','',$DOWNGRADE_ATTR,'','NEWERVERSIONDETECTED')"
+    Exec "INSERT INTO ``LaunchCondition`` (``Condition``,``Description``) VALUES ('NOT NEWERVERSIONDETECTED','A newer version of Myrkr is already installed.')"
 
     # Actions that establish properties for later actions run in the CLIENT
     # process.  Once the client's sequence finishes the installer marks them done,
     # so an action missing from InstallUISequence is skipped server-side as
     # "already done on client side" and never runs anywhere.
+    # FindRelatedProducts MUST run before LaunchConditions so NEWERVERSIONDETECTED
+    # is populated before the downgrade guard evaluates.
     $clientSide = @(
-        @("LaunchConditions",      "",  100),
-        @("FindRelatedProducts",   "",  200)
+        @("FindRelatedProducts",   "",  100),
+        @("LaunchConditions",      "",  200)
     )
     $seq = $clientSide + @(
         @("CostInitialize",        "",  800),
@@ -836,11 +950,11 @@ try {
     Write-Host ("  HKLM\{0}  - set only what you name; an unnamed value is not written," -f $PolicyKey)
     Write-Host "  and in Myrkr a value's PRESENCE is what locks it against the user."
     Write-Host ""
-    Write-Host ("    {0,-20} {1,-12} {2,-8} {3}" -f "PROPERTY", "VALUE", "RANGE", "MEANING (default)")
+    Write-Host ("    {0,-22} {1,-20} {2,-14} {3}" -f "PROPERTY", "VALUE", "RANGE", "MEANING (default)")
     foreach ($p in $Policies) {
-        Write-Host ("    {0,-20} {1,-12} {2,-8} {3} ({4})" -f $p.Prop, $p.Value, $p.Range, $p.Doc, $p.Default)
+        Write-Host ("    {0,-22} {1,-20} {2,-14} {3} ({4})" -f $p.Prop, $p.Value, $p.Range, $p.Doc, $p.Default)
     }
-    Write-Host ("    {0,-20} {1,-12} {2,-8} {3}" -f $SdProp, $SdValue, "0/1", "type the password on a private desktop (1)")
+    Write-Host ("    {0,-22} {1,-20} {2,-14} {3}" -f $SdProp, $SdValue, "0/1", "type the password on a private desktop (1)")
     Write-Host ""
     Write-Host "  $SdValue is the exception to the rule above: it is written whether or not"
     Write-Host "  you name it, because a control a user can switch off is not a control. It"
@@ -853,9 +967,9 @@ try {
     Write-Host "  HKCU settings on top, so a deployed default is what a new user gets and any"
     Write-Host "  change they make sticks. Name both keys and the policy one wins."
     Write-Host ""
-    Write-Host ("    {0,-24} {1,-14} {2}" -f "PROPERTY", "VALUE", "MEANING")
+    Write-Host ("    {0,-24} {1,-20} {2,-14} {3}" -f "PROPERTY", "VALUE", "RANGE", "MEANING")
     foreach ($d in $Defaults) {
-        Write-Host ("    {0,-24} {1,-14} {2}" -f $d.Prop, $d.Value, $d.Doc)
+        Write-Host ("    {0,-24} {1,-20} {2,-14} {3}" -f $d.Prop, $d.Value, $d.Range, $d.Doc)
     }
     Write-Host ""
     Write-Host "  HKLM rather than HKCU: a per-machine MSI writing HKCU reaches only the"

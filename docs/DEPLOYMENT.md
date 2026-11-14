@@ -69,7 +69,16 @@ msiexec /i myrkr-<version>.msi /qn MYRKR_MINLEN=16 MYRKR_MINCLASSES=4 MYRKR_LOGL
 | `MYRKR_LOGLEVEL` | `LogLevel` | 0–4 | audit-log verbosity: 0 off, 1 error, 2 warning, 3 full, 4 debug — **4 records file paths** (0) |
 | `MYRKR_COMPRESS` | `Compress` | 0/1 | force compression on or off, overriding the 50 MiB size-based default (size-based) |
 | `MYRKR_FORMAT` | `Format` | 0/1 | output format: 0 = `.mrk`, 1 = WinZip-AES `.zip` (0) |
+| `MYRKR_KDFTIME` | `KdfTime` | 1–16 | minimum Argon2id time cost in passes (3) |
+| `MYRKR_KDFMEMORY` | `KdfMemory` | 8192–4194304 | minimum Argon2id memory cost in KiB; 524288 = 512 MiB (524288) |
+| `MYRKR_SPLITSIZE` | `SplitSize` | 0–6 | file-split preset index; 0 = off (0) |
+| `MYRKR_ALLOWCAPTURE` | `AllowScreenCapture` | 0/1 | allow screen capture of Myrkr windows; 0 applies `WDA_EXCLUDEFROMCAPTURE` (0) |
+| `MYRKR_ALLOWUNC` | `AllowUnc` | 0/1 | allow opening or writing files on UNC network shares; 0 blocks UNC paths (1) |
 | `MYRKR_SECUREDESKTOP` | `SecureDesktop` | 0/1 | type the password on a private desktop — **always written, defaults to 1** (see below) |
+
+Deployed starting defaults (`HKLM\SOFTWARE\Myrkr\Defaults`, unlocked so users may override in `HKCU\Software\Myrkr`) expose the matching `MYRKR_DEF_MINLEN`, `MYRKR_DEF_MINCLASSES`, `MYRKR_DEF_LOGLEVEL`, `MYRKR_DEF_COMPRESS`, `MYRKR_DEF_FORMAT`, `MYRKR_DEF_SECUREDESK`, `MYRKR_DEF_KDFTIME`, `MYRKR_DEF_KDFMEMORY`, `MYRKR_DEF_SPLITSIZE`, `MYRKR_DEF_ALLOWCAPTURE`, and `MYRKR_DEF_ALLOWUNC` properties.
+
+`LaunchCondition` rows validate every numeric and boolean MSI property at install time (rejecting `#`, `%`, signs, spaces, and letters that could coerce `#[PROP]` into a non-`REG_DWORD` registry value) and refuse downgrades (`NOT NEWERVERSIONDETECTED`) when a newer version is already installed. In addition, `load_settings` validates `REG_DWORD` type and 4-byte size on read and fails closed (locking the setting at a safe value) if an `HKLM\SOFTWARE\Myrkr` policy entry is malformed or out of range.
 
 `tools\make_msi.ps1` prints this same table when it builds the package.
 

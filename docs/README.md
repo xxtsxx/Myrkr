@@ -11,7 +11,8 @@ is **process**.
 | Document | Read it when |
 |---|---|
 | [`../README.md`](../README.md) | You want to know what Myrkr is and how to use it. |
-| [`SECURITY.md`](SECURITY.md) | **Anything security-related.** What is defended, what is not, every hardening control with the test that proves it, and the residual-risk list. |
+| [`TRUST.md`](TRUST.md) | **Why Myrkr earns trust.** First-principles architectural rationale, secret lifecycle, runtime/desktop/I/O safeguards, runnable verification gates, and honest boundaries. |
+| [`SECURITY.md`](SECURITY.md) | **Threat model and hardening reference.** What is defended, what is not, post-quantum margin, every active-defence control with the test that proves it, and the residual-risk list. |
 | [`CLI.md`](CLI.md) | You are at a command prompt: verbs, exit codes, the audit log, and why encrypting is not among them. |
 | [`DEPLOYMENT.md`](DEPLOYMENT.md) | You are installing this on more than your own machine: every MSI property, policy versus default, the registry surface. |
 

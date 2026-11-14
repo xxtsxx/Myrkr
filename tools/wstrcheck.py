@@ -42,7 +42,10 @@ CONTRACTS = {
 }
 
 SETS = {
-    "r8": re.compile(r'^\s*(?:(lea|mov|xor)\s+r8d?\s*,'
+    # Reject mov r8, 0 / xor r8d, r8d as false "capacity bounds": a zeroed limit
+    # is never a valid destination end pointer.
+    "r8": re.compile(r'^\s*(?:lea\s+r8\s*,'
+                     r'|mov\s+r8d?\s*,\s*(?!0\b|0h\b|0x0+\b)'
                      r'|WBOUND\s+r8\s*,'
                      r'|call\s+slot_addr\s*$)', re.I),
 }
@@ -54,15 +57,24 @@ def main():
         base = os.path.basename(path)
         lines = [l.split(";")[0] for l in open(path, encoding="latin-1").read().split("\n")]
         for i, l in enumerate(lines):
-            m = re.match(r'^\s*call\s+(\w+)\s*$', l.rstrip())
-            if not m or m.group(1) not in CONTRACTS:
+            m = re.match(r'^\s*(?:call|jmp)\s+(\w+)\s*$', l.rstrip(), re.I)
+            callee = m.group(1) if m else None
+            if not callee:
+                wm = re.match(r'^\s*WINCALL\s+(\w+)\b(?:\s*,\s*(.*))?$', l.rstrip(), re.I)
+                if wm and wm.group(1) in CONTRACTS:
+                    args = [a.strip() for a in (wm.group(2) or '').split(',') if a.strip()]
+                    if len(args) >= 3 and args[2] not in ('0', '0h'):
+                        total += 1
+                        continue
+                    callee = wm.group(1)
+            if not callee or callee not in CONTRACTS:
                 continue
-            reg, back = CONTRACTS[m.group(1)]
+            reg, back = CONTRACTS[callee]
             total += 1
             window = lines[max(0, i - back):i]
             if not any(SETS[reg].match(w) for w in window):
                 bad += 1
-                print(f"[NO BOUND] {base}:{i+1} call {m.group(1)} without setting {reg} "
+                print(f"[NO BOUND] {base}:{i+1} call/jmp {callee} without setting {reg} "
                       f"in the {back} lines before it - the copy would run against "
                       f"whatever {reg} happened to hold")
     print(f"wstrcheck: {bad} unbounded call site(s) across {total} bounded-copy call(s) "

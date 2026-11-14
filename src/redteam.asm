@@ -12,6 +12,7 @@
 ;
 ;   myrkr redteam canary     -> FF_STACK_COOKIE (2)
 ;   myrkr redteam shadow     -> FF_SHADOW_STACK (0xF001)
+;   myrkr redteam shadow_anc -> FF_SHADOW_STACK (0xF001) (ancestor-frame pivot)
 ;   myrkr redteam dlpv       -> FF_GUARD_ICALL  (10)
 ;   myrkr redteam overflow   -> FF_OVERFLOW     (0xF005)
 ;   myrkr redteam bounds     -> FF_BOUNDS       (0xF004)
@@ -56,17 +57,18 @@ EXCEPTION_AV        equ 0C0000005h
 EXC_CONTINUE_SEARCH equ 0
 
 .const
-WSTR rc_canary,    <canary>
-WSTR rc_shadow,    <shadow>
-WSTR rc_dlpv,      <dlpv>
-WSTR rc_overflow,  <overflow>
-WSTR rc_bounds,    <bounds>
-WSTR rc_typemagic, <typemagic>
-WSTR rc_heaptag,   <heaptag>
-WSTR rc_iat,       <iat>
-WSTR rc_crash,     <crash>
+WSTR rc_canary,     <canary>
+WSTR rc_shadow,     <shadow>
+WSTR rc_shadow_anc, <shadow_anc>
+WSTR rc_dlpv,       <dlpv>
+WSTR rc_overflow,   <overflow>
+WSTR rc_bounds,     <bounds>
+WSTR rc_typemagic,  <typemagic>
+WSTR rc_heaptag,    <heaptag>
+WSTR rc_iat,        <iat>
+WSTR rc_crash,      <crash>
 CSTR rt_msg_nofire, "redteam: control did NOT fire - FAIL",13,10
-CSTR rt_msg_unkn,   "redteam: unknown case (canary|shadow|dlpv|overflow|bounds|typemagic|heaptag|iat|crash)",13,10
+CSTR rt_msg_unkn,   "redteam: unknown case (canary|shadow|shadow_anc|dlpv|overflow|bounds|typemagic|heaptag|iat|crash)",13,10
 
 .data?
 align 16
@@ -92,22 +94,25 @@ cmd_redteam proc frame
     test    rcx, rcx
     jz      rt_unknown
 
-    RTCASE  rt_do_canary,    rc_canary
-    RTCASE  rt_do_shadow,    rc_shadow
-    RTCASE  rt_do_dlpv,      rc_dlpv
-    RTCASE  rt_do_overflow,  rc_overflow
-    RTCASE  rt_do_bounds,    rc_bounds
-    RTCASE  rt_do_type,      rc_typemagic
-    RTCASE  rt_do_heap,      rc_heaptag
-    RTCASE  rt_do_iat,       rc_iat
-    RTCASE  rt_do_crash,     rc_crash
+    RTCASE  rt_do_canary,     rc_canary
+    RTCASE  rt_do_shadow,     rc_shadow
+    RTCASE  rt_do_shadow_anc, rc_shadow_anc
+    RTCASE  rt_do_dlpv,       rc_dlpv
+    RTCASE  rt_do_overflow,   rc_overflow
+    RTCASE  rt_do_bounds,     rc_bounds
+    RTCASE  rt_do_type,       rc_typemagic
+    RTCASE  rt_do_heap,       rc_heaptag
+    RTCASE  rt_do_iat,        rc_iat
+    RTCASE  rt_do_crash,      rc_crash
     jmp     rt_unknown
 
-rt_do_canary:   call rt_v_canary
+rt_do_canary:     call rt_v_canary
     jmp     rt_nofire
-rt_do_shadow:   call rt_v_shadow
+rt_do_shadow:     call rt_v_shadow
     jmp     rt_nofire
-rt_do_dlpv:     call rt_v_dlpv
+rt_do_shadow_anc: call rt_v_shadow_anc
+    jmp     rt_nofire
+rt_do_dlpv:       call rt_v_dlpv
     jmp     rt_nofire
 rt_do_overflow: call rt_v_overflow
     jmp     rt_nofire
@@ -160,6 +165,23 @@ rt_v_shadow proc frame
     FRAME_EPILOG                             ; canary ok, shadow mismatch -> FF_SHADOW_STACK
     ret
 rt_v_shadow endp
+
+; B2b ancestor-frame shadow-stack pivot: pivot rbp up one live frame so [rbp-8]
+; has a valid canary and [rbp+8] holds a real ancestor return address present
+; deeper on the shadow stack.  Strict top-of-stack pop must still trap.
+rt_anc_inner proc frame
+    FRAME_PROLOG 32
+    mov     rbp, qword ptr [rbp]             ; pivot to rt_anc_outer's live frame
+    FRAME_EPILOG                             ; top != [rbp+8] -> FF_SHADOW_STACK
+    ret
+rt_anc_inner endp
+
+rt_v_shadow_anc proc frame
+    FRAME_PROLOG 32
+    call    rt_anc_inner
+    FRAME_EPILOG
+    ret
+rt_v_shadow_anc endp
 
 ; B4 DLPV: guarded indirect call through a pointer with no landing-pad magic.
 rt_v_dlpv proc frame

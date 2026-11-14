@@ -143,12 +143,18 @@ uz_tail     db TAILSIZE dup (?)
 uz_lhbuf    db 64  dup (?)
 uz_saltbuf  db 32  dup (?)
 zcp_lochdr  db 32  dup (?)      ; a local header, for the password check
+public uz_keys
 uz_keys     db 72  dup (?)
+public uz_rk
 uz_rk       db 240 dup (?)
 uz_ctr      db 16  dup (?)
+public uz_ipad
 uz_ipad     db 64  dup (?)
+public uz_opad
 uz_opad     db 64  dup (?)
+public uz_sctx
 uz_sctx     db SHA1_CTX_SIZE dup (?)
+public uz_inner
 uz_inner    db 20  dup (?)
 uz_mac      db 20  dup (?)
 uz_tag      db 16  dup (?)
@@ -229,6 +235,9 @@ uz_wipe_keys proc
     call    secure_zero
     lea     rcx, [uz_sctx]
     mov     rdx, SHA1_CTX_SIZE
+    call    secure_zero
+    lea     rcx, [uz_inner]
+    mov     rdx, 20
     call    secure_zero
     add     rsp, 48
     pop     rbp
@@ -527,6 +536,20 @@ extract_zip_entry proc frame
     cmp     r11, r10
     ja      eze_corrupt
     ; ---- AES + ZIP64 extra fixups ------------------------------------------
+    ; Record which 32-bit fields hold the 0xFFFFFFFF ZIP64 sentinel; every such
+    ; field MUST be resolved by a ZIP64 (0x0001) extra record below.
+    xor     eax, eax
+    cmp     dword ptr [rbp-40], 0FFFFFFFFh
+    jne     @F
+    or      eax, 1
+@@: cmp     dword ptr [rbp-32], 0FFFFFFFFh
+    jne     @F
+    or      eax, 2
+@@: cmp     dword ptr [rbp-48], 0FFFFFFFFh
+    jne     @F
+    or      eax, 4
+@@: mov     dword ptr [rbp-224], eax
+
     mov     r11, rcx
     add     r11, 46
     add     r11, qword ptr [rbp-96]          ; extra ptr = ch+46+nlen
@@ -553,36 +576,41 @@ z64_loop:
     lea     r11, [rcx+r9+4]
     mov     r10, r8                       ; bytes left in this ZIP64 record
     xor     r8, r8
-    cmp     dword ptr [rbp-40], 0FFFFFFFFh
-    jne     @F
+    test    dword ptr [rbp-224], 1
+    jz      @F
     cmp     r10, 8
     jb      eze_corrupt
     sub     r10, 8
     mov     rax, qword ptr [r11+r8]
     mov     qword ptr [rbp-40], rax
+    and     dword ptr [rbp-224], not 1
     add     r8, 8
 @@:
-    cmp     dword ptr [rbp-32], 0FFFFFFFFh
-    jne     @F
+    test    dword ptr [rbp-224], 2
+    jz      @F
     cmp     r10, 8
     jb      eze_corrupt
     sub     r10, 8
     mov     rax, qword ptr [r11+r8]
     mov     qword ptr [rbp-32], rax
+    and     dword ptr [rbp-224], not 2
     add     r8, 8
 @@:
-    cmp     dword ptr [rbp-48], 0FFFFFFFFh
-    jne     z64_done
+    test    dword ptr [rbp-224], 4
+    jz      z64_done
     cmp     r10, 8
     jb      eze_corrupt
     mov     rax, qword ptr [r11+r8]
     mov     qword ptr [rbp-48], rax
+    and     dword ptr [rbp-224], not 4
     jmp     z64_done
 z64_next:
     add     r9, 4
     add     r9, r8
     jmp     z64_loop
 z64_done:
+    cmp     dword ptr [rbp-224], 0           ; unresolved 0xFFFFFFFF sentinel -> corrupt
+    jne     eze_corrupt
     ; ---- copy entry name (UTF-8) -> uz_name8 -------------------------------
     mov     r10, qword ptr [rbp-24]
     add     r10, 46
@@ -647,6 +675,16 @@ eze_file:
     jnz     eze_io
     lea     r10, [uz_lhbuf]
     cmp     dword ptr [r10], SIG_LOCAL
+    jne     eze_corrupt
+    ; ---- cross-check LFH method & encrypted flag against Central Directory --
+    movzx   eax, word ptr [r10+8]             ; LFH compression method
+    cmp     rax, qword ptr [rbp-64]           ; must match CD method
+    jne     eze_corrupt
+    movzx   eax, word ptr [r10+6]             ; LFH general purpose bit flag
+    and     eax, 1                            ; bit 0 = encrypted
+    mov     rdx, qword ptr [rbp-72]           ; CD general purpose bit flag
+    and     edx, 1
+    cmp     eax, edx
     jne     eze_corrupt
     movzx   r8d, word ptr [r10+26]           ; local name len
     movzx   r9d, word ptr [r10+28]           ; local extra len
@@ -755,6 +793,8 @@ eze_aes:
     mov     rdx, qword ptr [rbp-104]
     lea     r8, [uz_rk]
     call    aes_expand_key
+    test    eax, eax
+    jz      eze_unsup
     mov     qword ptr [rbp-120], rax         ; Nr
     ; dispatch on real method
     cmp     qword ptr [rbp-88], 0

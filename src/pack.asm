@@ -3495,41 +3495,55 @@ sn_loop:
     movzx   eax, byte ptr [rcx+r9]
     test    al, al
     jz      sn_ok
-    ; A COLON, ANYWHERE.  At index 1 it is a drive ("C:evil") - which is all
-    ; this used to look for.  Anywhere else it names an ALTERNATE DATA STREAM
-    ; ("notes.txt:hidden"), which writes real content that no ordinary listing
-    ; of the output directory shows.  Neither escapes OUTDIR, so this is not the
-    ; traversal rule; it refuses to create something the user cannot see they
-    ; have.  A colon is legal in a POSIX name and cannot be written on Windows
-    ; as anything but a stream, so nothing extractable is given up.
+    ; Control bytes (< 0x20, 0x7F) and Windows-illegal filename chars (< > " | ? * :)
+    cmp     al, 20h
+    jb      sn_bad
+    cmp     al, 7Fh
+    je      sn_bad
     cmp     al, ':'
+    je      sn_bad
+    cmp     al, '<'
+    je      sn_bad
+    cmp     al, '>'
+    je      sn_bad
+    cmp     al, '"'
+    je      sn_bad
+    cmp     al, '|'
+    je      sn_bad
+    cmp     al, '?'
+    je      sn_bad
+    cmp     al, '*'
     je      sn_bad
     test    r8d, r8d
     jz      sn_notstart
-    ; A DOS DEVICE NAME as a component - CON, NUL, COM3, "com3.txt" - opens the
-    ; DEVICE rather than creating a file, and having a directory in front of it
-    ; does not help.  The extraction then writes to a console or a serial port
-    ; and reports success, which is a worse outcome than refusing the entry.
+    ; Reject empty path segments ("//", "\\")
+    cmp     al, '/'
+    je      sn_bad
+    cmp     al, '\'
+    je      sn_bad
+    ; DOS device names as a component (CON, NUL, COM3, "com3.txt", ...)
     lea     rdx, [rcx+r9]
     call    sn_reserved
     test    eax, eax
     jnz     sn_bad
     movzx   eax, byte ptr [rcx+r9]      ; sn_reserved returned in rax; reload
+    xor     r8d, r8d
+sn_notstart:
+    ; Win32 silently strips trailing dots and spaces from path components, which
+    ; also catches "." and ".." segments as well as "foo." / "foo " aliasing.
     cmp     al, '.'
-    jne     sn_clearstart
+    je      sn_chk_end
+    cmp     al, ' '
+    jne     sn_chk_sep
+sn_chk_end:
     movzx   edx, byte ptr [rcx+r9+1]
-    cmp     dl, '.'
-    jne     sn_clearstart
-    movzx   edx, byte ptr [rcx+r9+2]
     test    dl, dl
     jz      sn_bad
     cmp     dl, '/'
     je      sn_bad
     cmp     dl, '\'
     je      sn_bad
-sn_clearstart:
-    xor     r8d, r8d
-sn_notstart:
+sn_chk_sep:
     cmp     al, '/'
     je      sn_start
     cmp     al, '\'

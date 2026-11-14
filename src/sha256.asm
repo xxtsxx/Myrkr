@@ -93,19 +93,221 @@ sha256_init proc
 sha256_init endp
 
 ; =============================================================================
-; sha256_compress(rcx = state ptr, rdx = blocks ptr, r8 = block count)
-; Leaf; saves nonvolatile xmm6..xmm10 per the Win64 ABI.
+; sha256_compress_sw(rcx = state ptr, rdx = blocks ptr, r8 = block count)
+; Software FIPS 180-4 SHA-256 fallback for pre-SHA-NI CPUs (e.g. Skylake).
 ; =============================================================================
-sha256_compress proc
+public sha256_compress_sw
+sha256_compress_sw proc frame
+    FRAME_PROLOG 416
+    ; [rbp-16]=r12 [rbp-24]=r13 [rbp-32]=r14 [rbp-40]=r15
+    ; [rbp-48]=rbx [rbp-56]=rsi [rbp-64]=rdi
+    ; [rsp+32 .. rsp+287] = W[0..63] (256 bytes)
+    ; [rsp+288 .. rsp+319] = a..h (32 bytes)
+    mov     qword ptr [rbp-16], r12
+    mov     qword ptr [rbp-24], r13
+    mov     qword ptr [rbp-32], r14
+    mov     qword ptr [rbp-40], r15
+    mov     qword ptr [rbp-48], rbx
+    mov     qword ptr [rbp-56], rsi
+    mov     qword ptr [rbp-64], rdi
+
+    test    r8, r8
+    jz      scsw_out
+
+    mov     r12, rcx                         ; state ptr
+    mov     r13, rdx                         ; blocks ptr
+    mov     r14, r8                          ; block count
+
+scsw_blk:
+    ; W[0..15] = big-endian dwords of [r13]
+    xor     r10d, r10d
+scsw_w0:
+    mov     eax, dword ptr [r13+r10*4]
+    bswap   eax
+    mov     dword ptr [rsp+32+r10*4], eax
+    inc     r10d
+    cmp     r10d, 16
+    jb      scsw_w0
+
+    ; W[16..63]
+    mov     r10d, 16
+scsw_wexp:
+    ; s0 = ROR(W[t-15],7) ^ ROR(W[t-15],18) ^ (W[t-15] >> 3)
+    mov     eax, dword ptr [rsp+32+r10*4-60]
+    mov     ecx, eax
+    mov     edx, eax
+    ror     eax, 7
+    ror     ecx, 18
+    shr     edx, 3
+    xor     eax, ecx
+    xor     eax, edx                         ; eax = s0
+    ; s1 = ROR(W[t-2],17) ^ ROR(W[t-2],19) ^ (W[t-2] >> 10)
+    mov     ebx, dword ptr [rsp+32+r10*4-8]
+    mov     ecx, ebx
+    mov     edx, ebx
+    ror     ebx, 17
+    ror     ecx, 19
+    shr     edx, 10
+    xor     ebx, ecx
+    xor     ebx, edx                         ; ebx = s1
+    add     eax, ebx
+    add     eax, dword ptr [rsp+32+r10*4-64] ; + W[t-16]
+    add     eax, dword ptr [rsp+32+r10*4-28] ; + W[t-7]
+    mov     dword ptr [rsp+32+r10*4], eax
+    inc     r10d
+    cmp     r10d, 64
+    jb      scsw_wexp
+
+    ; a..h = state[0..7]
+    mov     eax, dword ptr [r12+0]
+    mov     dword ptr [rsp+288], eax         ; a
+    mov     eax, dword ptr [r12+4]
+    mov     dword ptr [rsp+292], eax         ; b
+    mov     eax, dword ptr [r12+8]
+    mov     dword ptr [rsp+296], eax         ; c
+    mov     eax, dword ptr [r12+12]
+    mov     dword ptr [rsp+300], eax         ; d
+    mov     eax, dword ptr [r12+16]
+    mov     dword ptr [rsp+304], eax         ; e
+    mov     eax, dword ptr [r12+20]
+    mov     dword ptr [rsp+308], eax         ; f
+    mov     eax, dword ptr [r12+24]
+    mov     dword ptr [rsp+312], eax         ; g
+    mov     eax, dword ptr [r12+28]
+    mov     dword ptr [rsp+316], eax         ; h
+
+    lea     r15, [k256]
+    xor     r10d, r10d
+scsw_rnd:
+    ; S1 = ROR(e,6) ^ ROR(e,11) ^ ROR(e,25)
+    mov     eax, dword ptr [rsp+304]         ; e
+    mov     ecx, eax
+    mov     edx, eax
+    ror     eax, 6
+    ror     ecx, 11
+    ror     edx, 25
+    xor     eax, ecx
+    xor     eax, edx                         ; eax = S1
+    ; ch = (e & f) ^ (~e & g)
+    mov     ecx, dword ptr [rsp+304]         ; e
+    mov     edx, ecx
+    and     ecx, dword ptr [rsp+308]         ; e & f
+    not     edx
+    and     edx, dword ptr [rsp+312]         ; ~e & g
+    xor     ecx, edx                         ; ecx = ch
+    ; temp1 (esi) = h + S1 + ch + k256[t] + W[t]
+    mov     esi, dword ptr [rsp+316]         ; h
+    add     esi, eax
+    add     esi, ecx
+    add     esi, dword ptr [r15+r10*4]
+    add     esi, dword ptr [rsp+32+r10*4]
+
+    ; S0 = ROR(a,2) ^ ROR(a,13) ^ ROR(a,22)
+    mov     eax, dword ptr [rsp+288]         ; a
+    mov     ecx, eax
+    mov     edx, eax
+    ror     eax, 2
+    ror     ecx, 13
+    ror     edx, 22
+    xor     eax, ecx
+    xor     eax, edx                         ; eax = S0
+    ; maj = (a & b) ^ (a & c) ^ (b & c)
+    mov     ebx, dword ptr [rsp+288]         ; a
+    mov     ecx, dword ptr [rsp+292]         ; b
+    mov     edx, dword ptr [rsp+296]         ; c
+    mov     edi, ebx
+    and     edi, ecx                         ; a & b
+    and     ebx, edx                         ; a & c
+    and     ecx, edx                         ; b & c
+    xor     edi, ebx
+    xor     edi, ecx                         ; edi = maj
+    add     edi, eax                         ; edi = temp2
+
+    ; shift working registers
+    mov     eax, dword ptr [rsp+312]         ; g
+    mov     dword ptr [rsp+316], eax         ; h = g
+    mov     eax, dword ptr [rsp+308]         ; f
+    mov     dword ptr [rsp+312], eax         ; g = f
+    mov     eax, dword ptr [rsp+304]         ; e
+    mov     dword ptr [rsp+308], eax         ; f = e
+    mov     eax, dword ptr [rsp+300]         ; d
+    add     eax, esi                         ; d + temp1
+    mov     dword ptr [rsp+304], eax         ; e = d + temp1
+    mov     eax, dword ptr [rsp+296]         ; c
+    mov     dword ptr [rsp+300], eax         ; d = c
+    mov     eax, dword ptr [rsp+292]         ; b
+    mov     dword ptr [rsp+296], eax         ; c = b
+    mov     eax, dword ptr [rsp+288]         ; a
+    mov     dword ptr [rsp+292], eax         ; b = a
+    add     esi, edi                         ; temp1 + temp2
+    mov     dword ptr [rsp+288], esi         ; a = temp1 + temp2
+
+    inc     r10d
+    cmp     r10d, 64
+    jb      scsw_rnd
+
+    ; state[0..7] += a..h
+    mov     eax, dword ptr [rsp+288]
+    add     dword ptr [r12+0], eax
+    mov     eax, dword ptr [rsp+292]
+    add     dword ptr [r12+4], eax
+    mov     eax, dword ptr [rsp+296]
+    add     dword ptr [r12+8], eax
+    mov     eax, dword ptr [rsp+300]
+    add     dword ptr [r12+12], eax
+    mov     eax, dword ptr [rsp+304]
+    add     dword ptr [r12+16], eax
+    mov     eax, dword ptr [rsp+308]
+    add     dword ptr [r12+20], eax
+    mov     eax, dword ptr [rsp+312]
+    add     dword ptr [r12+24], eax
+    mov     eax, dword ptr [rsp+316]
+    add     dword ptr [r12+28], eax
+
+    add     r13, 64
+    dec     r14
+    jnz     scsw_blk
+
+    lea     rcx, [rsp+32]
+    mov     edx, 288
+    call    secure_zero
+
+scsw_out:
+    mov     r12, qword ptr [rbp-16]
+    mov     r13, qword ptr [rbp-24]
+    mov     r14, qword ptr [rbp-32]
+    mov     r15, qword ptr [rbp-40]
+    mov     rbx, qword ptr [rbp-48]
+    mov     rsi, qword ptr [rbp-56]
+    mov     rdi, qword ptr [rbp-64]
+    FRAME_EPILOG
+    ret
+sha256_compress_sw endp
+
+; =============================================================================
+; sha256_compress(rcx = state ptr, rdx = blocks ptr, r8 = block count)
+; Leaf; saves nonvolatile xmm6..xmm10 per the Win64 ABI (falls back to
+; sha256_compress_sw when SHA-NI is unavailable).
+; =============================================================================
+sha256_compress proc frame
     sub     rsp, 16*5
+    .allocstack 80
     movdqu  xmmword ptr [rsp+0],  xmm6
+    .savexmm128 xmm6, 0
     movdqu  xmmword ptr [rsp+16], xmm7
+    .savexmm128 xmm7, 16
     movdqu  xmmword ptr [rsp+32], xmm8
+    .savexmm128 xmm8, 32
     movdqu  xmmword ptr [rsp+48], xmm9
+    .savexmm128 xmm9, 48
     movdqu  xmmword ptr [rsp+64], xmm10
+    .savexmm128 xmm10, 64
+    .endprolog
 
     test    r8, r8
     jz      sc_done
+    test    dword ptr [g_cpu_features], CPUF_SHANI
+    jz      sc_fallback
 
     ; load + arrange state: xmm1=STATE0(ABEF), xmm2=STATE1(CDGH)
     movdqu  xmm1, xmmword ptr [rcx]          ; DCBA
@@ -167,6 +369,12 @@ sc_block:
     palignr xmm2, xmm10, 8                   ; HGFE
     movdqu  xmmword ptr [rcx], xmm1
     movdqu  xmmword ptr [rcx+16], xmm2
+    pxor    xmm0, xmm0
+    pxor    xmm1, xmm1
+    pxor    xmm2, xmm2
+    pxor    xmm3, xmm3
+    pxor    xmm4, xmm4
+    pxor    xmm5, xmm5
 
 sc_done:
     movdqu  xmm6,  xmmword ptr [rsp+0]
@@ -176,6 +384,14 @@ sc_done:
     movdqu  xmm10, xmmword ptr [rsp+64]
     add     rsp, 16*5
     ret
+sc_fallback:
+    movdqu  xmm6,  xmmword ptr [rsp+0]
+    movdqu  xmm7,  xmmword ptr [rsp+16]
+    movdqu  xmm8,  xmmword ptr [rsp+32]
+    movdqu  xmm9,  xmmword ptr [rsp+48]
+    movdqu  xmm10, xmmword ptr [rsp+64]
+    add     rsp, 16*5
+    jmp     sha256_compress_sw
 sha256_compress endp
 
 ; =============================================================================
@@ -331,7 +547,9 @@ sf_putlen:
     pshufb  xmm0, xmm1
     movdqu  xmmword ptr [rdx+16], xmm0
 
-    ; wipe context (contains message-derived state)
+    ; wipe context (contains message-derived state) + local bitlen + xmm0
+    mov     qword ptr [rbp-40], 0
+    pxor    xmm0, xmm0
     lea     rcx, [rcx].SHA256_CTX.state
     mov     rdx, SHA256_CTX_SIZE
     call    secure_zero
@@ -363,5 +581,4 @@ sha256_hash proc frame
     ret
 sha256_hash endp
 
-extern secure_zero:proc
 end

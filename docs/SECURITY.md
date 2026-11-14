@@ -12,7 +12,9 @@ The GUI warns at 100 MiB (container size, decoded contents, or an added input).
 Volume sets still cannot be edited. This does not repair exposure from old
 binaries. See [the review and regression tests](AUDIT_2026-09-04.md).
 
-What Myrkr protects, what it does not, and how each claim was checked.
+What Myrkr protects, what it does not, and how each claim was checked. For the
+architectural rationale, secret lifecycle diagram, and runnable verification
+pipeline, see **[Why Myrkr Earns Trust (`TRUST.md`)](TRUST.md)**.
 
 This is the document to read first. It is written to be understood without
 reading the assembly. Where a mechanism is summarised here, `manifest.md` has the
@@ -147,12 +149,13 @@ Argon2id derives the key from the password and is memory-hard; Grover offers no
 special leverage against it beyond the same quadratic factor, and the memory
 cost — not the raw operation count — is what dominates the attacker's bill.
 
-**What this is and is not.** This is not a claim that AES-256 is unbreakable, or
-that cryptography cannot advance. It is the deliberate, checkable position that
-Myrkr stands only on the primitive family widely expected to survive scalable
-quantum computers, and sizes it with margin. If that expectation ever changes,
-the fix is a larger symmetric key inside the same format — not a change of
-cryptographic species, because the species vulnerable to Shor was never here.
+**What this is and is not.** This is not a claim that AES-256 is immune to every
+future advance, or that cryptography stands still. It is the deliberate,
+checkable position that Myrkr stands only on the primitive family widely expected
+to survive scalable quantum computers, and sizes it with margin. If that
+expectation ever changes, the fix is a larger symmetric key inside the same
+format — not a change of cryptographic species, because the species vulnerable
+to Shor was never here.
 
 ---
 
@@ -170,20 +173,22 @@ after `build dbg`.
 | Control | Mechanism | Evidence |
 |---|---|---|
 | Stack canaries | Per-process random cookie (CSPRNG ⊕ `rdtsc`), planted at `[rbp-8]` by `FRAME_PROLOG` and verified by `FRAME_EPILOG` in every non-leaf procedure | `redteam canary` → `FF_STACK_COOKIE` ✔ |
-| Software shadow stack | A parallel return-address stack, per thread, in a region with guard pages either side; every epilogue verifies its own return address is on it | `redteam shadow` → `FF_SHADOW_STACK` ✔ |
+| Software shadow stack | A parallel return-address stack, per thread, flushed against an upper `PAGE_NOACCESS` guard page with a lower guard page; every epilogue verifies strict top-of-stack equality and ancestor integrity | `redteam shadow` & `redteam shadow_anc` → `FF_SHADOW_STACK` ✔ |
 | Hardware shadow stack | Linked `/CETCOMPAT` (Intel CET) | `dumpbin /headers` reports **CET compatible** ✔ |
 | Forward-edge guard (DLPV) | An 8-byte landing-pad magic before each of **our own** indirect-call targets; `CALL_GUARDED` validates it before transferring | `redteam dlpv` → `FF_GUARD_ICALL` ✔ — see the scope note below |
 | Integer overflow | `CHECK_ADD_OVF` on size arithmetic that could wrap | `redteam overflow` → `FF_OVERFLOW` ✔ |
 | Bounds checking | `BOUND_CHECK` before indexed access in parsing paths (14 sites) | `redteam bounds` → `FF_BOUNDS` ✔ |
 | Type confusion | 32-bit type magic on the heap block header, checked on access | `redteam typemagic` → `FF_TYPE_MAGIC` ✔ |
-| Use-after-free / double-free | Tagged heap: header {magic, size, generation, canary} plus a trailing canary; freed blocks poisoned `0xDD` and the generation bumped | `redteam heaptag` → `FF_HEAP_TAG` ✔ |
-| IAT lockdown ("RELRO") | The import address table is made `PAGE_READONLY` immediately after startup, before any user input is parsed | `redteam iat` → access violation on the locked slot ✔ |
-| Crash containment | A fatal fault raised in Myrkr's own code wipes every registered secret before anything else, switches back from the private password desktop, suppresses the Windows crash dialog and ends the process, leaving a 24-byte breadcrumb (code and address, never registers) - so a crash dump never holds the password, key or decrypted data. Faults other DLLs raise and handle themselves are left alone | `redteam crash` → `0xC0000409` + breadcrumb ✔ (`tests/crashtest.py`) |
-| Callee-saved registers | Every procedure that uses rbx, rsi, rdi, r12-r15 or xmm6-15 saves and restores it, as the Windows x64 ABI requires | `tools/nvcheck.py` gates `build strict` ✔ |
+| Use-after-free / double-free | Tagged heap: header {magic, size, generation, canary} plus a trailing canary; freed blocks poisoned `0xDD` (including rear canary) and the generation bumped | `redteam heaptag` → `FF_HEAP_TAG` ✔ |
+| IAT lockdown ("RELRO") | The import address table is bounds-checked and made `PAGE_READONLY` immediately after startup, before any user input is parsed | `redteam iat` → access violation on the locked slot ✔ |
+| Loader & process mitigations | `DependentLoadFlags = 0x0800` (`LOAD_LIBRARY_SEARCH_SYSTEM32`), `SetDefaultDllDirectories(0x0800)`, `HeapEnableTerminationOnCorruption`, `ProcessExtensionPointDisablePolicy`, and `ProcessImageLoadPolicy` (`NoRemoteImages`) | `pe_normalise.py` + `make_msi.ps1` ✔ |
+| Crash containment | A fatal fault raised in Myrkr's own code latches atomically, wipes all static and dynamic registered secrets first, switches back from the private password desktop, excludes WER (`WerSetFlags` + `WerAddExcludedApplication`), and ends the process via `__fastfail` (writing `%TEMP%\myrkr_crash.bin` only in `DBG_TRACE` diagnostic builds) | `redteam crash` → `0xC0000409` + breadcrumb ✔ (`tests/crashtest.py`) |
+| Private desktop & capture protection | Per-invocation 128-bit CSPRNG desktop name with explicit `SE_DACL_PROTECTED` `TokenUser + SYSTEM` DACL + 5-minute watchdog; `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)` on top-level windows (`AllowScreenCapture = 0` default); IME detach + 3-step `EDIT` buffer scrub | `secsuite.py` + `guifailtest.ps1` ✔ |
+| Callee-saved & vector registers | Every procedure saves/restores `rbx`, `rsi`, `rdi`, `r12–r15`, and `xmm6–xmm15`, and clears `YMM` upper state (`vzeroupper`) | `tools/nvcheck.py` gates `build strict` ✔ |
 | ASLR / DEP / NX | `/DYNAMICBASE /HIGHENTROPYVA /NXCOMPAT` | `dumpbin /headers` reports all three ✔ |
-| SEH unwind data | `.pushreg` / `.setframe` / `.allocstack` on every framed procedure | `framecheck` gates the build ✔ |
-| Secret erasure | `secure_zero` (volatile stores + fence) on keys, passwords, derived material and the Argon2 arena before release | 34 call sites; no fault-injection case — see §6 |
-| Constant-time comparison | `ct_memcmp` for tags and passwords; AES-NI and PCLMULQDQ are inherently constant-time | reasoned, not measured — see §6 |
+| SEH unwind data | `.pushreg` / `.setframe` / `.allocstack` / `.savexmm128` on framed procedures, and raw frames on OS `WNDPROC` callbacks | `framecheck --strict` gates the build ✔ |
+| Secret erasure | `secure_zero` (volatile stores + fence) across keys, passwords, Argon2 `H0` & dynamic `g_arena`, XMM/YMM registers, and bounded heap buffers; `VirtualLock` on static secret pages | `selftest` (`QueryWorkingSetEx`) + `zipclaimtest.py` ✔ |
+| Constant-time comparison | `ct_memcmp` for tags and passwords; hardware `aeskeygenassist`, `AES-NI`, and `PCLMULQDQ` avoid data-dependent S-box lookups | `selftest` (incl. untouched-output bad-tag KAT) ✔ |
 
 A violation of any of these terminates the process immediately through
 `__fastfail` (`int 29h`) — not an exception, not catchable, no chance to
@@ -220,7 +225,7 @@ hand-rolled equivalent for our own dispatch.
 | **Phase 1 — adversarial** | GCM and WinZip-AES tamper matrices, salt and nonce uniqueness across many runs, a path-traversal corpus, malformed archives, password policy | `tests\run.ps1` |
 | **Phase 2 — fault injection** | Every memory-safety control above, each asserted to fire with its exact code, plus a no-false-positive check | `tests\run.ps1` |
 | **Feature tests** | Drag and drop in both directions, the container view, volume sets, counts, settings and their locking, the shell extension, the installer | `tests\README.md` lists all of them |
-| **Installer** | 189 checks over the built MSI: every property, component, condition, registry row and sequence | `tools\verify_msi.ps1` |
+| **Installer** | 301 structural and costed-session checks over the built MSI: every policy and default property, component, condition, `LaunchCondition` downgrade/type-coercion guard, registry row, and sequence | `tools\verify_msi.ps1` |
 
 The feature tests exist because five defects in the drag-and-drop work reached
 the user rather than a test — all five built clean and passed every static
@@ -322,6 +327,7 @@ arranged.
 
 ## See also
 
+- [`TRUST.md`](TRUST.md) — architectural rationale, secret lifecycle diagram, and runnable verification overview.
 - [`manifest.md`](../manifest.md) — the technical reference: container format,
   cryptographic construction, module map, and the full risk assessment (§14).
 - [`security-testing.md`](security-testing.md) — the test plan behind §5, with

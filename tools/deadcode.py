@@ -44,12 +44,6 @@ ALLOWLIST = {
     # via myrkrshell.def.  Nothing in src/ may call them, so "unreferenced" is
     # the correct and permanent state - not a symbol waiting to be deleted.
     "DllMain", "DllGetClassObject", "DllCanUnloadNow",
-    "tagged_free",     # hardening.asm: the third member of the tagged-heap
-                       # family (alloc / check / free).  Only the DBG_TRACE
-                       # redteam probe allocates today, and it never frees, so
-                       # this reads as dead - but shipping alloc+check with no
-                       # safe way to free would mean the next real caller has to
-                       # re-derive the poison/generation-bump logic.  Kept whole.
     "MAX_PLAINTEXT_SIZE",  # macros.inc: the AES-GCM per-key plaintext ceiling
                        # (64 GiB - 1).  NOT CURRENTLY ENFORCED anywhere - see
                        # the note in macros.inc.  Kept because deleting it would

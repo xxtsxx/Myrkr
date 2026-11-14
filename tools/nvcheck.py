@@ -55,6 +55,16 @@ WRITE = re.compile(r'^(?:v?mov\w*|lea|xor|v?pxor|add|sub|inc|dec|and|or|not|neg|
                    r'vpbroadcast\w*|vzero\w*)\s+(\w+)\b', re.I)
 
 
+XCHG_TWO = re.compile(r'^\s*xchg\s+(\w+)\s*,\s*(\w+)\b', re.I)
+IMPLICIT_RSI_RDI = re.compile(r'^\s*(?:rep\w*\s+)?(?:movs|cmps)[bwdq]\b', re.I)
+IMPLICIT_RDI     = re.compile(r'^\s*(?:rep\w*\s+)?(?:stos|scas)[bwdq]\b', re.I)
+IMPLICIT_CPUID   = re.compile(r'^\s*cpuid\b', re.I)
+
+
+def _norm_slot(slot):
+    return re.sub(r'\s+', '', slot.lower())
+
+
 def scan(path):
     findings, procs = [], 0
     lines = open(path, encoding='latin-1').read().split('\n')
@@ -63,7 +73,7 @@ def scan(path):
         l = raw.split(';', 1)[0].strip()
         m = re.match(r'^(\w+)\s+proc\b', l, re.I)
         if m:
-            name, start, saved, restored, written = m.group(1), i, set(), set(), {}
+            name, start, saved, restored, written = m.group(1), i, {}, set(), {}
             continue
         if name is None:
             continue
@@ -76,27 +86,45 @@ def scan(path):
                                         f"without saving it first (callee-saved, Windows x64 ABI)")
                     elif r not in restored:
                         findings.append(f"[NV] {os.path.basename(path)}:{start} {name} saves {r} "
-                                        f"but never restores it")
+                                        f"but never restores it from its save slot")
             name = None
             continue
         if not l:
             continue
         lo = l.lower()
+        # implicit clobbers
+        if IMPLICIT_CPUID.match(lo):
+            written.setdefault('rbx', i)
+        if IMPLICIT_RSI_RDI.match(lo):
+            written.setdefault('rsi', i)
+            written.setdefault('rdi', i)
+        if IMPLICIT_RDI.match(lo):
+            written.setdefault('rdi', i)
+        xm = XCHG_TWO.match(lo)
         for r, aliases in REGS.items():
             alt = '|'.join(aliases)
-            # saves: push r, or a store of r into memory (before its first write)
-            if re.match(r'^push\s+(' + alt + r')\b', lo) or \
-               re.match(r'^\S+\s+(?:\w+\s+ptr\s*)?\[[^\]]*\]\s*,\s*(' + alt + r')\b', lo):
+            # saves: push r, or a store of r into memory [slot] (before its first write)
+            if re.match(r'^push\s+(' + alt + r')\b', lo):
                 if r not in written:
-                    saved.add(r)
-            # restores: pop r, or a load of r from memory after it was saved.  Any
-            # base register: the SIMD compress routines keep their xmm save area
-            # behind r11, not at a fixed rbp/rsp offset.
-            if re.match(r'^pop\s+(' + alt + r')\b', lo) or \
-               (r in saved and re.match(r'^\S+\s+(' + alt + r')\s*,\s*(?:\w+\s+ptr\s*)?\[[^\]]*\]', lo)):
+                    saved.setdefault(r, set()).add('push')
+                continue
+            msave = re.match(r'^\S+\s+(?:\w+\s+ptr\s*)?(\[[^\]]*\])\s*,\s*(' + alt + r')\b', lo)
+            if msave and r not in written:
+                saved.setdefault(r, set()).add(_norm_slot(msave.group(1)))
+                continue
+            # restores: pop r (when pushed), or load from the SAME memory slot it was saved to
+            if re.match(r'^pop\s+(' + alt + r')\b', lo):
+                if 'push' in saved.get(r, ()):
+                    restored.add(r)
+                written.setdefault(r, i)
+                continue
+            mload = re.match(r'^\S+\s+(' + alt + r')\s*,\s*(?:\w+\s+ptr\s*)?(\[[^\]]*\])', lo)
+            if mload and _norm_slot(mload.group(2)) in saved.get(r, ()):
                 restored.add(r)
-                if lo.startswith('pop'):
-                    continue
+                continue
+            if xm and (xm.group(1) in aliases or xm.group(2) in aliases):
+                written.setdefault(r, i)
+                continue
             w = WRITE.match(lo)
             if w and w.group(1) in aliases and not lo.startswith('push'):
                 written.setdefault(r, i)

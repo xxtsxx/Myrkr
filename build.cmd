@@ -59,6 +59,17 @@ shift
 goto :argloop
 :doneargs
 
+if "%REPRO%"=="1" (
+    if not "%ASMEXTRA%"=="" (
+        echo ERROR: "release" cannot be combined with debug or test build flags ^(%ASMEXTRA%^)
+        goto :failed
+    )
+    if "%GUARDFLAGS%"=="" (
+        echo ERROR: "release" cannot be combined with "nohw" ^(CET must remain enabled^)
+        goto :failed
+    )
+)
+
 rem ---------------------------------------------------------------------------
 rem Reproducible release build ("build release"): two clean builds of the same
 rem commit must produce a byte-identical exe (auditability - a user can rebuild
@@ -97,7 +108,13 @@ rem Each also enforces a coverage floor (tools\floors.py) so a checker that
 rem stops LOOKING cannot pass as a checker that found nothing.
 rem ---------------------------------------------------------------------------
 where python >nul 2>nul
-if errorlevel 1 goto :nochk
+if errorlevel 1 (
+    if "%STRICT%"=="1" (
+        echo ERROR: python not found on PATH - cannot run static checkers in strict mode
+        goto :failed
+    )
+    goto :nochk
+)
 
 echo === framecheck ===
 rem --strict also counts warns: the tree is at zero, and gating keeps a new
@@ -187,6 +204,15 @@ if errorlevel 1 (
     )
     echo wincallcheck: WARNING - suspect WINCALL sites above; build continues. Use "build strict" to gate.
 )
+echo === check_docs ===
+python tools\check_docs.py
+if errorlevel 1 (
+    if "%STRICT%"=="1" (
+        echo check_docs: documentation structural check failed - failing strict build
+        goto :failed
+    )
+    echo check_docs: WARNING - findings above; build continues. Use "build strict" to gate.
+)
 :nochk
 
 set ASMFLAGS=/c /nologo /W3 /Zi %ASMEXTRA%
@@ -210,22 +236,34 @@ rem link) must be on PATH; passing the SDK include dirs to rc.exe explicitly
 rem means this script builds from a plain prompt too, not only from an
 rem "x64 Native Tools Command Prompt" that pre-sets the INCLUDE variable.
 rem ---------------------------------------------------------------------------
-set SDKROOT=C:\Program Files (x86)\Windows Kits\10
-set SDKVER=10.0.26100.0
-for /f %%v in ('dir /b /ad /o-n "%SDKROOT%\Lib\10.*" 2^>nul') do (
-    set SDKVER=%%v
-    goto :sdkver_done
+if not defined SDKROOT set SDKROOT=C:\Program Files (x86)\Windows Kits\10
+if not defined SDKVER (
+    set SDKVER=10.0.26100.0
+    for /f %%v in ('dir /b /ad /o-n "%SDKROOT%\Lib\10.*" 2^>nul') do (
+        set SDKVER=%%v
+        goto :sdkver_done
+    )
 )
 :sdkver_done
-set SDKLIB=%SDKROOT%\Lib\%SDKVER%\um\x64
+if not defined SDKLIB (
+    if exist "%SDKROOT%\Lib\%SDKVER%\um\x64" (
+        set SDKLIB=%SDKROOT%\Lib\%SDKVER%\um\x64
+    ) else if exist "%SDKROOT%\um\x64" (
+        set SDKLIB=%SDKROOT%\um\x64
+    )
+)
 set SDKBIN=%SDKROOT%\bin\%SDKVER%\x64
 set SDKINC=%SDKROOT%\Include\%SDKVER%
 if exist "%SDKBIN%\mt.exe" set PATH=%SDKBIN%;%PATH%
+set RCINC=
+if exist "%SDKINC%\um" set RCINC=/I "%SDKINC%\um" /I "%SDKINC%\shared" /I "%SDKINC%\ucrt"
+set LINKLIB=
+if defined SDKLIB if exist "%SDKLIB%" set LINKLIB=/libpath:"%SDKLIB%"
 
 echo === resource (VERSIONINFO + icon) ===
-rc /nologo /I "%SDKINC%\um" /I "%SDKINC%\shared" /I "%SDKINC%\ucrt" /fo obj\myrkr.res myrkr.rc
+rc /nologo %RCINC% /fo obj\myrkr.res myrkr.rc
 if errorlevel 1 goto :failed
-rc /nologo /I "%SDKINC%\um" /I "%SDKINC%\shared" /I "%SDKINC%\ucrt" /fo obj\myrkrshell.res myrkrshell.rc
+rc /nologo %RCINC% /fo obj\myrkrshell.res myrkrshell.rc
 if errorlevel 1 goto :failed
 
 echo === linking myrkr.exe (%GUARDFLAGS%) ===
@@ -233,9 +271,9 @@ link /nologo /subsystem:windows /entry:wstart /nodefaultlib /incremental:no ^
      /dynamicbase /highentropyva /nxcompat /largeaddressaware ^
      %GUARDFLAGS% %REPROFLAGS% /debug /pdb:bin\myrkr.pdb /map:bin\myrkr.map ^
      /manifest:embed /manifestinput:myrkr.manifest /manifestuac:no ^
-     /libpath:"%SDKLIB%" ^
+     %LINKLIB% ^
      /out:bin\myrkr.exe obj\main.obj obj\console.obj obj\hardening.obj obj\random.obj obj\loadcfg.obj obj\sha256.obj obj\aesgcm.obj obj\blake2b.obj obj\argon2.obj obj\fileio.obj obj\volume.obj obj\secmem.obj obj\secdesk.obj obj\cmd.obj obj\archive.obj obj\pack.obj obj\compress.obj obj\progress.obj obj\crc32.obj obj\sha1.obj obj\inflate.obj obj\deflate.obj obj\unzip.obj obj\zip.obj obj\selftest.obj obj\redteam.obj obj\log.obj obj\ramlog.obj obj\estream.obj obj\gui.obj obj\myrkr.res ^
-     kernel32.lib bcrypt.lib cabinet.lib user32.lib comdlg32.lib comctl32.lib shell32.lib ole32.lib gdi32.lib advapi32.lib uxtheme.lib msimg32.lib
+     kernel32.lib bcrypt.lib cabinet.lib user32.lib comdlg32.lib comctl32.lib shell32.lib ole32.lib gdi32.lib advapi32.lib uxtheme.lib msimg32.lib imm32.lib userenv.lib
 if errorlevel 1 goto :failed
 
 rem ---------------------------------------------------------------------------
@@ -260,7 +298,7 @@ echo === linking myrkrshell.dll (%GUARDFLAGS%) ===
 link /nologo /dll /entry:DllMain /nodefaultlib /incremental:no ^
      /dynamicbase /highentropyva /nxcompat ^
      %GUARDFLAGS% %REPROFLAGS_DLL% /debug /pdb:bin\myrkrshell.pdb /map:bin\myrkrshell.map ^
-     /def:myrkrshell.def /implib:obj\myrkrshell.lib /libpath:"%SDKLIB%" ^
+     /def:myrkrshell.def /implib:obj\myrkrshell.lib %LINKLIB% ^
      /out:bin\myrkrshell.dll obj\shellext.obj obj\myrkrshell.res ^
      kernel32.lib user32.lib shell32.lib ole32.lib
 if errorlevel 1 goto :failed

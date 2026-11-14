@@ -26,7 +26,8 @@ $vcCandidates = @(
     "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
 )
 $vc = $vcCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
-if (-not $vc) { throw "no vcvars64.bat found; edit `$vcCandidates in tests\run.ps1" }
+$haveMl64 = [bool](Get-Command ml64 -ErrorAction SilentlyContinue)
+if (-not $vc -and -not $haveMl64) { throw "no vcvars64.bat or ml64 on PATH found; edit `$vcCandidates in tests\run.ps1" }
 
 # The GUI suites run in a child PowerShell.  PowerShell 7 (pwsh) when it is
 # installed, Windows PowerShell 5.1 otherwise: hard-coding pwsh made this whole
@@ -35,7 +36,11 @@ if (-not $vc) { throw "no vcvars64.bat found; edit `$vcCandidates in tests\run.p
 $ps = if (Get-Command pwsh -ErrorAction SilentlyContinue) { "pwsh" } else { "powershell" }
 
 function Build($buildArgs) {
-    cmd /c "`"$vc`" >nul 2>&1 && `"$root\build.cmd`" $buildArgs" | Out-Null
+    if ($vc) {
+        cmd /c "`"$vc`" >nul 2>&1 && `"$root\build.cmd`" $buildArgs" | Out-Null
+    } else {
+        cmd /c "`"$root\build.cmd`" $buildArgs" | Out-Null
+    }
     if ($LASTEXITCODE) { throw "build $buildArgs failed" }
 }
 

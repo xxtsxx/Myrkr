@@ -63,7 +63,7 @@ _load_config_used label byte
     dq 0                            ; ProcessAffinityMask
     dd 0                            ; ProcessHeapFlags
     dw 0                            ; CSDVersion
-    dw 0                            ; DependentLoadFlags
+    dw 0800h                        ; DependentLoadFlags (LOAD_LIBRARY_SEARCH_SYSTEM32)
     dq 0                            ; EditList
     dq __security_cookie            ; SecurityCookie
     dq 0                            ; SEHandlerTable (x64: table-based SEH)

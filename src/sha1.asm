@@ -17,6 +17,8 @@
 
 include macros.inc
 
+extern secure_zero:proc
+
 ; SHA1_CTX_SIZE now lives in macros.inc so the ZIP paths can size their context
 ; buffers from the same constant this module's layout defines.
 
@@ -150,6 +152,10 @@ sb_r4:
     add     dword ptr [rcx+12], eax
     mov     eax, dword ptr [rbp-356]
     add     dword ptr [rcx+16], eax
+    ; wipe working state a..e + message schedule W[0..79] ([rbp-356 .. rbp-16))
+    lea     rcx, [rbp-356]
+    mov     edx, 340
+    call    secure_zero
     FRAME_EPILOG
     ret
 sha1_block endp
@@ -269,6 +275,10 @@ sf_out:
     inc     r9d
     cmp     r9d, 5
     jb      sf_out
+    mov     qword ptr [rbp-40], 0
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, SHA1_CTX_SIZE
+    call    secure_zero
     FRAME_EPILOG
     ret
 sha1_final endp
@@ -378,6 +388,10 @@ hm_pad_done:
     lea     rcx, [rbp-288]
     mov     rdx, qword ptr [rbp-40]          ; out
     call    sha1_final
+    ; wipe inner digest, sha1 ctx, k_opad and k_ipad ([rbp-312 .. rbp-64))
+    lea     rcx, [rbp-312]
+    mov     edx, 312-64
+    call    secure_zero
     FRAME_EPILOG
     ret
 hmac_sha1 endp
@@ -488,6 +502,10 @@ pk_enext:
     inc     dword ptr [rbp-80]               ; blockidx++
     jmp     pk_block
 pk_done:
+    ; wipe U, T, and saltbuf ([rbp-208 .. rbp-96))
+    lea     rcx, [rbp-208]
+    mov     edx, 208-96
+    call    secure_zero
     FRAME_EPILOG
     ret
 pbkdf2_hmac_sha1 endp

@@ -23,39 +23,37 @@ reach - one of them only noticed after a live install went wrong.)
 FLOORS = {
     "framecheck": {
         # FRAME_PROLOG procs whose frame was actually sized and checked.
-        "procs": 135,                    # 153 at time of writing
+        "procs": 340,                    # 381 measured
         # RAW procs (push rbp / sub rsp,N) given the same spill-overlap
         # analysis.  Floored separately because they are nearly all of gui.asm,
         # and the summary line used to report only the count above - which read
         # as "gui.asm is not covered" to at least one person reviewing it.
-        "raw": 115,                      # 128 measured (99 of them in gui.asm)
+        "raw": 140,                      # 159 measured
     },
     "wincallcheck": {
         # WINCALL sites whose argument list was parsed and checked for reads of
         # a register the macro has already overwritten.
-        "sites": 700,                    # 791 measured
+        "sites": 1020,                   # 1135 measured
     },
     "constcheck": {
         # constants deliberately mirrored across modules and compared.
-        "mirrored": 18,                  # 20 measured
-        "files": 24,                     # 26 sources incl. macros.inc
+        "mirrored": 45,                  # 50 measured
+        "files": 28,                     # 32 sources incl. macros.inc
     },
     "deadcode": {
-        "symbols": 1290,                 # 1435 measured (was 1226 before shellext.asm)
+        "symbols": 2350,                 # 2622 measured
     },
     "aligncheck": {
-        "scalars": 48,                   # 53 measured
+        "scalars": 73,                   # 82 measured
     },
     "nvcheck": {
         # procs whose writes to callee-saved registers were checked for a save
         # and a restore.
-        "procs": 600,                    # 670 measured
+        "procs": 615,                    # 688 measured
     },
     "wstrcheck": {
-        # call sites whose bound-carrying register was checked.  Nearly doubled
-        # when wapp_lim joined wcopy in the CONTRACTS table, so the old floor of
-        # 15 would no longer notice this checker losing half its reach.
-        "calls": 28,                     # 32 measured
+        # call sites whose bound-carrying register was checked.
+        "calls": 45,                     # 51 measured
     },
 }
 

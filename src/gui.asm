@@ -75,6 +75,8 @@ externdef g_cfg_compress:dword           ; 0 store / 1 xpress (consumed by do_pa
 externdef g_cfg_compress_set:dword       ; 1 = explicit (skip size-based default)
 externdef g_file_done:qword              ; per-positional bytes done (MAX_ARGS entries)
 externdef g_file_total:qword             ; per-positional total bytes (MAX_ARGS entries)
+externdef g_allow_screencap:dword        ; main.asm: 0 = exclude windows from capture
+externdef g_allow_unc:dword              ; main.asm: 1 = allow UNC shares; 0 = block UNC
 
 ; ---- Win32 imports ----------------------------------------------------------
 extern GetModuleHandleW:proc
@@ -89,7 +91,8 @@ extern GetFileAttributesExW:proc
 extern FindFirstFileW:proc
 extern FindNextFileW:proc
 extern FindClose:proc
-extern CreateFileW:proc
+extern file_open_read:proc
+extern file_open_write:proc
 extern ReadFile:proc
 extern CloseHandle:proc
 extern WideCharToMultiByte:proc
@@ -102,8 +105,11 @@ extern ShowWindow:proc
 extern ShowScrollBar:proc
 extern SetWindowPos:proc
 extern SetLayeredWindowAttributes:proc
+extern SetWindowDisplayAffinity:proc
+extern ImmAssociateContext:proc
 extern SetForegroundWindow:proc
-extern WaitForSingleObject:proc
+extern MsgWaitForMultipleObjects:proc
+extern PeekMessageW:proc
 extern secdesk_open:proc                 ; secdesk.asm
 extern secdesk_enter:proc
 extern secdesk_leave:proc
@@ -344,7 +350,6 @@ ES_PASSWORD         equ 000000020h
 EM_LIMITTEXT        equ 0000000C5h
 EM_SETSEL           equ 0000000B1h
 EM_SCROLLCARET      equ 0000000B7h
-INFINITE            equ 0FFFFFFFFh
 ES_READONLY         equ 000000800h
 ES_MULTILINE        equ 000000004h
 ES_AUTOVSCROLL      equ 000000040h
@@ -1435,6 +1440,18 @@ g_setrows label byte
     dd      0, SPLIT_MAX_IDX, 0, ID_VOLSPLIT, 0, SPLIT_MAX_IDX
     dd      0, 0
     dq      0
+    ; AllowScreenCapture: policy/registry opt-in (0 = WDA_EXCLUDEFROMCAPTURE, 1 = allow)
+    dq      w_val_allowcap, g_allow_screencap, 0, 0, 0, g_lock_allowcap, g_pol_allowcap
+    dq      0, 0
+    dd      0, 1, 1, 0, 0, 0
+    dd      0, 0
+    dq      0
+    ; AllowUnc: policy/registry toggle (1 = allow UNC shares, 0 = block UNC)
+    dq      w_val_allowunc, g_allow_unc, 0, 0, 0, g_lock_allowunc, g_pol_allowunc
+    dq      0, 0
+    dd      0, 1, 1, 0, 0, 0
+    dd      0, 0
+    dq      0
 
 WSTR w_regkey,      <Software\Myrkr>
 WSTR w_regkey_def,  <Software\Myrkr\Defaults>   ; deployed defaults, NOT policy
@@ -1447,6 +1464,8 @@ WSTR w_val_securedesk,<SecureDesktop>
 WSTR w_val_kdftime, <KdfTime>
 WSTR w_val_kdfmem,  <KdfMemory>
 WSTR w_val_split,   <SplitSize>
+WSTR w_val_allowcap,<AllowScreenCapture>
+WSTR w_val_allowunc,<AllowUnc>
 
 ; =============================================================================
 ; The settings table.  One row per registry value, consumed by load_settings.
@@ -1488,7 +1507,7 @@ sr_scale            equ 96
 sr_step             equ 100
 sr_unit             equ 104
 SETROW_SIZE         equ 112
-SETROW_COUNT        equ 9
+SETROW_COUNT        equ 11
 ;
 ; The three fields after the registry ones describe the CONTROL, so the same row
 ; answers "which panel control is this setting" as well as "where does the value
@@ -1682,7 +1701,8 @@ WSTR s_sd_title,   <Myrkr - password>
 WSTR s_sd_hint1,   <Typed on a private desktop, where other programs>
 WSTR s_sd_hint2,   <on this machine cannot see or reach it.>
 ifdef DBG_TRACE
-WSTR w_dbg_nosd,   <MYRKR_DBG_NOSECDESK>
+WSTR w_dbg_nosd,     <MYRKR_DBG_NOSECDESK>
+WSTR w_dbg_allowcap, <MYRKR_DBG_ALLOWCAPTURE>
 endif
 WSTR s_sd_pw,      <Password>
 WSTR s_sd_conf,    <Confirm>
@@ -1950,6 +1970,7 @@ g_cfg_compress_seen dd ?                ; 1 if a saved Compress value was loaded
 g_fmt_seen  dd ?                        ; 1 if a saved Format value was loaded
 g_regval    dd ?                        ; scratch DWORD for registry get/set
 g_regsz     dd ?                        ; scratch size for RegQueryValueExW
+g_regtype   dd ?                        ; scratch type for RegQueryValueExW
 g_reghk     dq ?                        ; open ...\Software\Myrkr handle (load)
 g_loading_hklm dd ?                     ; 1 while loading HKLM (enforced policy)
 g_lock_compress  dd ?                   ; 1 = setting fixed by HKLM (disable in menu)
@@ -1961,6 +1982,8 @@ g_lock_securedesk dd ?
 g_lock_kdftime   dd ?
 g_lock_kdfmem    dd ?
 g_lock_split     dd ?
+g_lock_allowcap  dd ?
+g_lock_allowunc  dd ?
 ; The HKLM-enforced values, kept alongside the lock flags so apply_policy_locks
 ; can put them back after the CLI option parser has run.  Without these the lock
 ; flags only reach the GUI, where they grey a control out; the CLI parser writes
@@ -1973,6 +1996,8 @@ g_pol_securedesk dd ?
 g_pol_kdftime    dd ?
 g_pol_kdfmem     dd ?
 g_pol_split      dd ?
+g_pol_allowcap   dd ?
+g_pol_allowunc   dd ?
 g_cfg_splitidx   dd ?                    ; 0..5 index into the split presets
 g_hformat   dq ?                        ; Format toggle handle
 g_input_total dq ?                      ; total input bytes (size-based default)
@@ -2078,18 +2103,20 @@ g_ctl_parent dq ?                            ; create_ctl parent override (0 = g
 ; --- private-desktop password prompt state (one at a time; never nests) -------
 g_sd_hwnd    dq ?
 ifdef DBG_TRACE
-g_dbg_sdbuf  dw 8 dup (?)
-g_dbg_nodesk dd ?
+g_dbg_sdbuf    dw 8 dup (?)
+g_dbg_nodesk   dd ?
+g_dbg_allowcap dd ?
 endif
+g_secdesk_orphan dd ?
+g_scrubbing  dd ?
+align 2
+g_scrubw     dw PWBUF_CHARS dup (?)
 g_pw_ready   dd ?                            ; password already collected pre-window
 g_container  dd ?                            ; 1 = window shows a .mrk's contents
 g_badset_open dd ?                           ; 1 = detect_op was handed a part of a
                                              ; set that cannot be assembled
 g_add_refused dd ?                           ; items append_input (or a drop) turned
                                              ; away in the current add - see append_input
-public g_gui_active
-g_gui_active dd ?                            ; 1 once gui_main runs: crash_contain may
-                                             ; show a box (never in the CLI)
 g_argover    dd ?                            ; command-line inputs past MAX_ARGS
 g_arglong    dd ?                            ; command-line inputs too long for a slot
 g_idx_bytes  dq ?                            ; bytes the inventory accounts for
@@ -2182,6 +2209,71 @@ wz_l:
 wz_d:
     ret
 wzero endp
+
+; =============================================================================
+; gui_protect_hwnd(rcx = hwnd) - exclude top-level window from screen capture
+; (WDA_EXCLUDEFROMCAPTURE = 11h, falling back to WDA_MONITOR = 1h on older OS)
+; unless AllowScreenCapture=1 or (DBG_TRACE only) MYRKR_DBG_ALLOWCAPTURE=1.
+; =============================================================================
+gui_protect_hwnd proc
+    push    rbp
+    mov     rbp, rsp
+    sub     rsp, 48
+    test    rcx, rcx
+    jz      gph_done
+    cmp     dword ptr [g_allow_screencap], 0
+    jne     gph_done
+ifdef DBG_TRACE
+    cmp     dword ptr [g_dbg_allowcap], 0
+    jne     gph_done
+endif
+    mov     qword ptr [rbp-8], rcx
+    WINCALL SetWindowDisplayAffinity, rcx, 11h      ; WDA_EXCLUDEFROMCAPTURE
+    test    eax, eax
+    jnz     gph_done
+    WINCALL SetWindowDisplayAffinity, qword ptr [rbp-8], 1 ; WDA_MONITOR fallback
+gph_done:
+    add     rsp, 48
+    pop     rbp
+    ret
+gui_protect_hwnd endp
+
+; =============================================================================
+; gui_hwnd_scrub(rcx = hwnd) - 3-step Win32 EDIT internal buffer & undo scrub.
+; SetWindowTextW("") alone sets length to 0 without overwriting the control's
+; internal HLOCAL allocation or undo ring.  Overwriting with PWBUF_CHARS-1 'X'
+; code units first overwrites the live HLOCAL allocation in place.
+; =============================================================================
+gui_hwnd_scrub proc
+    push    rbp
+    mov     rbp, rsp
+    sub     rsp, 48
+    test    rcx, rcx
+    jz      ghs_done
+    mov     qword ptr [rbp-8], rcx
+    mov     dword ptr [g_scrubbing], 1   ; suppress EN_CHANGE regrade during scrub
+    lea     r10, [g_scrubw]
+    xor     r9d, r9d
+ghs_fill:
+    mov     word ptr [r10+r9*2], 'X'
+    inc     r9d
+    cmp     r9d, PWBUF_CHARS-1
+    jb      ghs_fill
+    mov     word ptr [r10+r9*2], 0
+    WINCALL SendMessageW, qword ptr [rbp-8], 0CFh, 0, 0 ; EM_EMPTYUNDOBUFFER
+    WINCALL SetWindowTextW, qword ptr [rbp-8], addr g_scrubw
+    WINCALL SendMessageW, qword ptr [rbp-8], 0CFh, 0, 0
+    WINCALL SetWindowTextW, qword ptr [rbp-8], addr s_empty
+    WINCALL SendMessageW, qword ptr [rbp-8], 0CFh, 0, 0
+    lea     rcx, [g_scrubw]
+    mov     rdx, PWBUF_CHARS*2
+    call    secure_zero
+    mov     dword ptr [g_scrubbing], 0
+ghs_done:
+    add     rsp, 48
+    pop     rbp
+    ret
+gui_hwnd_scrub endp
 
 ; =============================================================================
 ; wfindbase(rcx = path) -> rax = ptr to char after the last '\' or '/', or the
@@ -3265,6 +3357,8 @@ mb_create:
     mov     qword ptr [g_mb_hwnd], rax
     test    rax, rax
     jz      mb_ret                               ; creation failed: return IDCANCEL
+    mov     rcx, rax
+    call    gui_protect_hwnd
     WINCALL SetLayeredWindowAttributes, qword ptr [g_mb_hwnd], 0, WIN_ALPHA, LWA_ALPHA
     mov     r8d, dword ptr [rbp-48]
     inc     r8d
@@ -5740,8 +5834,12 @@ us_enable:
     ; placeholder cue is reapplied (deleting the last char only paints a
     ; partial region, which would otherwise leave the cue missing)
     cmp     dword ptr [rbp-8], 0
-    jne     us_done
+    jne     us_wipe
     WINCALL InvalidateRect, qword ptr [g_hpass], 0, 1   ; bErase=TRUE -> full repaint
+us_wipe:
+    lea     rcx, [g_passw]
+    mov     rdx, PWBUF_CHARS*2
+    call    secure_zero
 us_done:
     add     rsp, 96
     pop     rbp
@@ -6753,6 +6851,7 @@ create_controls_enc proc
     MKCTL   cls_static, s_ready, ST_UNDER, ID_PW_UNDER, 15, LV_Y+LV_H+40+STAT_BAND, 455, 2, g_hpw_under
     MKCTL   cls_button, s_ready, ST_OWNERBTN_NT, ID_SHOWPW, 476, LV_Y+LV_H+16+STAT_BAND, 34, 24, g_hshow
     ; placeholder cue ("Password") drawn while the field is empty
+    WINCALL ImmAssociateContext, qword ptr [g_hpass], 0
     mov     rcx, qword ptr [g_hpass]
     call    subclass_edit
     call    hide_pwrow                       ; secure desktop asks instead
@@ -6982,6 +7081,7 @@ ccd_pwrow:
     MKCTL   cls_static, s_ready, ST_UNDER, ID_PW_UNDER, 15, 104, 455, 2, g_hpw_under
     ; show/hide eye as a separate button to the right of the field (no overlap)
     MKCTL   cls_button, s_ready, ST_OWNERBTN_NT, ID_SHOWPW, 476, 80, 34, 24, g_hshow
+    WINCALL ImmAssociateContext, qword ptr [g_hpass], 0
     mov     rcx, qword ptr [g_hpass]
     call    subclass_edit
     call    hide_pwrow                       ; secure desktop asks instead
@@ -7478,8 +7578,10 @@ glyph_attach endp
 ; wrong size and simply never delivers WM_MOUSELEAVE, which leaves the halo lit
 ; after the pointer has gone.
 ; -----------------------------------------------------------------------------
-glyph_subclass proc frame
-    FRAME_PROLOG 128
+glyph_subclass proc
+    push    rbp
+    mov     rbp, rsp
+    sub     rsp, 128
     mov     qword ptr [rbp-24], rcx           ; hwnd
     mov     qword ptr [rbp-32], rdx           ; msg
     mov     qword ptr [rbp-40], r8            ; wParam
@@ -7515,7 +7617,8 @@ gs_leave:
     WINCALL InvalidateRect, qword ptr [rbp-24], 0, 1
     jmp     gs_def
 gs_ret:
-    FRAME_EPILOG
+    add     rsp, 128
+    pop     rbp
     ret
 glyph_subclass endp
 
@@ -9265,18 +9368,31 @@ ss_done:
 save_setting endp
 
 ; =============================================================================
-; ls_read(rcx = value-name wide) -> eax = 1 if the DWORD was read into g_regval.
+; ls_read(rcx = value-name wide) -> eax = 1 valid REG_DWORD, 0 absent,
+;                                         2 present with wrong type or size.
 ; Reads from the key opened in g_reghk.
 ; =============================================================================
 ls_read proc
     push    rbp
     mov     rbp, rsp
     sub     rsp, 64
+    mov     dword ptr [g_regtype], 0
     mov     dword ptr [g_regsz], 4
-    WINCALL RegQueryValueExW, qword ptr [g_reghk], rcx, 0, 0, addr g_regval, addr g_regsz
-    test    eax, eax
-    jnz     lr_no
+    WINCALL RegQueryValueExW, qword ptr [g_reghk], rcx, 0, addr g_regtype, addr g_regval, addr g_regsz
+    cmp     eax, 2                          ; ERROR_FILE_NOT_FOUND -> absent
+    je      lr_no
+    test    eax, eax                        ; e.g. ERROR_MORE_DATA -> malformed
+    jnz     lr_bad
+    cmp     dword ptr [g_regtype], 4        ; must be REG_DWORD (4)
+    jne     lr_bad
+    cmp     dword ptr [g_regsz], 4          ; must be exactly 4 bytes
+    jne     lr_bad
     mov     eax, 1
+    add     rsp, 64
+    pop     rbp
+    ret
+lr_bad:
+    mov     eax, 2
     add     rsp, 64
     pop     rbp
     ret
@@ -9288,22 +9404,17 @@ lr_no:
 ls_read endp
 
 ; =============================================================================
-; load_settings(rcx = root HKEY) - read Compress/Format/LogLevel/MinLen/
-; MinClasses from <root>\Software\Myrkr.  Called twice from wstart: HKCU before
-; parse_cmdline (so CLI flags override it) and HKLM after (so it overrides CLI
-; and HKCU).  While g_loading_hklm is set, each present value also locks the
-; matching GUI control so the user cannot weaken an admin-enforced policy.
+; load_settings(rcx = root HKEY) - read settings from <root>\Software\Myrkr.
+; Called from wstart: Defaults and HKCU before parse_cmdline, and HKLM policy
+; after.  While g_loading_hklm is set, ANY present policy value (even if wrong
+; registry type/size or out-of-range) fails CLOSED: it clamps/forces a safe
+; policy value and sets sr_lock = 1 so the user cannot weaken policy.
 ; =============================================================================
 public load_settings
 load_settings proc
     push    rbp
     mov     rbp, rsp
     sub     rsp, 80
-    ; rdx names the SUBKEY, because two of them under HKLM mean opposite things:
-    ; Software\Myrkr is POLICY and locks what it sets, Software\Myrkr\Defaults is
-    ; a deployed starting value the user may still change.  [rbp-32] is clear of
-    ; both the locals below and the outgoing arguments of the five-argument call
-    ; that follows.
     mov     qword ptr [rbp-32], rdx
     WINCALL RegOpenKeyExW, rcx, qword ptr [rbp-32], 0, KEY_READ, addr g_reghk
     test    eax, eax
@@ -9312,7 +9423,7 @@ load_settings proc
 ls_row:
     mov     rax, qword ptr [rbp-8]
     cmp     rax, SETROW_COUNT
-    jae     ls_close
+    jae     ls_regclose
     imul    rax, rax, SETROW_SIZE
     lea     r10, [g_setrows]
     add     r10, rax
@@ -9322,6 +9433,8 @@ ls_row:
     test    eax, eax
     jz      ls_next                      ; absent: every LATER row still runs
     mov     r10, qword ptr [rbp-16]      ; ls_read clobbered it
+    cmp     eax, 2                       ; malformed type or size?
+    je      ls_malformed
     mov     eax, dword ptr [g_regval]
     cmp     dword ptr [r10+sr_bool], 0
     je      ls_range
@@ -9331,9 +9444,50 @@ ls_row:
     jmp     ls_store
 ls_range:
     cmp     eax, dword ptr [r10+sr_min]
-    jb      ls_next                      ; out of range: ignored, not fatal
+    jb      ls_below
     cmp     eax, dword ptr [r10+sr_max]
-    ja      ls_next
+    ja      ls_above
+    jmp     ls_store
+ls_below:
+    cmp     dword ptr [g_loading_hklm], 0
+    je      ls_next                      ; HKCU/Defaults out-of-range: ignore
+    mov     eax, dword ptr [r10+sr_min]  ; HKLM policy below min: clamp + lock
+    jmp     ls_store
+ls_above:
+    cmp     dword ptr [g_loading_hklm], 0
+    je      ls_next
+    mov     eax, dword ptr [r10+sr_max]  ; HKLM policy above max: clamp + lock
+    jmp     ls_store
+ls_malformed:
+    cmp     dword ptr [g_loading_hklm], 0
+    je      ls_next                      ; HKCU/Defaults malformed: ignore
+    ; HKLM policy present with malformed type/size -> fail closed & lock!
+    mov     rax, qword ptr [r10+sr_name]
+    lea     rdx, [w_val_allowcap]
+    cmp     rax, rdx
+    je      ls_malf_zero
+    lea     rdx, [w_val_allowunc]
+    cmp     rax, rdx
+    je      ls_malf_zero
+    lea     rdx, [w_val_securedesk]
+    cmp     rax, rdx
+    jne     ls_malf_keep
+    mov     eax, 1                       ; SecureDesktop malformed under HKLM -> force ON
+    jmp     ls_store
+ls_malf_zero:
+    xor     eax, eax                     ; AllowScreenCapture / AllowUnc -> force 0
+    jmp     ls_store
+ls_malf_keep:
+    mov     rcx, qword ptr [r10+sr_val]
+    mov     eax, dword ptr [rcx]         ; lock at current safe/default value
+    cmp     dword ptr [r10+sr_bool], 0
+    jne     ls_store
+    cmp     eax, dword ptr [r10+sr_min]
+    jae     @F
+    mov     eax, dword ptr [r10+sr_min]
+@@: cmp     eax, dword ptr [r10+sr_max]
+    jbe     ls_store
+    mov     eax, dword ptr [r10+sr_max]
 ls_store:
     mov     dword ptr [rbp-24], eax
     mov     rcx, qword ptr [r10+sr_val]
@@ -9369,39 +9523,29 @@ ls_store:
 ls_next:
     inc     qword ptr [rbp-8]
     jmp     ls_row
-ls_close:
-    ; Hand-written, and staying that way: this is not a setting, it is a
-    ; DEBUG-ONLY escape from one.  A table row implies "read a value, store it",
-    ; and this reads an ENVIRONMENT variable to move the prompt to another
-    ; desktop.  Vordr keeps its TPM enrolment out of the table for the same
-    ; reason - a row should not imply a side effect.
-    ; Condition preserved from the chain it replaces: HKLM pass, SecureDesktop
-    ; present (which is exactly what set g_lock_securedesk).
-ifdef DBG_TRACE
-    cmp     dword ptr [g_loading_hklm], 0
-    je      ls_regclose
-    cmp     dword ptr [g_lock_securedesk], 0
-    je      ls_regclose
-    ; DEBUG BUILDS ONLY - work on the prompt's own UI without a second desktop.
-    ; MYRKR_DBG_NOSECDESK=1 keeps the prompt on the interactive desktop so it can
-    ; be screenshotted and driven; the window is identical either way, only the
-    ; desktop it lives on differs.  This is a deliberate hole and is why it is
-    ; inside DBG_TRACE: a release binary has no way to reach it, and a build that
-    ; did would defeat the control it exists to develop.  See manifest 11.1.
-    WINCALL GetEnvironmentVariableW, addr w_dbg_nosd, addr g_dbg_sdbuf, 8
-    test    eax, eax
-    jz      ls_regclose
-    cmp     word ptr [g_dbg_sdbuf], '1'
-    jne     ls_regclose
-    ; Move the prompt to the interactive desktop WITHOUT clearing
-    ; g_cfg_securedesk.  Clearing it would also switch off everything else the
-    ; setting governs - notably the dialog's own password row - so the thing
-    ; under test would no longer be the thing that ships.
-    mov     dword ptr [g_dbg_nodesk], 1
-endif
 ls_regclose:
     WINCALL RegCloseKey, qword ptr [g_reghk]
 ls_done:
+ifdef DBG_TRACE
+    cmp     dword ptr [g_loading_hklm], 0
+    je      ls_out
+    ; DEBUG BUILDS ONLY: test-harness overrides for interactive-desktop driving
+    ; and control GetPixel sampling (never compiled into release binaries).
+    WINCALL GetEnvironmentVariableW, addr w_dbg_nosd, addr g_dbg_sdbuf, 8
+    test    eax, eax
+    jz      @F
+    cmp     word ptr [g_dbg_sdbuf], '1'
+    jne     @F
+    mov     dword ptr [g_dbg_nodesk], 1
+@@:
+    WINCALL GetEnvironmentVariableW, addr w_dbg_allowcap, addr g_dbg_sdbuf, 8
+    test    eax, eax
+    jz      ls_out
+    cmp     word ptr [g_dbg_sdbuf], '1'
+    jne     ls_out
+    mov     dword ptr [g_dbg_allowcap], 1
+ls_out:
+endif
     add     rsp, 80
     pop     rbp
     ret
@@ -9485,6 +9629,16 @@ apply_policy_locks proc
     je      @F
     mov     eax, dword ptr [g_pol_securedesk]
     mov     dword ptr [g_cfg_securedesk], eax
+@@:
+    cmp     dword ptr [g_lock_allowcap], 0
+    je      @F
+    mov     eax, dword ptr [g_pol_allowcap]
+    mov     dword ptr [g_allow_screencap], eax
+@@:
+    cmp     dword ptr [g_lock_allowunc], 0
+    je      @F
+    mov     eax, dword ptr [g_pol_allowunc]
+    mov     dword ptr [g_allow_unc], eax
 @@:
     ret
 apply_policy_locks endp
@@ -9648,7 +9802,8 @@ do_checkzip:
     call    ends_with_zip
     test    eax, eax
     jz      do_done
-    WINCALL CreateFileW, addr g_filepath_w, GENERIC_READ, FILE_SHARE_READ, 0, OPEN_EXISTING, 0, 0
+    lea     rcx, [g_filepath_w]
+    call    file_open_read
     cmp     rax, INVALID_HVAL
     je      do_done
     mov     qword ptr [rbp-8], rax
@@ -11728,6 +11883,11 @@ rp_have:
     ; g_passw already holds the typed password (wide) from the prompt.
     ; UTF-8 conversion (CP_UTF8, WC_ERR_INVALID_CHARS, ...)
     WINCALL WideCharToMultiByte, 65001, 80h, addr g_passw, -1, addr g_cfg_pass, MAX_PASSWORD_BYTES+1, 0, 0
+    mov     dword ptr [rbp-8], eax
+    lea     rcx, [g_passw]
+    mov     rdx, PWBUF_CHARS*2
+    call    secure_zero
+    mov     eax, dword ptr [rbp-8]
     test    eax, eax
     jz      rp_bad
     dec     eax
@@ -11737,6 +11897,10 @@ rp_have:
     xor     eax, eax
     jmp     rp_ret
 rp_bad:
+    mov     dword ptr [g_cfg_passlen], 0
+    lea     rcx, [g_cfg_pass]
+    mov     rdx, MAX_PASSWORD_BYTES+1
+    call    secure_zero
     lea     rcx, [m_badpass]
     lea     rdx, [t_err]
     mov     r8d, MB_OK or MB_ICONERROR
@@ -12682,26 +12846,21 @@ od_restore:
     lea     rdx, [s_edits_saved]
 @@:
     WINCALL SetWindowTextW, qword ptr [g_hstatus], rdx
-    ; clear password fields + buffers
-    mov     word ptr [g_statusw], 0
-    WINCALL SetWindowTextW, qword ptr [g_hpass], addr g_statusw
-    cmp     qword ptr [g_hconfirm], 0
-    je      @F
-    WINCALL SetWindowTextW, qword ptr [g_hconfirm], addr g_statusw
-@@:
+    ; clear password fields + internal EDIT HLOCAL/undo buffers + globals
+    mov     rcx, qword ptr [g_hpass]
+    call    gui_hwnd_scrub
+    mov     rcx, qword ptr [g_hconfirm]
+    call    gui_hwnd_scrub
     lea     rcx, [g_passw]
-    mov     rdx, PWBUF_CHARS
-    call    wzero
+    mov     rdx, PWBUF_CHARS*2
+    call    secure_zero
     lea     rcx, [g_confirmw]
-    mov     rdx, PWBUF_CHARS
-    call    wzero
+    mov     rdx, PWBUF_CHARS*2
+    call    secure_zero
     lea     rcx, [g_cfg_pass]
-    xor     r9, r9
-od_wp:
-    mov     byte ptr [rcx+r9], 0
-    inc     r9
-    cmp     r9, MAX_PASSWORD_BYTES+1
-    jb      od_wp
+    mov     rdx, MAX_PASSWORD_BYTES+1
+    call    secure_zero
+    mov     dword ptr [g_cfg_passlen], 0
     ; refresh the strength UI back to the empty state (encrypt mode)
     cmp     dword ptr [g_op], 0
     jne     od_fin
@@ -14587,6 +14746,8 @@ wp_change:
 wp_pwchange:
     cmp     r9d, EN_CHANGE
     jne     wp_zero
+    cmp     dword ptr [g_scrubbing], 0
+    jne     wp_zero
     cmp     dword ptr [g_op], 0
     jne     wp_zero
     call    update_strength
@@ -14639,6 +14800,10 @@ wp_destroy_noole:
     mov     dword ptr [g_ole_ok], 0
     WINCALL OleUninitialize
 wp_destroy_quit:
+    mov     rcx, qword ptr [g_hpass]
+    call    gui_hwnd_scrub
+    mov     rcx, qword ptr [g_hconfirm]
+    call    gui_hwnd_scrub
     call    rlog_wipe                    ; it held every path the operation touched
     WINCALL PostQuitMessage, 0
     jmp     wp_zero
@@ -14768,7 +14933,6 @@ gui_main proc
     sub     rsp, 256                     ; large frame: keep locals clear of the
                                          ; CreateWindowExW outgoing-arg area so W/H
                                          ; survive for the post-create rounding
-    mov     dword ptr [g_gui_active], 1
     WINCALL GetCommandLineW
     WINCALL CommandLineToArgvW, rax, addr g_argc
     mov     qword ptr [rbp-16], rax              ; argv
@@ -14956,6 +15120,8 @@ gm_zwc:
     ; CreateWindowExW(WS_EX_TOOLWINDOW, class, title, style, X, Y, W, H, 0, 0, hinst, 0)
     WINCALL CreateWindowExW, <WS_EX_TOOLWINDOW or WS_EX_LAYERED>, addr wc_class, qword ptr [rbp-64], ST_MAINWND, dword ptr [rbp-72], dword ptr [rbp-76], dword ptr [rbp-48], dword ptr [rbp-52], 0, 0, qword ptr [g_hinst], 0
     mov     qword ptr [g_hwnd], rax
+    mov     rcx, rax
+    call    gui_protect_hwnd
     ; 90% opaque: uniform layered alpha over the whole window
     WINCALL SetLayeredWindowAttributes, qword ptr [g_hwnd], 0, WIN_ALPHA, LWA_ALPHA
     ; round the window corners: SetWindowRgn(CreateRoundRectRgn(0,0,W+1,H+1,16,16))
@@ -15503,7 +15669,8 @@ make_secdesk_controls proc
     mov     dword ptr [rsp+56], SD_EDIT_H
     call    create_ctl
     mov     qword ptr [g_sd_hpass], rax
-    WINCALL SendMessageW, rax, EM_LIMITTEXT, PWBUF_CHARS-1, 0
+    WINCALL ImmAssociateContext, rax, 0
+    WINCALL SendMessageW, qword ptr [g_sd_hpass], EM_LIMITTEXT, PWBUF_CHARS-1, 0
     mov     rcx, qword ptr [g_sd_hpass]
     call    subclass_edit                     ; in-field "Password" cue
     ; strength underline, directly under the field (Vordr's model: the field's
@@ -15545,7 +15712,8 @@ make_secdesk_controls proc
     mov     dword ptr [rsp+56], SD_EDIT_H
     call    create_ctl
     mov     qword ptr [g_sd_hconf], rax
-    WINCALL SendMessageW, rax, EM_LIMITTEXT, PWBUF_CHARS-1, 0
+    WINCALL ImmAssociateContext, rax, 0
+    WINCALL SendMessageW, qword ptr [g_sd_hconf], EM_LIMITTEXT, PWBUF_CHARS-1, 0
     mov     rcx, qword ptr [g_sd_hconf]
     call    subclass_edit                     ; in-field "Confirm" cue
     lea     rcx, [cls_static]
@@ -15938,7 +16106,9 @@ sd_accept proc
     lea     rcx, [g_confirmw]
     mov     rdx, PWBUF_CHARS*2
     call    secure_zero
-    WINCALL SetWindowTextW, qword ptr [g_sd_hconf], addr s_empty
+    mov     rcx, qword ptr [g_sd_hconf]
+    call    gui_hwnd_scrub
+    call    sd_update
     WINCALL SetFocus, qword ptr [g_sd_hconf]
     lea     rcx, [s_sd_mismatch]
     lea     rdx, [t_sd_err]
@@ -16051,6 +16221,8 @@ sdw_cmd:
     cmp     eax, ID_SDCONF
     jne     @F
 sdw_regrade:
+    cmp     dword ptr [g_scrubbing], 0
+    jne     sdw_zero
     call    sd_update
     jmp     sdw_zero
 @@:
@@ -16078,15 +16250,33 @@ sdw_notfmtcmd:
     jne     sdw_zero
     mov     dword ptr [g_sd_result], SDR_CANCEL
 sdw_end:
+    mov     rcx, qword ptr [g_sd_hpass]
+    mov     qword ptr [g_sd_hpass], 0
+    call    gui_hwnd_scrub
+    mov     rcx, qword ptr [g_sd_hconf]
+    mov     qword ptr [g_sd_hconf], 0
+    call    gui_hwnd_scrub
     WINCALL DestroyWindow, qword ptr [g_sd_hwnd]
     jmp     sdw_zero
 sdw_close:
     mov     dword ptr [g_sd_result], SDR_CANCEL
+    mov     rcx, qword ptr [g_sd_hpass]
+    mov     qword ptr [g_sd_hpass], 0
+    call    gui_hwnd_scrub
+    mov     rcx, qword ptr [g_sd_hconf]
+    mov     qword ptr [g_sd_hconf], 0
+    call    gui_hwnd_scrub
     WINCALL DestroyWindow, qword ptr [g_sd_hwnd]
 sdw_zero:
     xor     rax, rax
     jmp     sdw_ret
 sdw_destroy:
+    mov     rcx, qword ptr [g_sd_hpass]
+    mov     qword ptr [g_sd_hpass], 0
+    call    gui_hwnd_scrub
+    mov     rcx, qword ptr [g_sd_hconf]
+    mov     qword ptr [g_sd_hconf], 0
+    call    gui_hwnd_scrub
     mov     dword ptr [g_sd_done], 1
     xor     rax, rax
     jmp     sdw_ret
@@ -16164,6 +16354,8 @@ sdb_have:
     mov     qword ptr [g_sd_hwnd], rax
     test    rax, rax
     jz      sdb_done
+    mov     rcx, rax
+    call    gui_protect_hwnd
     mov     r8d, SD_W
     inc     r8d
     mov     r9d, dword ptr [g_sd_height]
@@ -16254,7 +16446,7 @@ public secdesk_prompt
 secdesk_prompt proc
     push    rbp
     mov     rbp, rsp
-    sub     rsp, 96
+    sub     rsp, 160
     mov     dword ptr [g_sd_flags], ecx
     mov     dword ptr [g_sd_result], SDR_CANCEL
     mov     dword ptr [g_sd_show], 0                 ; always start masked
@@ -16264,7 +16456,10 @@ ifdef DBG_TRACE
     cmp     dword ptr [g_dbg_nodesk], 0
     jne     sdp_here
 endif
-    jmp     sdp_secure
+    cmp     dword ptr [g_secdesk_orphan], 0
+    je      sdp_secure
+    mov     dword ptr [g_sd_result], SDR_UNAVAILABLE
+    jmp     sdp_ret
 sdp_here:
     ; opted out: ordinary modal, this thread, this desktop
     call    sd_build_pump
@@ -16284,7 +16479,32 @@ sdp_secure:
     mov     dword ptr [g_sd_result], SDR_UNAVAILABLE
     jmp     sdp_close
 @@:
-    WINCALL WaitForSingleObject, qword ptr [rbp-8], INFINITE
+    WINCALL GetTickCount64
+    add     rax, 300000                              ; 5-minute bounded UI wait
+    mov     qword ptr [rbp-16], rax
+sdp_wait:
+    WINCALL MsgWaitForMultipleObjects, 1, addr rbp-8, 0, 250, 0020h ; QS_PAINT
+    test    eax, eax                                 ; WAIT_OBJECT_0 (0) -> worker finished
+    jz      sdp_joined
+    cmp     eax, 1                                   ; WAIT_OBJECT_0 + 1 -> paint message
+    jne     sdp_chk_deadline
+sdp_pump_paint:
+    WINCALL PeekMessageW, addr rbp-80, 0, 0Fh, 0Fh, 1 ; WM_PAINT = 0Fh, PM_REMOVE = 1
+    test    eax, eax
+    jz      sdp_chk_deadline
+    WINCALL DispatchMessageW, addr rbp-80
+    jmp     sdp_pump_paint
+sdp_chk_deadline:
+    WINCALL GetTickCount64
+    cmp     rax, qword ptr [rbp-16]
+    jb      sdp_wait
+    ; Hung worker: rescue the user's interactive desktop, mark orphan, leak
+    ; thread/desktop handles rather than closing them under a live thread.
+    mov     dword ptr [g_secdesk_orphan], 1
+    call    secdesk_leave
+    mov     dword ptr [g_sd_result], SDR_UNAVAILABLE
+    jmp     sdp_ret
+sdp_joined:
     WINCALL CloseHandle, qword ptr [rbp-8]
 sdp_close:
     mov     rcx, qword ptr [g_sd_hdesk]
@@ -16292,7 +16512,7 @@ sdp_close:
     mov     qword ptr [g_sd_hdesk], 0
 sdp_ret:
     mov     eax, dword ptr [g_sd_result]
-    add     rsp, 96
+    add     rsp, 160
     pop     rbp
     ret
 secdesk_prompt endp
@@ -17253,6 +17473,8 @@ pgs_haveclass:
     mov     qword ptr [g_pg_hwnd], rax
     test    rax, rax
     jz      pgs_no
+    mov     rcx, rax
+    call    gui_protect_hwnd
     WINCALL CreateRoundRectRgn, 0, 0, PG_W+1, PG_H + PG_LOG_H + 1, WIN_ROUND, WIN_ROUND
     WINCALL SetWindowRgn, qword ptr [g_pg_hwnd], rax, 1
     WINCALL ShowWindow, qword ptr [g_pg_hwnd], SW_SHOW
@@ -17529,7 +17751,8 @@ ls_zero:
             qword ptr [rbp-16], dword ptr [rbp-56], 0, 0
     test    eax, eax
     jz      ls_freefail
-    WINCALL CreateFileW, addr g_lb_path, GENERIC_WRITE, 0, 0, CREATE_ALWAYS, FILE_ATTR_NORMAL, 0
+    lea     rcx, [g_lb_path]
+    call    file_open_write
     cmp     rax, -1
     je      ls_freefail
     mov     qword ptr [rbp-32], rax
@@ -17708,6 +17931,8 @@ lb_create:
     mov     qword ptr [g_lb_hwnd], rax
     test    rax, rax
     jz      lb_freetext
+    mov     rcx, rax
+    call    gui_protect_hwnd
     WINCALL SetLayeredWindowAttributes, qword ptr [g_lb_hwnd], 0, WIN_ALPHA, LWA_ALPHA
     WINCALL CreateRoundRectRgn, 0, 0, LB_W+1, LB_H+1, WIN_ROUND, WIN_ROUND
     WINCALL SetWindowRgn, qword ptr [g_lb_hwnd], rax, 1
@@ -17925,6 +18150,8 @@ sa_zwc:
     mov     dword ptr [rbp-76], eax             ; Y
     WINCALL CreateWindowExW, <WS_EX_TOOLWINDOW or WS_EX_LAYERED>, addr wc_about, addr wtitle_about, ST_MAINWND, dword ptr [rbp-72], dword ptr [rbp-76], dword ptr [rbp-48], dword ptr [rbp-52], 0, 0, qword ptr [g_hinst], 0
     mov     qword ptr [g_hwnd], rax
+    mov     rcx, rax
+    call    gui_protect_hwnd
     WINCALL SetLayeredWindowAttributes, qword ptr [g_hwnd], 0, WIN_ALPHA, LWA_ALPHA
     ; rounded corners (region owned by the window)
     mov     r8d, dword ptr [rbp-48]

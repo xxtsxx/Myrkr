@@ -170,6 +170,7 @@ for ($i = 0; $i -lt 4096; $i++) { $b[$i] = [byte]($i % 251) }
 if (-not (Test-Path "$w\f.mrk")) { "  FAIL could not make a container to open"; exit 1 }
 
 $env:MYRKR_DBG_NOSECDESK = "1"
+$env:MYRKR_DBG_ALLOWCAPTURE = "1"
 Get-Process myrkr -EA SilentlyContinue | ForEach-Object { try { $_.Kill() } catch {} }
 $q = Start-Process $exe -ArgumentList @("`"$w\f.mrk`"") -PassThru
 $sd = [IntPtr]::Zero
@@ -295,6 +296,7 @@ else {
 Get-Process -Id $q.Id -EA SilentlyContinue | ForEach-Object { try { $_.Kill() } catch {} }
 Remove-Item $w -Recurse -Force -EA SilentlyContinue
 Remove-Item Env:\MYRKR_DBG_NOSECDESK -EA SilentlyContinue
+Remove-Item Env:\MYRKR_DBG_ALLOWCAPTURE -EA SilentlyContinue
 
 ""
 "=== Restore: shipping build ==="

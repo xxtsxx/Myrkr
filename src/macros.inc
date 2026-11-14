@@ -581,7 +581,7 @@ endm
 ; Preserves rax/rdx/xmm0 (return values).  Clobbers r10, r11.
 ; =============================================================================
 FRAME_EPILOG macro
-    local ok1, ok2, sse_scan, sse_fail, no_sstk
+    local ok1, ok2, sse_fail, no_sstk
     ; ---- verify stack canary ------------------------------------------------
     mov     r10, qword ptr [g_stack_canary]
     cmp     r10, qword ptr [rbp-8]
@@ -589,24 +589,12 @@ FRAME_EPILOG macro
     mov     ecx, FF_STACK_COOKIE
     jmp     ff_trap
 ok1:
-    ; ---- pop + verify the software shadow stack (SEH-unwind tolerant) -------
-    ; The OS SEH unwinder restores rsp/rbp but does NOT pop this software shadow
-    ; stack, so an exception unwinding through framed procs leaves stale entries
-    ; above the live frame's.  Popping exactly one entry and demanding a match
-    ; then fastfails on the next perfectly legitimate return - the process dies
-    ; from having survived an exception, not from an attack.  (Vordr hit this
-    ; with the Windows GUI/CoreMessaging exceptions raised around its unlock
-    ; dialog; Myrkr runs framed worker-thread procs under a live GUI, which is
-    ; the same exposure.)
-    ;
-    ; So scan DOWN for THIS frame's return address: found -> resync, dropping
-    ; the stale entries above it; absent from the whole stack -> a genuine
-    ; return-address (ROP) violation.  rax/rdx/xmm0 carry return values here, so
-    ; the scan uses only r10/r11 - the registers this macro already clobbers.
-    ; Per-thread block, exactly as the prologue found it.  rcx carries it: it is
-    ; volatile and is not a return-value register, and the scan already needs
-    ; both r10 and r11.  A null slot means this thread never pushed, so there is
-    ; nothing to verify - that is the degrade path, not an error.
+    ; ---- pop + verify the software shadow stack (strict top-of-stack) -------
+    ; Every OS-entered callback (WndProc, subclass, hook, thread entry, VEH)
+    ; uses a raw frame, so SEH unwinding across OS boundaries never leaves
+    ; stale entries on this thread's shadow stack.  Popping strictly the top
+    ; entry catches ancestor-frame return-address pivots as well as arbitrary
+    ; ROP targets.  rax/rdx/xmm0 carry return values; only rcx/r10/r11 clobber.
     mov     r10d, dword ptr [g_sstk_tls]
     test    r10d, r10d
     jz      no_sstk
@@ -615,18 +603,15 @@ ok1:
     test    rcx, rcx
     jz      no_sstk
     mov     r11, qword ptr [rbp+8]              ; the return address to match
-    mov     r10, qword ptr [rcx]                ; this thread's index
-    shl     r10, 3                              ; index -> byte offset
-    add     r10, qword ptr [rcx+8]              ; -> one past the top entry
-sse_scan:
-    cmp     r10, qword ptr [rcx+8]
-    jbe     sse_fail                            ; hit the bottom -> not ours -> ROP
-    sub     r10, 8
-    cmp     r11, qword ptr [r10]
-    jne     sse_scan
-    sub     r10, qword ptr [rcx+8]              ; resync to just below the match
-    shr     r10, 3
+    mov     r10, qword ptr [rcx]                ; this thread's depth
+    test    r10, r10
+    jz      sse_fail                            ; underflow -> corruption
+    dec     r10
     mov     qword ptr [rcx], r10
+    shl     r10, 3                              ; index -> byte offset
+    add     r10, qword ptr [rcx+8]              ; -> top entry
+    cmp     r11, qword ptr [r10]
+    jne     sse_fail
 no_sstk:
     jmp     ok2
 sse_fail:

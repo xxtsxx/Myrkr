@@ -16,14 +16,21 @@ extern GetFileSizeEx:proc
 extern SetFilePointerEx:proc
 extern SetEndOfFile:proc
 extern CloseHandle:proc
-extern VirtualAlloc:proc
-extern VirtualFree:proc
+extern GetFileType:proc
+extern GetFileInformationByHandleEx:proc
+extern GetFinalPathNameByHandleW:proc
+extern FindFirstFileW:proc
+extern FindClose:proc
 extern MoveFileExW:proc
 extern DeleteFileW:proc
 extern GetDiskFreeSpaceExW:proc
 extern GetFileAttributesW:proc
 extern FlushFileBuffers:proc
 extern secure_zero:proc
+extern tagged_alloc:proc
+extern tagged_free:proc
+extern tagged_check:proc
+externdef g_allow_unc:dword             ; gui.asm: AllowUnc policy/setting (default 1)
 
 MOVEFILE_REPLACE_EXISTING equ 1
 MOVEFILE_WRITE_THROUGH    equ 8
@@ -37,23 +44,225 @@ OPEN_EXISTING       equ 3
 CREATE_ALWAYS       equ 2
 CREATE_NEW          equ 1
 FILE_ATTR_NORMAL    equ 80h
-MEM_COMMIT          equ 1000h
-MEM_RESERVE         equ 2000h
-MEM_RELEASE         equ 8000h
-PAGE_READWRITE      equ 04h
+FILE_FLAG_OPEN_RP   equ 00200000h        ; FILE_FLAG_OPEN_REPARSE_POINT
+FILE_ATTR_REPARSE_  equ 00000400h        ; FILE_ATTRIBUTE_REPARSE_POINT
+REPARSE_SURROGATE_  equ 20000000h        ; IsReparseTagNameSurrogate bit
+FILE_TYPE_DISK_     equ 1
+FILE_ATTR_TAG_INFO  equ 9                ; FileAttributeTagInfo
 IO_CHUNK            equ 1000000h         ; 16 MiB per ReadFile/WriteFile
 
 .data?
+align 8
+g_fvh_find  db 600 dup (?)               ; WIN32_FIND_DATAW (592 bytes)
 align 2
 g_dfdir     dw MAX_PATH_CHARS dup (?)    ; scratch: directory of a path
+g_fvh_final dw (MAX_PATH_CHARS + 16) dup (?)
 
 .code
+
+; =============================================================================
+; file_path_allowed(rcx = wide path) -> eax = 1 allowed / 0 refused.
+; Pre-CreateFileW gate:
+;   - rejects NULL / empty paths
+;   - blocks Win32 device namespaces ("\\.\" and "\\?\GLOBALROOT\...")
+;   - checks g_allow_unc on UNC paths ("\\server\..." and "\\?\UNC\...")
+;   - rejects NTFS Alternate Data Stream ':' colons past the drive letter
+; =============================================================================
+public file_path_allowed
+file_path_allowed proc
+    test    rcx, rcx
+    jz      fpa_no
+    cmp     word ptr [rcx], 0
+    je      fpa_no
+    mov     r10, rcx
+    movzx   eax, word ptr [r10]
+    cmp     ax, 5Ch
+    je      fpa_bs1
+    cmp     ax, '/'
+    jne     fpa_scan_ads
+fpa_bs1:
+    movzx   eax, word ptr [r10+2]
+    cmp     ax, 5Ch
+    je      fpa_bs2
+    cmp     ax, '/'
+    jne     fpa_scan_ads
+fpa_bs2:
+    ; starts with "\\" or "//"
+    movzx   eax, word ptr [r10+4]
+    cmp     ax, '.'
+    je      fpa_no                              ; "\\.\" device namespace -> refuse
+    cmp     ax, '?'
+    jne     fpa_unc                             ; "\\server\..." -> check g_allow_unc
+    movzx   eax, word ptr [r10+6]
+    cmp     ax, 5Ch
+    je      fpa_qbody
+    cmp     ax, '/'
+    jne     fpa_no
+fpa_qbody:
+    ; "\\?\" prefix: allow "\\?\X:\..." local drive; check "\\?\UNC\..."; refuse others
+    movzx   eax, word ptr [r10+8]
+    or      ax, 20h
+    cmp     ax, 'a'
+    jb      fpa_no
+    cmp     ax, 'z'
+    ja      fpa_no
+    cmp     word ptr [r10+10], ':'
+    je      fpa_qdrive
+    cmp     ax, 'u'
+    jne     fpa_no                              ; e.g. "\\?\GLOBALROOT\..." -> refuse
+    movzx   eax, word ptr [r10+10]
+    or      ax, 20h
+    cmp     ax, 'n'
+    jne     fpa_no
+    movzx   eax, word ptr [r10+12]
+    or      ax, 20h
+    cmp     ax, 'c'
+    jne     fpa_no
+    movzx   eax, word ptr [r10+14]
+    cmp     ax, 5Ch
+    je      fpa_unc
+    cmp     ax, '/'
+    je      fpa_unc
+    jmp     fpa_no
+fpa_qdrive:
+    movzx   eax, word ptr [r10+12]
+    cmp     ax, 5Ch
+    je      fpa_scan_ads
+    cmp     ax, '/'
+    je      fpa_scan_ads
+    jmp     fpa_no
+fpa_unc:
+    cmp     dword ptr [g_allow_unc], 0
+    je      fpa_no
+fpa_scan_ads:
+    ; Reject NTFS Alternate Data Stream ':' anywhere except index 1 ("X:...")
+    ; or index 5 on "\\?\X:..."
+    xor     r8d, r8d
+fpa_colon_lp:
+    movzx   eax, word ptr [r10 + r8*2]
+    test    ax, ax
+    jz      fpa_ok
+    cmp     ax, ':'
+    jne     fpa_colon_next
+    cmp     r8d, 1
+    je      fpa_colon_next
+    cmp     r8d, 5
+    jne     fpa_no
+    cmp     word ptr [r10], 5Ch
+    jne     fpa_no
+    cmp     word ptr [r10+4], '?'
+    jne     fpa_no
+fpa_colon_next:
+    inc     r8d
+    cmp     r8d, MAX_PATH_CHARS + 16
+    jb      fpa_colon_lp
+    jmp     fpa_no
+fpa_ok:
+    mov     eax, 1
+    ret
+fpa_no:
+    xor     eax, eax
+    ret
+file_path_allowed endp
+
+; file_leaf_surrogate(rcx = wide path) -> eax = 1 if path exists as a symlink,
+; junction, or mount point (name-surrogate reparse point); 0 otherwise (including
+; non-existent files and OneDrive cloud placeholders).
+file_leaf_surrogate proc frame
+    FRAME_PROLOG 48
+    mov     qword ptr [rbp-24], rcx
+    WINCALL GetFileAttributesW, rcx
+    cmp     eax, INVALID_FILE_ATTRIBUTES
+    je      fls_no
+    test    eax, FILE_ATTR_REPARSE_
+    jz      fls_no
+    WINCALL FindFirstFileW, qword ptr [rbp-24], addr g_fvh_find
+    cmp     rax, -1
+    je      fls_yes
+    mov     qword ptr [rbp-32], rax
+    WINCALL FindClose, qword ptr [rbp-32]
+    test    dword ptr [g_fvh_find+36], REPARSE_SURROGATE_
+    jz      fls_no
+fls_yes:
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+fls_no:
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+file_leaf_surrogate endp
+
+; =============================================================================
+; file_validate_handle(rcx = hFile) -> eax = 1 valid disk file / 0 refused.
+;   1. GetFileType(h) == FILE_TYPE_DISK (rejects pipes, CON, NUL, COM*, etc.)
+;   2. GetFileInformationByHandleEx(FileAttributeTagInfo): rejects name-surrogate
+;      reparse points while preserving OneDrive/cloud placeholder compatibility
+;   3. GetFinalPathNameByHandleW -> file_path_allowed (enforces g_allow_unc and
+;      ADS ':' rejection after resolving parent junctions / mapped drives)
+; =============================================================================
+public file_validate_handle
+file_validate_handle proc frame
+    FRAME_PROLOG 80
+    ; [rbp-24] = hFile, [rbp-40..-33] = FILE_ATTRIBUTE_TAG_INFO (8 bytes)
+    mov     qword ptr [rbp-24], rcx
+    WINCALL GetFileType, rcx
+    cmp     eax, FILE_TYPE_DISK_
+    jne     fvh_no
+    mov     qword ptr [rbp-40], 0
+    WINCALL GetFileInformationByHandleEx, qword ptr [rbp-24], FILE_ATTR_TAG_INFO, addr rbp-40, 8
+    test    eax, eax
+    jz      fvh_final
+    test    dword ptr [rbp-40], FILE_ATTR_REPARSE_
+    jz      fvh_final
+    test    dword ptr [rbp-36], REPARSE_SURROGATE_
+    jnz     fvh_no
+fvh_final:
+    WINCALL GetFinalPathNameByHandleW, qword ptr [rbp-24], addr g_fvh_final, <MAX_PATH_CHARS + 16>, 0
+    test    eax, eax
+    jz      fvh_no
+    cmp     eax, MAX_PATH_CHARS + 16
+    jae     fvh_no
+    lea     rcx, [g_fvh_final]
+    call    file_path_allowed
+    test    eax, eax
+    jz      fvh_no
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+fvh_no:
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+file_validate_handle endp
 
 ; Keep the source immutable to other writers while allowing our atomic rename.
 public file_open_rewrite_source
 file_open_rewrite_source proc frame
-    FRAME_PROLOG 64
-    WINCALL CreateFileW, rcx, 0C0000000h, 5, 0, OPEN_EXISTING, FILE_ATTR_NORMAL, 0
+    FRAME_PROLOG 80
+    mov     qword ptr [rbp-24], rcx
+    call    file_path_allowed
+    test    eax, eax
+    jz      fors_bad
+    mov     rcx, qword ptr [rbp-24]
+    call    file_leaf_surrogate
+    test    eax, eax
+    jnz     fors_bad
+    WINCALL CreateFileW, qword ptr [rbp-24], 0C0000000h, 5, 0, OPEN_EXISTING, FILE_ATTR_NORMAL, 0
+    cmp     rax, -1
+    je      fors_done
+    mov     qword ptr [rbp-32], rax
+    mov     rcx, rax
+    call    file_validate_handle
+    test    eax, eax
+    jz      fors_close
+    mov     rax, qword ptr [rbp-32]
+    jmp     fors_done
+fors_close:
+    WINCALL CloseHandle, qword ptr [rbp-32]
+fors_bad:
+    mov     rax, -1
+fors_done:
     FRAME_EPILOG
     ret
 file_open_rewrite_source endp
@@ -120,7 +329,7 @@ mem_alloc proc frame
     xIFZ rcx
         mov     rcx, 1                   ; never request 0 bytes
     xENDIF
-    WINCALL VirtualAlloc, 0, rcx, <MEM_RESERVE or MEM_COMMIT>, PAGE_READWRITE
+    call    tagged_alloc
     FRAME_EPILOG
     ret
 mem_alloc endp
@@ -131,10 +340,20 @@ mem_free proc frame
     FRAME_PROLOG 48
     xIFT rcx                             ; ptr != 0
         mov     qword ptr [rbp-24], rcx
-        xIFT rdx                         ; len != 0 -> wipe before release
-            call    secure_zero          ; (rcx=ptr, rdx=len)
+        mov     qword ptr [rbp-32], rdx
+        call    tagged_check             ; verify header + canaries; returns rax = blksize
+        mov     rcx, qword ptr [rbp-24]
+        mov     rdx, qword ptr [rbp-32]
+        xIFT rdx                         ; touched len != 0 -> clamp & wipe
+            cmp     rdx, rax
+            jbe     mf_wipe
+            mov     rdx, rax
+mf_wipe:
+            call    secure_zero          ; wipe only touched pages (keeps PeakWS bounded)
         xENDIF
-        WINCALL VirtualFree, qword ptr [rbp-24], 0, MEM_RELEASE
+        mov     rcx, qword ptr [rbp-24]
+        xor     edx, edx                 ; already wiped touched prefix above
+        call    tagged_free
     xENDIF
     FRAME_EPILOG
     ret
@@ -145,20 +364,34 @@ mem_free endp
 ; =============================================================================
 public read_file
 read_file proc frame
-    FRAME_PROLOG 128                    ; 128 (alloc 144), not 96: the 7-arg
-                                        ; CreateFileW's outgoing area reached the
-                                        ; local at [rbp-80]
+    FRAME_PROLOG 144                    ; 144 (alloc 160): leaves [rbp-88] clear
+                                        ; of 7-arg CreateFileW's outgoing area
     ; [rbp-24]=outbuf* [rbp-32]=outsize* [rbp-40]=handle
     ; [rbp-48]=filesize [rbp-56]=buf [rbp-64]=cursor [rbp-72]=remaining
+    ; [rbp-88]=wpath
+    mov     qword ptr [rbp-88], rcx
     mov     qword ptr [rbp-24], rdx
     mov     qword ptr [rbp-32], r8
 
-    WINCALL CreateFileW, rcx, GENERIC_READ, FILE_SHARE_READ, 0, OPEN_EXISTING, FILE_ATTR_NORMAL, 0
+    call    file_path_allowed
+    test    eax, eax
+    jz      rf_io
+    mov     rcx, qword ptr [rbp-88]
+    call    file_leaf_surrogate
+    test    eax, eax
+    jnz     rf_io
+
+    WINCALL CreateFileW, qword ptr [rbp-88], GENERIC_READ, FILE_SHARE_READ, 0, OPEN_EXISTING, FILE_ATTR_NORMAL, 0
     cmp     rax, -1
     je      rf_io
     mov     qword ptr [rbp-40], rax
 
-    WINCALL GetFileSizeEx, rax, addr rbp-48
+    mov     rcx, rax
+    call    file_validate_handle
+    test    eax, eax
+    jz      rf_io_close
+
+    WINCALL GetFileSizeEx, qword ptr [rbp-40], addr rbp-48
     test    eax, eax
     jz      rf_io_close
 
@@ -224,8 +457,30 @@ read_file endp
 ; file_open_read(rcx = wpath) -> rax = handle (or INVALID_HANDLE_VALUE = -1)
 public file_open_read
 file_open_read proc frame
-    FRAME_PROLOG 64
-    WINCALL CreateFileW, rcx, GENERIC_READ, FILE_SHARE_READ, 0, OPEN_EXISTING, FILE_ATTR_NORMAL, 0
+    FRAME_PROLOG 80
+    mov     qword ptr [rbp-24], rcx
+    call    file_path_allowed
+    test    eax, eax
+    jz      for_bad
+    mov     rcx, qword ptr [rbp-24]
+    call    file_leaf_surrogate
+    test    eax, eax
+    jnz     for_bad
+    WINCALL CreateFileW, qword ptr [rbp-24], GENERIC_READ, FILE_SHARE_READ, 0, OPEN_EXISTING, FILE_ATTR_NORMAL, 0
+    cmp     rax, -1
+    je      for_done
+    mov     qword ptr [rbp-32], rax
+    mov     rcx, rax
+    call    file_validate_handle
+    test    eax, eax
+    jz      for_close
+    mov     rax, qword ptr [rbp-32]
+    jmp     for_done
+for_close:
+    WINCALL CloseHandle, qword ptr [rbp-32]
+for_bad:
+    mov     rax, -1
+for_done:
     FRAME_EPILOG
     ret
 file_open_read endp
@@ -233,8 +488,30 @@ file_open_read endp
 ; file_open_write(rcx = wpath) -> rax = handle (or -1)
 public file_open_write
 file_open_write proc frame
-    FRAME_PROLOG 64
-    WINCALL CreateFileW, rcx, GENERIC_WRITE, 0, 0, CREATE_ALWAYS, FILE_ATTR_NORMAL, 0
+    FRAME_PROLOG 80
+    mov     qword ptr [rbp-24], rcx
+    call    file_path_allowed
+    test    eax, eax
+    jz      fow_bad
+    mov     rcx, qword ptr [rbp-24]
+    call    file_leaf_surrogate
+    test    eax, eax
+    jnz     fow_bad
+    WINCALL CreateFileW, qword ptr [rbp-24], GENERIC_WRITE, 0, 0, CREATE_ALWAYS, FILE_ATTR_NORMAL, 0
+    cmp     rax, -1
+    je      fow_done
+    mov     qword ptr [rbp-32], rax
+    mov     rcx, rax
+    call    file_validate_handle
+    test    eax, eax
+    jz      fow_close
+    mov     rax, qword ptr [rbp-32]
+    jmp     fow_done
+fow_close:
+    WINCALL CloseHandle, qword ptr [rbp-32]
+fow_bad:
+    mov     rax, -1
+fow_done:
     FRAME_EPILOG
     ret
 file_open_write endp
@@ -247,8 +524,30 @@ file_open_write endp
 ; rather than written through.
 public file_open_new
 file_open_new proc frame
-    FRAME_PROLOG 64
-    WINCALL CreateFileW, rcx, GENERIC_WRITE, 0, 0, CREATE_NEW, FILE_ATTR_NORMAL, 0
+    FRAME_PROLOG 80
+    mov     qword ptr [rbp-24], rcx
+    call    file_path_allowed
+    test    eax, eax
+    jz      fon_bad
+    mov     rcx, qword ptr [rbp-24]
+    call    file_leaf_surrogate
+    test    eax, eax
+    jnz     fon_bad
+    WINCALL CreateFileW, qword ptr [rbp-24], GENERIC_WRITE, 0, 0, CREATE_NEW, <FILE_ATTR_NORMAL or FILE_FLAG_OPEN_RP>, 0
+    cmp     rax, -1
+    je      fon_done
+    mov     qword ptr [rbp-32], rax
+    mov     rcx, rax
+    call    file_validate_handle
+    test    eax, eax
+    jz      fon_close
+    mov     rax, qword ptr [rbp-32]
+    jmp     fon_done
+fon_close:
+    WINCALL CloseHandle, qword ptr [rbp-32]
+fon_bad:
+    mov     rax, -1
+fon_done:
     FRAME_EPILOG
     ret
 file_open_new endp
@@ -342,8 +641,30 @@ file_read_at endp
 ; =============================================================================
 public file_open_rw
 file_open_rw proc frame
-    FRAME_PROLOG 64
-    WINCALL CreateFileW, rcx, <GENERIC_READ or GENERIC_WRITE>, 0, 0, OPEN_EXISTING, FILE_ATTR_NORMAL, 0
+    FRAME_PROLOG 80
+    mov     qword ptr [rbp-24], rcx
+    call    file_path_allowed
+    test    eax, eax
+    jz      forw_bad
+    mov     rcx, qword ptr [rbp-24]
+    call    file_leaf_surrogate
+    test    eax, eax
+    jnz     forw_bad
+    WINCALL CreateFileW, qword ptr [rbp-24], <GENERIC_READ or GENERIC_WRITE>, 0, 0, OPEN_EXISTING, FILE_ATTR_NORMAL, 0
+    cmp     rax, -1
+    je      forw_done
+    mov     qword ptr [rbp-32], rax
+    mov     rcx, rax
+    call    file_validate_handle
+    test    eax, eax
+    jz      forw_close
+    mov     rax, qword ptr [rbp-32]
+    jmp     forw_done
+forw_close:
+    WINCALL CloseHandle, qword ptr [rbp-32]
+forw_bad:
+    mov     rax, -1
+forw_done:
     FRAME_EPILOG
     ret
 file_open_rw endp
@@ -451,17 +772,36 @@ file_rename proc frame
     ; file extraction into a fresh folder many times slower.
     mov     qword ptr [rbp-24], rcx
     mov     qword ptr [rbp-32], rdx
-    WINCALL GetFileAttributesW, rdx
+    call    file_path_allowed
+    test    eax, eax
+    jz      frn_io
+    mov     rcx, qword ptr [rbp-32]
+    call    file_path_allowed
+    test    eax, eax
+    jz      frn_io
+    mov     rcx, qword ptr [rbp-24]
+    call    file_leaf_surrogate
+    test    eax, eax
+    jnz     frn_io
+    WINCALL GetFileAttributesW, qword ptr [rbp-32]
     cmp     eax, INVALID_FILE_ATTRIBUTES
     je      frn_plain
     ; Best effort: a source somebody holds without sharing write cannot be
     ; reopened, and then only the write-through rename is had.
-    WINCALL CreateFileW, qword ptr [rbp-24], GENERIC_WRITE, FILE_SHARE_ALL, 0, OPEN_EXISTING, FILE_ATTR_NORMAL, 0
+    WINCALL CreateFileW, qword ptr [rbp-24], GENERIC_WRITE, FILE_SHARE_ALL, 0, OPEN_EXISTING, <FILE_ATTR_NORMAL or FILE_FLAG_OPEN_RP>, 0
     cmp     rax, -1
     je      frn_through
     mov     qword ptr [rbp-40], rax
+    mov     rcx, rax
+    call    file_validate_handle
+    test    eax, eax
+    jz      frn_close_bad
     WINCALL FlushFileBuffers, qword ptr [rbp-40]
     WINCALL CloseHandle, qword ptr [rbp-40]
+    jmp     frn_through
+frn_close_bad:
+    WINCALL CloseHandle, qword ptr [rbp-40]
+    jmp     frn_io
 frn_through:
     WINCALL MoveFileExW, qword ptr [rbp-24], qword ptr [rbp-32], <MOVEFILE_REPLACE_EXISTING or MOVEFILE_WRITE_THROUGH>
     jmp     frn_check

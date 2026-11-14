@@ -88,10 +88,23 @@ ROUND macro s0,s1,s2,s3,s4,s5,s6,s7,s8,s9,s10,s11,s12,s13,s14,s15
 endm
 
 ; =============================================================================
-; blake2b_init(rcx = ctx, edx = outlen)
+; blake2b_init(rcx = ctx, edx = outlen) -> eax = 0 ok, 1 invalid outlen
 ; =============================================================================
 public blake2b_init
 blake2b_init proc
+    mov     r10d, 1
+    test    edx, edx
+    jnz     @F
+    mov     edx, 64                          ; clamp invalid 0 to 64 and flag error
+    jmp     b2i_set
+@@:
+    cmp     edx, 64
+    jbe     b2i_ok
+    mov     edx, 64                          ; clamp >64 to 64 and flag error
+    jmp     b2i_set
+b2i_ok:
+    xor     r10d, r10d
+b2i_set:
     ; h = IV
     movdqu  xmm0, xmmword ptr [b2b_iv+0]
     movdqu  xmmword ptr [rcx].BLAKE2B_CTX.h+0, xmm0
@@ -101,6 +114,7 @@ blake2b_init proc
     movdqu  xmmword ptr [rcx].BLAKE2B_CTX.h+32, xmm0
     movdqu  xmm0, xmmword ptr [b2b_iv+48]
     movdqu  xmmword ptr [rcx].BLAKE2B_CTX.h+48, xmm0
+    pxor    xmm0, xmm0
     ; h[0] ^= 0x01010000 | outlen   (fanout=1, depth=1, no key)
     mov     eax, edx
     and     eax, 0FFh
@@ -112,6 +126,7 @@ blake2b_init proc
     mov     qword ptr [rcx].BLAKE2B_CTX.t+8, 0
     mov     dword ptr [rcx].BLAKE2B_CTX.buflen, 0
     mov     dword ptr [rcx].BLAKE2B_CTX.outlen, edx
+    mov     eax, r10d
     ret
 blake2b_init endp
 
@@ -179,6 +194,20 @@ blake2b_compress proc frame
     FF 5
     FF 6
     FF 7
+
+    ; wipe 128-byte working state v[0..15] from stack
+    pxor    xmm0, xmm0
+    movdqu  xmmword ptr [r13+0],   xmm0
+    movdqu  xmmword ptr [r13+16],  xmm0
+    movdqu  xmmword ptr [r13+32],  xmm0
+    movdqu  xmmword ptr [r13+48],  xmm0
+    movdqu  xmmword ptr [r13+64],  xmm0
+    movdqu  xmmword ptr [r13+80],  xmm0
+    movdqu  xmmword ptr [r13+96],  xmm0
+    movdqu  xmmword ptr [r13+112], xmm0
+    xor     eax, eax
+    xor     r10d, r10d
+    xor     r11d, r11d
 
     mov     r13, qword ptr [rbp-16]
     mov     r14, qword ptr [rbp-24]
@@ -315,6 +344,9 @@ blake2b_long proc frame
     ;  [rbp-56] ctx ptr  [rbp-64] pos  [rbp-72] remaining
     ;  ctx at [rsp+32], Vbuf (64) at [rsp+32+CTX]
     mov     qword ptr [rbp-24], rcx
+    mov     edx, edx                     ; zero-extend 32-bit outlen to 64-bit
+    test    edx, edx
+    jz      bl_early_out
     mov     qword ptr [rbp-32], rdx
     mov     qword ptr [rbp-40], r8
     mov     qword ptr [rbp-48], r9
@@ -413,6 +445,9 @@ bl_done:
     lea     rcx, [rsp+32]
     mov     edx, BLAKE2B_CTX_SIZE + 64
     call    secure_zero
+    mov     qword ptr [rbp-88], 0
+    pxor    xmm0, xmm0
+bl_early_out:
     FRAME_EPILOG
     ret
 blake2b_long endp

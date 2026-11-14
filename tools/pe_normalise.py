@@ -87,9 +87,33 @@ def normalise(path):
             s = sect + i * 40
             va, vsz = _u32(b, s + 12), _u32(b, s + 8)
             raw, rawsz = _u32(b, s + 20), _u32(b, s + 16)
-            if va <= rva < va + max(vsz, rawsz):
+            span = min(vsz, rawsz) if vsz else rawsz
+            if va <= rva < va + span:
                 return raw + (rva - va)
         return None
+
+    # --- LOAD_CONFIG verification + TimeDateStamp (.exe images) ------------
+    # myrkr.exe links loadcfg.obj with DependentLoadFlags = 0x0800
+    # (LOAD_LIBRARY_SEARCH_SYSTEM32); myrkrshell.dll is a DLL (0x2000) and
+    # intentionally omits loadcfg.obj.
+    coff_chars = _u16(b, pe + 22)
+    if not (coff_chars & 0x2000):
+        if nddir <= 10:
+            raise ValueError("exe image missing LOAD_CONFIG directory slot")
+        lcfg_rva, lcfg_size = _u32(b, ddir + 10 * 8), _u32(b, ddir + 10 * 8 + 4)
+        if not lcfg_rva or lcfg_size < 0x50:
+            raise ValueError("exe image missing _load_config_used (RVA=0x%X size=0x%X)" % (lcfg_rva, lcfg_size))
+        lo = rva_to_off(lcfg_rva)
+        if lo is None or lo + 0x50 > len(b):
+            raise ValueError("LOAD_CONFIG RVA 0x%X outside raw section data" % lcfg_rva)
+        if _u32(b, lo) < 0x50:
+            raise ValueError("LOAD_CONFIG.Size 0x%X does not cover DependentLoadFlags" % _u32(b, lo))
+        if _u32(b, lo + 4) != 0:
+            struct.pack_into("<I", b, lo + 4, 0)
+            changed += 1
+        dep_flags = _u16(b, lo + 0x4E)  # DependentLoadFlags in IMAGE_LOAD_CONFIG_DIRECTORY64
+        if dep_flags != 0x0800:
+            raise ValueError("LOAD_CONFIG.DependentLoadFlags = 0x%04X (expected 0x0800)" % dep_flags)
 
     # --- the EXPORT directory's own TimeDateStamp --------------------------
     # An exe has no exports, which is why myrkr.exe reproduced while

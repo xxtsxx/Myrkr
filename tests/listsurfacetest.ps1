@@ -47,8 +47,10 @@ public static class ListSurface {
 }
 '@
 $p = $null
+$oldAllowCap = $env:MYRKR_DBG_ALLOWCAPTURE
 $work = Join-Path ([IO.Path]::GetTempPath()) ('myrkr-list-surface-' + [guid]::NewGuid())
 try {
+    $env:MYRKR_DBG_ALLOWCAPTURE = '1'
     [void](New-Item -ItemType Directory -Path $work)
     $seed = Join-Path $work 'seed'
     [void](New-Item -ItemType Directory -Path $seed)
@@ -94,6 +96,7 @@ try {
         $p.Kill(); $p.WaitForExit(); $p = $null
     }
 } finally {
+    if ($null -eq $oldAllowCap) { Remove-Item Env:\MYRKR_DBG_ALLOWCAPTURE -ErrorAction SilentlyContinue } else { $env:MYRKR_DBG_ALLOWCAPTURE = $oldAllowCap }
     if ($p -and -not $p.HasExited) { $p.Kill(); $p.WaitForExit() }
     $target = [IO.Path]::GetFullPath($work)
     $tempRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath())

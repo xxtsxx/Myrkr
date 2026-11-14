@@ -66,6 +66,7 @@ function Stop-Myrkr { Get-Process myrkr -EA SilentlyContinue | ForEach-Object { 
 function Entries($z) { $a=[IO.Compression.ZipFile]::OpenRead($z); $n=@($a.Entries|ForEach-Object{$_.FullName}); $a.Dispose(); return $n }
 
 function Open-Zip($path) {
+  $env:MYRKR_DBG_ALLOWCAPTURE = "1"
   $p = Start-Process $exe -ArgumentList @("`"$path`"") -PassThru
   $m=[IntPtr]::Zero
   for($i=0;$i -lt 80 -and $m -eq [IntPtr]::Zero;$i++){ Start-Sleep -Milliseconds 250; $m=[L]::Find([uint32]$p.Id,"myrkr_window") }
@@ -148,6 +149,7 @@ Stop-Myrkr
 # builds dbg and used to leave it there), and the exit code says what happened
 # (a $fail++ that only printed gave this script exit 0 in the suite runner).
 function Finish([int]$code) {
+  Remove-Item Env:\MYRKR_DBG_ALLOWCAPTURE -EA SilentlyContinue
   "=== Restore: shipping build ==="
   $blog = cmd /c "$root\build.cmd strict release" 2>&1
   if (($blog -join "`n") -notmatch "BUILD OK") { "  FAIL could not restore the release build"; if ($code -eq 0) { $code = 1 } }

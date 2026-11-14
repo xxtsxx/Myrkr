@@ -28,10 +28,15 @@ include macros.inc
 extern CreateFileW:proc
 extern WriteFile:proc
 extern CloseHandle:proc
-extern GetEnvironmentVariableW:proc
+extern OpenProcessToken:proc
+extern GetUserProfileDirectoryW:proc
 extern CreateDirectoryW:proc
 extern GetLocalTime:proc
 extern WideCharToMultiByte:proc
+extern normalize_path:proc
+extern file_path_allowed:proc
+extern file_leaf_surrogate:proc
+extern file_validate_handle:proc
 
 externdef g_cfg_loglevel:dword
 externdef g_cfg_logfile:qword
@@ -48,11 +53,12 @@ FILE_APPEND_DATA     equ 4
 FILE_SHARE_RW        equ 3            ; FILE_SHARE_READ | FILE_SHARE_WRITE
 OPEN_ALWAYS          equ 4
 FILE_ATTR_NORMAL     equ 80h
+FILE_FLAG_OPEN_RP    equ 00200000h    ; FILE_FLAG_OPEN_REPARSE_POINT
 INVALID              equ -1
 LINELEN              equ 16384        ; one log line, UTF-8 bytes
 
 .const
-WSTR w_localappdata, <LOCALAPPDATA>
+WSTR w_appdatalocal, <\AppData\Local>
 WSTR w_subdir,       <\Myrkr>
 WSTR w_logname,      <\myrkr.log>
 
@@ -79,7 +85,9 @@ CSTR sep_crlf,   13,10
 .data?
 align 16
 g_logline   db LINELEN dup (?)        ; assembled UTF-8 line
-g_logpath   dw 1024 dup (?)           ; resolved default log path
+align 2
+g_logpath   dw MAX_PATH_CHARS dup (?) ; resolved default log path
+g_logio     dw MAX_PATH_CHARS dup (?) ; normalized path for log_open
 g_systime   db 16 dup (?)             ; SYSTEMTIME
 g_logwrote  dd ?
 
@@ -110,6 +118,15 @@ log_putn endp
 ; log_puta(rcx = dst, rdx = src, r8 = len) -> rax = dst+len.  Byte copy.  Leaf.
 ; -----------------------------------------------------------------------------
 log_puta proc
+    ; Clamp to the end of g_logline so trailing separators after a long path
+    ; can never spill past LINELEN into adjacent .data? globals.
+    lea     rax, [g_logline + LINELEN]
+    sub     rax, rcx                    ; remaining bytes (signed)
+    jle     pa_done                     ; at/past the end -> write nothing
+    cmp     r8, rax
+    jbe     pa_have
+    mov     r8, rax                     ; clamp copy length to space left
+pa_have:
     test    r8, r8
     jz      pa_done
 pa_l:
@@ -143,7 +160,7 @@ log_wapp endp
 
 ; -----------------------------------------------------------------------------
 ; log_putw(rcx = dst, rdx = wideZ src) -> rax = new dst.  Appends src as UTF-8,
-; bounded by the end of g_logline.  On failure leaves dst unchanged.
+; bounded by the end of g_logline, scrubbing C0/DEL controls to '?'.
 ; -----------------------------------------------------------------------------
 log_putw proc frame
     FRAME_PROLOG 128
@@ -159,6 +176,21 @@ log_putw proc frame
     jz      pw_none
     dec     eax                         ; drop the NUL from the byte count
     mov     rcx, qword ptr [rbp-24]
+    xor     r8d, r8d
+pw_scrub:
+    cmp     r8d, eax
+    jae     pw_done
+    movzx   edx, byte ptr [rcx+r8]
+    cmp     edx, 20h                    ; scrub CR/LF and C0 controls (log-injection guard)
+    jb      pw_qmark
+    cmp     edx, 7Fh
+    jne     pw_next
+pw_qmark:
+    mov     byte ptr [rcx+r8], '?'
+pw_next:
+    inc     r8d
+    jmp     pw_scrub
+pw_done:
     add     rcx, rax
     mov     rax, rcx
     FRAME_EPILOG
@@ -268,41 +300,89 @@ log_result_text endp
 
 ; -----------------------------------------------------------------------------
 ; log_open() -> rax = file handle (append mode) or INVALID.
-; Uses g_cfg_logfile if set, else %LOCALAPPDATA%\Myrkr\myrkr.log (creating the
-; Myrkr directory if needed).
+; Uses g_cfg_logfile if set, else <UserProfile>\AppData\Local\Myrkr\myrkr.log
+; resolved from the process token (ignoring mutable %LOCALAPPDATA%).
+; Refuses device paths, ADS, surrogate reparse points, and non-disk handles.
 ; -----------------------------------------------------------------------------
 log_open proc frame
-    FRAME_PROLOG 128
-    ; [rbp-24]=saved cursor  [rbp-32]=path ptr
+    FRAME_PROLOG 144
+    ; [rbp-24]=saved cursor  [rbp-32]=path ptr  [rbp-40]=handle
+    ; [rbp-48]=token handle  [rbp-56]=cchProfile  [rbp-60]=ok
     mov     rax, qword ptr [g_cfg_logfile]
     test    rax, rax
     jz      lo_default
     mov     qword ptr [rbp-32], rax
     jmp     lo_open
 lo_default:
-    WINCALL GetEnvironmentVariableW, addr w_localappdata, addr g_logpath, 1024
+    mov     qword ptr [rbp-48], 0
+    WINCALL OpenProcessToken, -1, 8, addr rbp-48    ; GetCurrentProcess()=-1, TOKEN_QUERY=8
     test    eax, eax
     jz      lo_fail
-    mov     ecx, eax                    ; dir length (chars)
+    mov     dword ptr [rbp-56], MAX_PATH_CHARS-64
+    WINCALL GetUserProfileDirectoryW, qword ptr [rbp-48], addr g_logpath, addr rbp-56
+    mov     dword ptr [rbp-60], eax
+    WINCALL CloseHandle, qword ptr [rbp-48]
+    cmp     dword ptr [rbp-60], 0
+    je      lo_fail
+    ; Measure profile length safely inside g_logpath
     lea     rdx, [g_logpath]
-    lea     rdx, [rdx + rcx*2]          ; cursor at the NUL
-    mov     rcx, rdx
+    xor     ecx, ecx
+lo_plen:
+    cmp     word ptr [rdx + rcx*2], 0
+    je      lo_phave
+    inc     ecx
+    cmp     ecx, MAX_PATH_CHARS-64
+    jb      lo_plen
+    jmp     lo_fail
+lo_phave:
+    test    ecx, ecx
+    jz      lo_fail
+    lea     rcx, [rdx + rcx*2]
+    cmp     word ptr [rcx-2], 5Ch
+    jne     @F
+    sub     rcx, 2                              ; strip trailing '\' if any
+@@: lea     rdx, [w_appdatalocal]
+    call    log_wapp                            ; append "\AppData\Local"
     lea     rdx, [w_subdir]
-    call    log_wapp                    ; append "\Myrkr"
+    mov     rcx, rax
+    call    log_wapp                            ; append "\Myrkr"
     mov     word ptr [rax], 0
     mov     qword ptr [rbp-24], rax
-    WINCALL CreateDirectoryW, addr g_logpath, 0     ; ignore result (may exist)
+    WINCALL CreateDirectoryW, addr g_logpath, 0 ; ignore result (may exist)
     mov     rcx, qword ptr [rbp-24]
     lea     rdx, [w_logname]
-    call    log_wapp                    ; append "\myrkr.log"
+    call    log_wapp                            ; append "\myrkr.log"
     mov     word ptr [rax], 0
     lea     rax, [g_logpath]
     mov     qword ptr [rbp-32], rax
 lo_open:
-    WINCALL CreateFileW, qword ptr [rbp-32], FILE_APPEND_DATA, FILE_SHARE_RW, 0, \
-            OPEN_ALWAYS, FILE_ATTR_NORMAL, 0
+    mov     rcx, qword ptr [rbp-32]
+    lea     rdx, [g_logio]
+    call    normalize_path
+    test    eax, eax
+    jnz     lo_fail
+    lea     rcx, [g_logio]
+    call    file_path_allowed
+    test    eax, eax
+    jz      lo_fail
+    lea     rcx, [g_logio]
+    call    file_leaf_surrogate
+    test    eax, eax
+    jnz     lo_fail
+    WINCALL CreateFileW, addr g_logio, FILE_APPEND_DATA, FILE_SHARE_RW, 0, \
+            OPEN_ALWAYS, <FILE_ATTR_NORMAL or FILE_FLAG_OPEN_RP>, 0
+    cmp     rax, INVALID
+    je      lo_fail
+    mov     qword ptr [rbp-40], rax
+    mov     rcx, rax
+    call    file_validate_handle
+    test    eax, eax
+    jz      lo_badtype
+    mov     rax, qword ptr [rbp-40]
     FRAME_EPILOG
     ret
+lo_badtype:
+    WINCALL CloseHandle, qword ptr [rbp-40]
 lo_fail:
     mov     rax, INVALID
     FRAME_EPILOG

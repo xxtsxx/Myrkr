@@ -153,12 +153,18 @@ g_zrel      db 4096 dup (?)
 g_zrellen   dq ?
 g_zchildu8  db 1024 dup (?)
 zip_salt    db 16 dup (?)
+public zip_keys
 zip_keys    db 72 dup (?)
+public zip_rk
 zip_rk      db 240 dup (?)
 zip_ctr     db 16 dup (?)
+public zip_ipad
 zip_ipad    db 64 dup (?)
+public zip_opad
 zip_opad    db 64 dup (?)
+public zip_sctx
 zip_sctx    db SHA1_CTX_SIZE dup (?)
+public zip_inner
 zip_inner   db 20 dup (?)
 zip_mac     db 20 dup (?)
 zip_fhdr    db 64 dup (?)
@@ -352,6 +358,8 @@ zef_sizes:
     mov     rdx, 32
     lea     r8, [zip_rk]
     call    aes_expand_key
+    test    eax, eax
+    jz      zef_err
     jmp     zef_crc_done
 zef_plain_crc:
     ; unencrypted entry: ZIP authenticates with a real CRC-32 of the *uncompressed*

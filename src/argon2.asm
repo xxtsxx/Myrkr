@@ -19,6 +19,8 @@ extern VirtualAlloc:proc
 extern VirtualFree:proc
 extern VirtualLock:proc                 ; best-effort pin of the final block
 extern VirtualUnlock:proc
+extern secmem_register_range:proc
+extern secmem_unregister_range:proc
 
 MEM_COMMIT      equ 1000h
 MEM_RESERVE     equ 2000h
@@ -117,8 +119,10 @@ endm
 ; argon2_p(rcx = ptr to 16 contiguous qwords) - BLAKE2 P permutation
 ; Leaf; uses rsi (saved).
 ; =============================================================================
-argon2_p proc
+argon2_p proc frame
     push    rsi
+    .pushreg rsi
+    .endprolog
     mov     rsi, rcx
     GBM 0,4,8,12
     GBM 1,5,9,13
@@ -243,6 +247,12 @@ ac_store:
     add     rax, 16
     cmp     rax, 1024
     jb      ac_fin
+
+    lea     rcx, [rsp+RB]
+    mov     edx, 2176
+    call    secure_zero
+    pxor    xmm0, xmm0
+    pxor    xmm1, xmm1
 
     mov     r12, qword ptr [rsp+S12]
     mov     r13, qword ptr [rsp+S13]
@@ -474,6 +484,16 @@ cs_store:
     cmp     rax, 1024
     jb      cs_fin
 
+    lea     rcx, [rsp+SR]
+    mov     edx, 2048
+    call    secure_zero
+    pxor    xmm0, xmm0
+    pxor    xmm1, xmm1
+    pxor    xmm2, xmm2
+    pxor    xmm3, xmm3
+    pxor    xmm4, xmm4
+    pxor    xmm5, xmm5
+
     lea     r11, [rsp+SX6]
     movdqu  xmm6,  xmmword ptr [r11+0]
     movdqu  xmm7,  xmmword ptr [r11+16]
@@ -669,6 +689,15 @@ av_store:
     jb      av_fin
 
     vzeroupper
+    lea     rcx, [rsp+AR]
+    mov     edx, 2048
+    call    secure_zero
+    pxor    xmm0, xmm0
+    pxor    xmm1, xmm1
+    pxor    xmm2, xmm2
+    pxor    xmm3, xmm3
+    pxor    xmm4, xmm4
+    pxor    xmm5, xmm5
     lea     r11, [rsp+AX6]
     movdqu  xmm6,  xmmword ptr [r11+0]
     movdqu  xmm7,  xmmword ptr [r11+16]
@@ -706,14 +735,18 @@ g_refidx  dq 0
 
 .data?
 align 16
+public g_b2bctx
 g_b2bctx  db 256 dup (?)
+public g_hbuf
 g_hbuf    db 80 dup (?)   ; H0(64) || LE32(blk) || LE32(lane)
 align 8
 g_lastblk dq ?            ; B[0][q-1]: pinned while the KDF runs
 g_lastlk  dd ?            ; 1 = that VirtualLock succeeded
 g_le4     db 8 dup (?)
 align 16
+public g_inp
 g_inp     db 1024 dup (?)
+public g_addr
 g_addr    db 1024 dup (?)
 g_zero    db 1024 dup (?) ; stays zero (BSS, never written)
 
@@ -770,6 +803,46 @@ argon2id_hash proc frame
     mov     qword ptr [rbp-32], r12
     mov     qword ptr [rbp-40], r13
     mov     qword ptr [rbp-48], r15
+
+    ; ---- RFC 9106 parameter validation (prevents #DE on lanes=0 / q=0) -----
+    test    rcx, rcx
+    jz      a2_badparam
+    cmp     qword ptr [rcx].ARGON2REQ.outp, 0
+    je      a2_badparam
+    cmp     dword ptr [rcx].ARGON2REQ.atype, 2      ; Argon2id ONLY
+    jne     a2_badparam
+    cmp     dword ptr [rcx].ARGON2REQ.version, 13h  ; RFC 9106 v1.3 ONLY
+    jne     a2_badparam
+    cmp     dword ptr [rcx].ARGON2REQ.saltlen, 8    ; RFC 9106 min salt = 8 bytes
+    jb      a2_badparam
+    cmp     qword ptr [rcx].ARGON2REQ.salt, 0
+    je      a2_badparam
+    cmp     dword ptr [rcx].ARGON2REQ.pwdlen, 0
+    je      @F
+    cmp     qword ptr [rcx].ARGON2REQ.pwd, 0
+    je      a2_badparam
+@@: cmp     dword ptr [rcx].ARGON2REQ.secretlen, 0
+    je      @F
+    cmp     qword ptr [rcx].ARGON2REQ.secret, 0
+    je      a2_badparam
+@@: cmp     dword ptr [rcx].ARGON2REQ.adlen, 0
+    je      @F
+    cmp     qword ptr [rcx].ARGON2REQ.ad, 0
+    je      a2_badparam
+@@: mov     eax, dword ptr [rcx].ARGON2REQ.lanes
+    test    eax, eax
+    jz      a2_badparam
+    cmp     eax, 0FFFFFFh
+    ja      a2_badparam
+    cmp     dword ptr [rcx].ARGON2REQ.t_cost, 1
+    jb      a2_badparam
+    cmp     dword ptr [rcx].ARGON2REQ.outlen, 4
+    jb      a2_badparam
+    mov     rdx, rax
+    shl     rdx, 3                           ; 8 * lanes (64-bit)
+    mov     r8d, dword ptr [rcx].ARGON2REQ.m_cost
+    cmp     r8, rdx
+    jb      a2_badparam
 
     ; ---- read params -------------------------------------------------------
     mov     eax, dword ptr [rcx].ARGON2REQ.lanes
@@ -884,6 +957,10 @@ endif
     test    rax, rax
     jz      a2_fail
     mov     qword ptr [g_arena], rax
+    mov     rcx, rax
+    mov     rdx, qword ptr [g_mb]
+    shl     rdx, 10
+    call    secmem_register_range
     ; The arena is far too large to lock and it is pageable, but one block in it
     ; is key-equivalent on its own: B[0][q-1] after the last pass is the input to
     ; the final H', so recovering it from the pagefile recovers the key.  Pin that
@@ -936,6 +1013,14 @@ a2_init_lane:
     ; fill loop
     ; =====================================================================
 a2_fill:
+    ; H0 (g_hbuf) and g_b2bctx are never read again once B[i][0..1] are seeded;
+    ; wipe them immediately rather than keeping key-equivalent H0 live across fill.
+    lea     rcx, [g_hbuf]
+    mov     edx, 80
+    call    secure_zero
+    lea     rcx, [g_b2bctx]
+    mov     edx, 256
+    call    secure_zero
 ifdef DBG_TRACE
     mov     rcx, qword ptr [g_arena]
     mov     edx, 8
@@ -1289,11 +1374,19 @@ endif
     lea     rcx, [g_hbuf]
     mov     rdx, 80
     call    secure_zero
+    lea     rcx, [g_inp]
+    mov     edx, 1024
+    call    secure_zero
+    lea     rcx, [g_addr]
+    mov     edx, 1024
+    call    secure_zero
+    mov     qword ptr [g_le4], 0
     ; wipe + free arena
     mov     rcx, qword ptr [g_arena]
     mov     rdx, qword ptr [g_mb]
     shl     rdx, 10
     call    secure_zero
+    call    secmem_unregister_range
     cmp     dword ptr [g_lastlk], 0
     je      @F
     WINCALL VirtualUnlock, qword ptr [g_lastblk], 1024
@@ -1302,13 +1395,34 @@ endif
     xor     edx, edx
     mov     r8d, MEM_RELEASE
     call    VirtualFree
+    mov     qword ptr [g_arena], 0
 
+    pxor    xmm0, xmm0
+    pxor    xmm1, xmm1
+    pxor    xmm2, xmm2
+    pxor    xmm3, xmm3
+    pxor    xmm4, xmm4
+    pxor    xmm5, xmm5
     xor     eax, eax
     jmp     a2_restore
 a2_fail:
     lea     rcx, [g_hbuf]
     mov     rdx, 80
     call    secure_zero
+    lea     rcx, [g_inp]
+    mov     edx, 1024
+    call    secure_zero
+    lea     rcx, [g_addr]
+    mov     edx, 1024
+    call    secure_zero
+    mov     qword ptr [g_le4], 0
+a2_badparam:
+    pxor    xmm0, xmm0
+    pxor    xmm1, xmm1
+    pxor    xmm2, xmm2
+    pxor    xmm3, xmm3
+    pxor    xmm4, xmm4
+    pxor    xmm5, xmm5
     mov     eax, 1
 a2_restore:
     mov     r12, qword ptr [rbp-32]     ; callee-saved, see the prologue

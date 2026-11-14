@@ -25,6 +25,10 @@ rng_fill proc frame
 
     mov     qword ptr [rbp-24], rcx
     mov     dword ptr [rbp-32], edx
+    test    edx, edx
+    jz      rf_ok
+    test    rcx, rcx
+    jz      rf_fail
 
     ; ---- primary: OS CSPRNG -------------------------------------------------
     ; BCryptGenRandom(hAlgorithm=NULL, pbBuffer, cbBuffer, dwFlags)
@@ -39,7 +43,7 @@ rng_fill proc frame
     mov     r11d, dword ptr [rbp-32]    ; remaining bytes
 rf_mix_loop:
     cmp     r11d, 8
-    jb      rf_ok                       ; tail < 8 bytes: already random, done
+    jb      rf_tail
     mov     eax, 16                     ; retry budget per lane
 rf_retry:
     rdseed  rcx
@@ -53,10 +57,31 @@ rf_have_seed:
     sub     r11d, 8
     jmp     rf_mix_loop
 
+rf_tail:
+    test    r11d, r11d
+    jz      rf_scrub
+    mov     eax, 16
+rf_t_retry:
+    rdseed  rcx
+    jc      rf_t_mix
+    dec     eax
+    jnz     rf_t_retry
+    jmp     rf_scrub
+rf_t_mix:
+    xor     byte ptr [r10], cl
+    shr     rcx, 8
+    inc     r10
+    dec     r11d
+    jnz     rf_t_mix
+
+rf_scrub:
+    xor     ecx, ecx
 rf_ok:
+    xor     ecx, ecx
     mov     eax, 1
     jmp     rf_done
 rf_fail:
+    xor     ecx, ecx
     xor     eax, eax
 rf_done:
     FRAME_EPILOG

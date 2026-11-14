@@ -44,12 +44,14 @@ public static class CmdBarPaint {
 }
 '@
 $p = $null
+$oldAllowCap = $env:MYRKR_DBG_ALLOWCAPTURE
 function Pixel($h) {
     $color = [CmdBarPaint]::Pixel($h)
     if ($color -eq [uint32]::MaxValue) { throw 'Cannot read test control pixels' }
     return $color
 }
 try {
+    $env:MYRKR_DBG_ALLOWCAPTURE = '1'
     $p = Start-Process -WindowStyle Hidden -FilePath (Join-Path $root 'bin\myrkr.exe') -PassThru
     for ($i=0; $i -lt 100; $i++) {
         $p.Refresh()
@@ -86,5 +88,6 @@ try {
         "PASS button ${id}: blended idle, hover, pressed, disabled"
     }
 } finally {
+    if ($null -eq $oldAllowCap) { Remove-Item Env:\MYRKR_DBG_ALLOWCAPTURE -ErrorAction SilentlyContinue } else { $env:MYRKR_DBG_ALLOWCAPTURE = $oldAllowCap }
     if ($p -and -not $p.HasExited) { $p.Kill(); $p.WaitForExit() }
 }

@@ -13,6 +13,7 @@ include macros.inc
 
 extern file_open_read:proc
 extern file_open_write:proc
+extern file_path_allowed:proc
 extern get_file_size:proc
 extern file_read_exact:proc
 extern file_write_all:proc
@@ -264,8 +265,9 @@ mtp_suffix:
 make_temp_path endp
 
 ; =============================================================================
-; wstr_copy_conv(rcx = src, rdx = dst) - copy NUL-terminated UTF-16, mapping
-; '/' -> '\' (required before a \\?\ prefix, which disables normalization).
+; wstr_copy_conv(rcx = src, rdx = dst) -> eax = 0 ok / 1 truncated.
+; Copies NUL-terminated UTF-16, mapping '/' -> '\' (required before a \\?\
+; prefix, which disables Win32 normalization).
 ; =============================================================================
 wstr_copy_conv proc
     xor     r9d, r9d
@@ -277,33 +279,164 @@ wcc_loop:
 @@:
     mov     word ptr [rdx+r9*2], ax
     test    eax, eax
-    jz      wcc_done
+    jz      wcc_ok
     inc     r9d
     cmp     r9d, 7FF0h
     jb      wcc_loop
-    mov     word ptr [rdx+r9*2], 0      ; bounded truncation
-wcc_done:
+    mov     word ptr [rdx+r9*2], 0      ; bounded truncation -> caller rejects
+    mov     eax, 1
+    ret
+wcc_ok:
+    xor     eax, eax
     ret
 wstr_copy_conv endp
 
 ; =============================================================================
+; np_collapse(rcx = dst, rdx = root_floor) -> eax = 1 ok / 0 invalid.
+; In-place extended-path canonicalizer for "\\?\..." buffers:
+;   - collapses repeated '\' separators and "." segments
+;   - resolves ".." segments without ever backing above root_floor
+;   - strips Win32-ambiguous trailing '.' and ' ' on each segment (rejecting
+;     segments that become empty after stripping)
+; =============================================================================
+np_collapse proc
+    mov     r8, rdx                     ; r8 = immutable root floor
+    mov     r10, rdx                    ; r10 = read cursor
+    mov     r11, rdx                    ; r11 = write cursor
+    xor     ecx, ecx                    ; cl = 1 if input ended with '\'
+npc_scan_tail:
+    cmp     word ptr [rdx], 0
+    je      npc_tail_done
+    add     rdx, 2
+    jmp     npc_scan_tail
+npc_tail_done:
+    cmp     rdx, r8
+    jbe     npc_seg
+    cmp     word ptr [rdx-2], 5Ch
+    jne     npc_seg
+    mov     cl, 1
+
+npc_seg:
+    cmp     word ptr [r10], 5Ch
+    jne     npc_seg_start
+    add     r10, 2
+    jmp     npc_seg
+npc_seg_start:
+    cmp     word ptr [r10], 0
+    je      npc_finish
+    mov     r9, r10
+npc_find_end:
+    movzx   eax, word ptr [r9]
+    test    ax, ax
+    jz      npc_got_seg
+    cmp     ax, 5Ch
+    je      npc_got_seg
+    add     r9, 2
+    jmp     npc_find_end
+
+npc_got_seg:
+    mov     rax, r9
+    sub     rax, r10
+    shr     rax, 1                      ; segment length in WCHARs
+    cmp     rax, 1
+    jne     npc_chk_dotdot
+    cmp     word ptr [r10], '.'
+    jne     npc_emit
+    mov     r10, r9                     ; "." -> skip
+    jmp     npc_seg
+
+npc_chk_dotdot:
+    cmp     rax, 2
+    jne     npc_emit
+    cmp     word ptr [r10], '.'
+    jne     npc_emit
+    cmp     word ptr [r10+2], '.'
+    jne     npc_emit
+    ; ".." -> pop previous segment down to r8 floor
+    cmp     r11, r8
+    jbe     npc_pop_done
+npc_pop_loop:
+    cmp     r11, r8
+    jbe     npc_pop_done
+    cmp     word ptr [r11-2], 5Ch
+    je      npc_pop_sep
+    sub     r11, 2
+    jmp     npc_pop_loop
+npc_pop_sep:
+    sub     r11, 2
+npc_pop_done:
+    mov     r10, r9
+    jmp     npc_seg
+
+npc_emit:
+    ; Trim trailing '.' and ' ' from [r10 .. rdx)
+    mov     rdx, r9
+npc_trim:
+    cmp     rdx, r10
+    jbe     npc_bad                     ; segment was all dots/spaces -> invalid
+    movzx   eax, word ptr [rdx-2]
+    cmp     ax, '.'
+    je      npc_trim_step
+    cmp     ax, ' '
+    jne     npc_emit_sep
+npc_trim_step:
+    sub     rdx, 2
+    jmp     npc_trim
+
+npc_emit_sep:
+    cmp     r11, r8
+    jbe     npc_copy_chars
+    mov     word ptr [r11], 5Ch
+    add     r11, 2
+npc_copy_chars:
+    cmp     r10, rdx
+    jae     npc_seg_next
+    movzx   eax, word ptr [r10]
+    mov     word ptr [r11], ax
+    add     r10, 2
+    add     r11, 2
+    jmp     npc_copy_chars
+npc_seg_next:
+    mov     r10, r9
+    jmp     npc_seg
+
+npc_finish:
+    test    cl, cl
+    jz      npc_nul
+    cmp     r11, r8
+    jbe     npc_nul
+    mov     word ptr [r11], 5Ch
+    add     r11, 2
+npc_nul:
+    mov     word ptr [r11], 0
+    mov     eax, 1
+    ret
+npc_bad:
+    xor     eax, eax
+    ret
+np_collapse endp
+
+; =============================================================================
 ; normalize_path(rcx = src, rdx = dst) -> eax 0 / EXIT_IO
-; Produces an extended-length "\\?\" path so Windows allows up to 32,767 chars.
-;   already "\\?\"        -> copied as-is
+; Produces a validated, collapsed extended-length "\\?\" path:
+;   already "\\?\"        -> copied, validated & collapsed
 ;   UNC "\\server\..."    -> "\\?\UNC\server\..."
 ;   drive "X:\..."/"X:/..."-> "\\?\X:\..."
 ;   relative              -> GetFullPathNameW first, then prefixed
 ; =============================================================================
 public normalize_path
 normalize_path proc frame
-    FRAME_PROLOG 64                     ; 64 (alloc 80), not 48: the local at
-                                        ; [rbp-40] otherwise sat in
-                                        ; GetFullPathNameW's 32-byte home space,
-                                        ; which a Win32 callee may save registers
-                                        ; into
+    FRAME_PROLOG 64
     mov     qword ptr [rbp-24], rcx     ; src
     mov     qword ptr [rbp-32], rdx     ; dst
 
+    ; Reject device namespaces ("\\.\...", "\\?\GLOBALROOT\..."), ADS, and
+    ; disallowed UNC paths BEFORE rewriting "\\" -> "\\?\UNC\".
+    call    file_path_allowed
+    test    eax, eax
+    jz      np_io
+
+    mov     rcx, qword ptr [rbp-24]
     ; rule 1: already "\\?\"
     cmp     word ptr [rcx+0], 5Ch
     jne     np_notpre
@@ -313,19 +446,26 @@ normalize_path proc frame
     jne     np_notpre
     cmp     word ptr [rcx+6], 5Ch
     jne     np_notpre
-    mov     rcx, qword ptr [rbp-24]
     mov     rdx, qword ptr [rbp-32]
     call    wstr_copy_conv
-    xor     eax, eax
-    jmp     np_done
+    test    eax, eax
+    jnz     np_io
+    jmp     np_canon
 
 np_notpre:
-    ; UNC absolute "\\"
+    ; UNC absolute "\\" or "//"
     mov     rcx, qword ptr [rbp-24]
-    cmp     word ptr [rcx+0], 5Ch
+    movzx   eax, word ptr [rcx+0]
+    cmp     ax, 5Ch
+    je      @F
+    cmp     ax, 2Fh
     jne     np_chkdrive
-    cmp     word ptr [rcx+2], 5Ch
+@@: movzx   eax, word ptr [rcx+2]
+    cmp     ax, 5Ch
+    je      np_unc_abs
+    cmp     ax, 2Fh
     jne     np_chkdrive
+np_unc_abs:
     mov     rax, rcx
     jmp     np_haveabs
 np_chkdrive:
@@ -345,16 +485,25 @@ np_rel:
     WINCALL GetFullPathNameW, qword ptr [rbp-24], 8000h, addr g_fullbuf, 0
     test    eax, eax
     jz      np_io
+    cmp     eax, 7FF0h
+    jae     np_io
     lea     rax, [g_fullbuf]
 
 np_haveabs:
     mov     qword ptr [rbp-40], rax     ; base (absolute)
     mov     r10, rax
     mov     rdx, qword ptr [rbp-32]     ; dst
-    cmp     word ptr [r10+0], 5Ch       ; UNC?
+    movzx   eax, word ptr [r10+0]
+    cmp     ax, 5Ch
+    je      @F
+    cmp     ax, 2Fh
     jne     np_pfx_drive
-    cmp     word ptr [r10+2], 5Ch
+@@: movzx   eax, word ptr [r10+2]
+    cmp     ax, 5Ch
+    je      np_pfx_unc
+    cmp     ax, 2Fh
     jne     np_pfx_drive
+np_pfx_unc:
     ; "\\?\UNC\" + (base + 2 chars)
     mov     word ptr [rdx+0],  5Ch
     mov     word ptr [rdx+2],  5Ch
@@ -368,8 +517,9 @@ np_haveabs:
     add     rcx, 4                       ; skip leading "\\"
     lea     rdx, [rdx+16]
     call    wstr_copy_conv
-    xor     eax, eax
-    jmp     np_done
+    test    eax, eax
+    jnz     np_io
+    jmp     np_canon
 np_pfx_drive:
     mov     rdx, qword ptr [rbp-32]
     mov     word ptr [rdx+0], 5Ch
@@ -379,6 +529,62 @@ np_pfx_drive:
     mov     rcx, qword ptr [rbp-40]
     lea     rdx, [rdx+8]
     call    wstr_copy_conv
+    test    eax, eax
+    jnz     np_io
+
+np_canon:
+    ; Validate prefix/ADS/UNC and locate the root floor before collapsing '..'
+    mov     rcx, qword ptr [rbp-32]
+    call    file_path_allowed
+    test    eax, eax
+    jz      np_io
+    mov     rcx, qword ptr [rbp-32]
+    cmp     word ptr [rcx+10], ':'
+    je      np_floor_drv
+    ; "\\?\UNC\server\share\..." -> advance past server and share
+    lea     rdx, [rcx+16]               ; start of server
+    cmp     word ptr [rdx], 0
+    je      np_io
+    cmp     word ptr [rdx], '.'         ; reject "." / ".." server
+    jne     np_srv_loop
+    cmp     word ptr [rdx+2], 5Ch
+    je      np_io
+    cmp     word ptr [rdx+2], 0
+    je      np_io
+np_srv_loop:
+    movzx   eax, word ptr [rdx]
+    test    ax, ax
+    jz      np_io                       ; missing "\share"
+    add     rdx, 2
+    cmp     ax, 5Ch
+    jne     np_srv_loop
+    ; rdx = start of share
+    cmp     word ptr [rdx], 0
+    je      np_io
+    cmp     word ptr [rdx], 5Ch
+    je      np_io
+np_shr_loop:
+    movzx   eax, word ptr [rdx]
+    test    ax, ax
+    jz      np_have_floor               ; "\\?\UNC\server\share"
+    add     rdx, 2
+    cmp     ax, 5Ch
+    jne     np_shr_loop
+    jmp     np_have_floor               ; rdx points right after "share\"
+
+np_floor_drv:
+    cmp     word ptr [rcx+12], 5Ch      ; require '\' after "\\?\X:"
+    jne     np_io
+    lea     rdx, [rcx+14]               ; right after "\\?\X:\"
+
+np_have_floor:
+    call    np_collapse
+    test    eax, eax
+    jz      np_io
+    mov     rcx, qword ptr [rbp-32]
+    call    file_path_allowed
+    test    eax, eax
+    jz      np_io
     xor     eax, eax
     jmp     np_done
 np_io:
@@ -1650,17 +1856,26 @@ do_hash endp
 ; =============================================================================
 public do_bench
 do_bench proc frame
-    FRAME_PROLOG 96 + 64
-    lea     rcx, [rsp+32]
+    FRAME_PROLOG 160
+    ; [rbp-32]=rc [rbp-40]=freq [rbp-48]=t0 [rbp-56]=t1 [rbp-64]=ms [rbp-104..rbp-73]=salt(32)
+    lea     rcx, [rbp-104]
     mov     edx, 32
     call    rng_fill
+    test    eax, eax
+    jz      db_oom
     WINCALL QueryPerformanceFrequency, addr rbp-40
     WINCALL QueryPerformanceCounter, addr rbp-48
-    lea     rcx, [rsp+32]
+    lea     rcx, [rbp-104]
     mov     edx, dword ptr [g_cfg_t]
     mov     r8d, dword ptr [g_cfg_m]
     mov     r9d, HDR_VERSION                ; time what encrypt would pay
     call    derive_key
+    mov     dword ptr [rbp-32], eax
+    lea     rcx, [rbp-104]
+    mov     edx, 32
+    call    secure_zero
+    cmp     dword ptr [rbp-32], 0
+    jne     db_fail
     WINCALL QueryPerformanceCounter, addr rbp-56
     mov     rax, qword ptr [rbp-56]
     sub     rax, qword ptr [rbp-48]
@@ -1676,6 +1891,20 @@ do_bench proc frame
     mov     rdx, KEY_LEN
     call    secure_zero
     xor     eax, eax
+    jmp     db_done
+db_oom:
+    lea     rcx, [rbp-104]
+    mov     edx, 32
+    call    secure_zero
+    prn     e_oom
+    mov     eax, EXIT_OOM
+    jmp     db_done
+db_fail:
+    lea     rcx, [g_key]
+    mov     rdx, KEY_LEN
+    call    secure_zero
+    mov     eax, dword ptr [rbp-32]
+db_done:
     FRAME_EPILOG
     ret
 do_bench endp

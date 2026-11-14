@@ -85,6 +85,7 @@ function Clear-All {
 function Probe {
     Get-Process myrkr -EA SilentlyContinue | ForEach-Object { try { $_.Kill() } catch {} }
     $env:MYRKR_DBG_NOSECDESK = "1"
+    $env:MYRKR_DBG_ALLOWCAPTURE = "1"
     $q = Start-Process $exe -PassThru
     $mw = [IntPtr]::Zero
     for ($i=0; $i -lt 100 -and $mw -eq [IntPtr]::Zero; $i++) { Start-Sleep -Milliseconds 150; $mw = [D]::Find([uint32]$q.Id,"myrkr_window") }
@@ -178,6 +179,7 @@ if ($null -ne $savedPolicy) { New-ItemProperty $POLICY -Name Format -Value $save
 if ($null -ne $savedUser)   { New-ItemProperty $USERKEY -Name Format -Value $savedUser -PropertyType DWord -Force | Out-Null }
 if (-not $hadDefaults) { Remove-Item $DEFAULTS -Force -EA SilentlyContinue }
 Remove-Item Env:\MYRKR_DBG_NOSECDESK -EA SilentlyContinue
+Remove-Item Env:\MYRKR_DBG_ALLOWCAPTURE -EA SilentlyContinue
 
 ""
 "=== Restore: shipping build ==="

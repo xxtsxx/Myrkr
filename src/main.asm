@@ -35,6 +35,10 @@ extern hardening_init:proc
 extern iat_lockdown:proc
 extern secure_zero:proc
 extern secmem_wipe_all:proc             ; secmem.asm: wipe + unlock all secrets
+extern sstk_reset_current:proc          ; hardening.asm: reset thread shadow-stack depth
+extern SwitchDesktop:proc               ; user32: restore input desktop on fastfail
+externdef g_in_crash:dword              ; hardening.asm: atomic crash/fastfail latch
+externdef g_sd_prev_input:qword         ; secdesk.asm: user's desktop if prompt active
 extern run_selftest:proc
 extern do_encrypt:proc
 extern do_decrypt:proc
@@ -94,13 +98,15 @@ public g_cfg_loglevel
 g_cfg_loglevel      dd 0            ; log verbosity (0 = none/off by default; see log.asm)
 public g_cfg_logfile
 g_cfg_logfile       dq 0            ; --log-file PATH override (0 = default path)
-public g_cfg_securedesk
+public g_cfg_securedesk, g_allow_screencap, g_allow_unc
 ; 1 = type the password on a private desktop (secdesk.asm), 0 = an ordinary
 ; modal on the interactive desktop.  Defaults ON, and the MSI writes it to HKLM
 ; so it is enforced rather than merely defaulted.  Turning it off restores the
 ; surface that lets Myrkr be driven headlessly by window messages - the cost is
 ; set out in manifest section 14.
 g_cfg_securedesk    dd 1
+g_allow_screencap   dd 0            ; 0 = WDA_EXCLUDEFROMCAPTURE on GUI windows
+g_allow_unc         dd 1            ; 1 = allow UNC shares by default; 0 = block UNC
 
 .data?
 public g_cfg_pass, g_positionals, g_poscount
@@ -193,14 +199,16 @@ WSTR w_redteam,  <redteam>
 WSTR w_secdesk,  <secdesk>
 endif
 ifdef TEST_IO
-; Marker so a test build is identifiable from the outside.  It exists only to be
-; found: tools\make_msi.ps1 scans the image for it and refuses to package a
-; binary that accepts a password on the command line.  Nothing else about the
-; file distinguishes one - same name, same version resource, same icons - and a
-; test build shipped by accident would hand every user the automation surface
-; the release build exists to withhold.
+; Marker so a non-release build is identifiable from the outside.  It exists
+; only to be found: tools\make_msi.ps1 scans the image for it and refuses to
+; package a binary built with TEST_IO or DBG_TRACE enabled.
 WSTR w_testio_marker, <MYRKR_TEST_IO_BUILD>
 public w_testio_marker
+else
+ifdef DBG_TRACE
+WSTR w_testio_marker, <MYRKR_TEST_IO_BUILD>
+public w_testio_marker
+endif
 endif
 ifdef TEST_IO
 ; "-p" exists ONLY in a test build.  A release binary has no way to take a
@@ -311,15 +319,26 @@ endif
 
 ; =============================================================================
 ; ff_trap - central fail handler.  ecx = fail code (FF_*).  Never returns.
-; Release build: immediate __fastfail (int 29h) - non-catchable termination.
-; Debug build  : prints "FF" + 4 hex digits of the code so a fault can be
-;                attributed to the exact check that fired, then exits.
+; Resets shadow stack, wipes all registered secrets, and restores the input
+; desktop before terminating.
+; Release build: __fastfail (int 29h) - non-catchable termination.
+; Debug build  : prints "FF" + 4 hex digits of the code and exits 0xFADE<code>.
 ; =============================================================================
 public ff_trap
 ff_trap proc
+    mov     r15d, ecx                   ; preserve code (r15 nonvolatile, we never return)
+    and     rsp, -16                    ; realign stack before any calls
+    sub     rsp, 32                     ; Win64 shadow space
+    lock bts dword ptr [g_in_crash], 0  ; re-entrancy guard: if wipe itself traps,
+    jc      ff_die                      ;   skip straight to kernel fastfail
+    call    sstk_reset_current
+    call    secmem_wipe_all
+    mov     rcx, qword ptr [g_sd_prev_input]
+    test    rcx, rcx
+    jz      ff_after_desk
+    WINCALL SwitchDesktop, rcx
+ff_after_desk:
 ifdef DBG_TRACE
-    mov     r15d, ecx                   ; preserve code (r15 nonvolatile, unused)
-    and     rsp, -16                    ; realign (we never return from here)
     mov     al, 'F'
     call    dbg_putc
     mov     al, 'F'
@@ -352,7 +371,9 @@ ff_emit:
     or      eax, 0FADE0000h
     WINCALL ExitProcess, eax
 endif
-    int     29h                         ; release: real fast-fail
+ff_die:
+    mov     ecx, r15d
+    int     29h                         ; release (or re-entrant): real fast-fail
 ff_trap endp
 
 ; =============================================================================
@@ -365,6 +386,7 @@ cpu_gate proc frame
     .pushreg rbx
     .endprolog
     xor     r10d, r10d                  ; feature accumulator
+    xor     r8d, r8d                    ; OS AVX state enabled (OSXSAVE + XCR0[2:1]==11b)
 
     xor     eax, eax                    ; leaf 0: highest supported leaf
     xor     ecx, ecx
@@ -384,6 +406,18 @@ cpu_gate proc frame
     jz      @F
     or      r10d, CPUF_SSE41
 @@:
+    ; AVX2 instructions #UD unless OSXSAVE (ECX.27) + AVX (ECX.28) are both set
+    ; AND XGETBV(0) reports both XMM (bit 1) and YMM (bit 2) state enabled by OS.
+    mov     eax, ecx
+    and     eax, (1 SHL 27) or (1 SHL 28)
+    cmp     eax, (1 SHL 27) or (1 SHL 28)
+    jne     cg_leaf7
+    xor     ecx, ecx
+    xgetbv
+    and     eax, 6
+    cmp     eax, 6
+    sete    r8b
+cg_leaf7:
     cmp     r9d, 7                      ; leaf 7 may not exist on old CPUs
     jb      cg_store
     mov     eax, 7
@@ -393,6 +427,8 @@ cpu_gate proc frame
     jz      @F
     or      r10d, CPUF_SHANI
 @@: test    ebx, 1 SHL 5                ; AVX2
+    jz      @F
+    test    r8d, r8d                    ; OS YMM context enabled?
     jz      @F
     or      r10d, CPUF_AVX2
 @@: test    ebx, 1 SHL 18               ; RDSEED
@@ -1170,10 +1206,25 @@ p2u_wipe:
     mov     eax, 1
     jmp     p2u_done
 p2u_bad:
-    ; wipe whatever partial conversion landed in the buffer
+    ; wipe partial UTF-8 conversion, zero length, and scrub wide copy in g_argbuf
+    mov     dword ptr [g_cfg_passlen], 0
     lea     rcx, [g_cfg_pass]
     mov     edx, MAX_PASSWORD_BYTES+1
     call    secure_zero
+    mov     rcx, qword ptr [rbp-24]
+    test    rcx, rcx
+    jz      p2u_bad_ret
+    xor     edx, edx
+p2u_bad_meas:
+    cmp     word ptr [rcx+rdx*2], 0
+    je      p2u_bad_wipe
+    inc     edx
+    cmp     edx, ARGBUF_CHARS
+    jb      p2u_bad_meas
+p2u_bad_wipe:
+    shl     edx, 1
+    call    secure_zero
+p2u_bad_ret:
     xor     eax, eax
 p2u_done:
     FRAME_EPILOG

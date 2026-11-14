@@ -98,6 +98,11 @@ aes256_expand proc
     movdqu  xmmword ptr [rdx+208], xmm1
     EXPA 40h
     movdqu  xmmword ptr [rdx+224], xmm0
+    pxor    xmm0, xmm0
+    pxor    xmm1, xmm1
+    pxor    xmm2, xmm2
+    pxor    xmm3, xmm3
+    pxor    xmm4, xmm4
     ret
 aes256_expand endp
 
@@ -279,6 +284,7 @@ gcm_init proc frame
     movdqu  xmmword ptr [rax+GC_Y], xmm0
     mov     qword ptr [rax+GC_AADN], 0
     mov     qword ptr [rax+GC_PTN], 0
+    pxor    xmm5, xmm5
 
     movdqu  xmm14, xmmword ptr [rsp+32]
     FRAME_EPILOG
@@ -330,6 +336,13 @@ ga_tcopy:
 ga_done:
     mov     rax, qword ptr [rsp+128]
     movdqu  xmmword ptr [rax+GC_Y], xmm1
+    pxor    xmm0, xmm0
+    movdqu  xmmword ptr [rsp+112], xmm0
+    pxor    xmm1, xmm1
+    pxor    xmm2, xmm2
+    pxor    xmm3, xmm3
+    pxor    xmm4, xmm4
+    pxor    xmm5, xmm5
 
     movdqu  xmm6,  xmmword ptr [rsp+32]
     movdqu  xmm7,  xmmword ptr [rsp+48]
@@ -438,6 +451,11 @@ gx_done:
     movdqu  xmmword ptr [rsp+144], xmm0         ;   [rsp+144] and the zero-padded tail
     movdqu  xmmword ptr [rsp+160], xmm0         ;   [rsp+160]: keystream XOR the tail is
                                                 ;   the plaintext (from Vordr)
+    pxor    xmm1, xmm1
+    pxor    xmm2, xmm2
+    pxor    xmm3, xmm3
+    pxor    xmm4, xmm4
+    pxor    xmm5, xmm5
 
     movdqu  xmm6,  xmmword ptr [rsp+32]
     movdqu  xmm7,  xmmword ptr [rsp+48]
@@ -493,6 +511,14 @@ gcm_final proc frame
     mov     rdx, qword ptr [rsp+136]
     movdqu  xmmword ptr [rdx], xmm0
 
+    pxor    xmm0, xmm0
+    movdqu  xmmword ptr [rsp+112], xmm0
+    pxor    xmm1, xmm1
+    pxor    xmm2, xmm2
+    pxor    xmm3, xmm3
+    pxor    xmm4, xmm4
+    pxor    xmm5, xmm5
+
     movdqu  xmm6,  xmmword ptr [rsp+32]
     movdqu  xmm7,  xmmword ptr [rsp+48]
     movdqu  xmm8,  xmmword ptr [rsp+64]
@@ -503,11 +529,19 @@ gcm_final proc frame
 gcm_final endp
 
 ; =============================================================================
-; gcm_seal(rcx = GCMREQ*) -> eax = 0   (one-shot wrapper)
+; gcm_seal(rcx = GCMREQ*) -> eax = 0 ok, 1 length over NIST SP 800-38D limit
 ; =============================================================================
 public gcm_seal
 gcm_seal proc frame
     FRAME_PROLOG 64 + GCM_CTX_SIZE
+    ; NIST SP 800-38D: P <= (2^36 - 32) bytes (0FFFFFFFE0h) so the 32-bit
+    ; counter in J0[12..15] never wraps back to J0; A <= 2^61 - 1 bytes.
+    mov     rax, 0FFFFFFFE0h
+    cmp     qword ptr [rcx].GCMREQ.inlen, rax
+    ja      gs_bad
+    mov     rax, 1FFFFFFFFFFFFFFFh
+    cmp     qword ptr [rcx].GCMREQ.aadlen, rax
+    ja      gs_bad
     mov     qword ptr [rbp-24], rcx
     lea     rax, [rsp+32]
     mov     qword ptr [rbp-32], rax
@@ -537,7 +571,17 @@ gcm_seal proc frame
     mov     rcx, qword ptr [rbp-32]
     mov     rdx, GCM_CTX_SIZE
     call    secure_zero
+    pxor    xmm0, xmm0
+    pxor    xmm1, xmm1
+    pxor    xmm2, xmm2
+    pxor    xmm3, xmm3
+    pxor    xmm4, xmm4
+    pxor    xmm5, xmm5
     xor     eax, eax
+    FRAME_EPILOG
+    ret
+gs_bad:
+    mov     eax, 1
     FRAME_EPILOG
     ret
 gcm_seal endp
@@ -548,6 +592,12 @@ gcm_seal endp
 public gcm_open
 gcm_open proc frame
     FRAME_PROLOG 64 + GCM_CTX_SIZE + 16
+    mov     rax, 0FFFFFFFE0h
+    cmp     qword ptr [rcx].GCMREQ.inlen, rax
+    ja      go_bad
+    mov     rax, 1FFFFFFFFFFFFFFFh
+    cmp     qword ptr [rcx].GCMREQ.aadlen, rax
+    ja      go_bad
     mov     qword ptr [rbp-24], rcx
     lea     rax, [rsp+32]
     mov     qword ptr [rbp-32], rax
@@ -557,6 +607,9 @@ gcm_open proc frame
     mov     r8,  qword ptr [r10].GCMREQ.iv
     mov     r9, 1
     call    gcm_init
+    ; Authenticate GHASH(aad, ciphertext) + J0 tag in constant time BEFORE
+    ; decrypting a single byte to outp.  Forged ciphertexts never emit
+    ; unauthenticated plaintext and inp is preserved when outp == inp.
     mov     rcx, qword ptr [rbp-32]
     mov     r10, qword ptr [rbp-24]
     mov     rdx, qword ptr [r10].GCMREQ.aad
@@ -565,10 +618,14 @@ gcm_open proc frame
     mov     rcx, qword ptr [rbp-32]
     mov     r10, qword ptr [rbp-24]
     mov     rdx, qword ptr [r10].GCMREQ.inp
-    mov     r8,  qword ptr [r10].GCMREQ.outp
-    mov     r9,  qword ptr [r10].GCMREQ.inlen
-    call    gcm_crypt
+    mov     r8,  qword ptr [r10].GCMREQ.inlen
+    call    gcm_aad
     mov     rcx, qword ptr [rbp-32]
+    mov     r10, qword ptr [rbp-24]
+    mov     rax, qword ptr [r10].GCMREQ.aadlen
+    mov     qword ptr [rcx+GC_AADN], rax
+    mov     rax, qword ptr [r10].GCMREQ.inlen
+    mov     qword ptr [rcx+GC_PTN], rax
     lea     rdx, [rsp+32+GCM_CTX_SIZE]
     call    gcm_final
     lea     rcx, [rsp+32+GCM_CTX_SIZE]
@@ -576,94 +633,73 @@ gcm_open proc frame
     mov     rdx, qword ptr [r10].GCMREQ.tag
     mov     r8, 16
     call    ct_memcmp
-    ; wipe the ctx (round keys) AND the computed tag behind it, preserving the
-    ; compare result - they are contiguous, so one call covers both
     mov     dword ptr [rbp-40], eax
+    test    eax, eax
+    jnz     go_tagfail
+    ; Tag verified: now decrypt inp -> outp via CTR.
+    mov     rcx, qword ptr [rbp-32]
+    mov     qword ptr [rcx+GC_PTN], 0
+    mov     r10, qword ptr [rbp-24]
+    mov     rdx, qword ptr [r10].GCMREQ.inp
+    mov     r8,  qword ptr [r10].GCMREQ.outp
+    mov     r9,  qword ptr [r10].GCMREQ.inlen
+    call    gcm_crypt
+    jmp     go_cleanup
+go_tagfail:
+    ; If outp is a distinct destination buffer, zero it so callers never read stale bytes.
+    mov     r10, qword ptr [rbp-24]
+    mov     rcx, qword ptr [r10].GCMREQ.outp
+    test    rcx, rcx
+    jz      go_cleanup
+    cmp     rcx, qword ptr [r10].GCMREQ.inp
+    je      go_cleanup
+    mov     rdx, qword ptr [r10].GCMREQ.inlen
+    call    secure_zero
+go_cleanup:
+    ; wipe the ctx (round keys) AND the computed tag behind it
     lea     rcx, [rsp+32]
     mov     rdx, GCM_CTX_SIZE + 16
     call    secure_zero
-    cmp     dword ptr [rbp-40], 0
-    je      go_ok
-    ; Tag mismatch: the plaintext is already in outp, decrypted from bytes that
-    ; did not authenticate.  Scrub it, so a caller that neglects the return value
-    ; cannot go on to use forged data.  (From Vordr.)
-    mov     r10, qword ptr [rbp-24]
-    mov     rcx, qword ptr [r10].GCMREQ.outp
-    mov     rdx, qword ptr [r10].GCMREQ.inlen
-    call    secure_zero
-go_ok:
+    pxor    xmm0, xmm0
+    pxor    xmm1, xmm1
+    pxor    xmm2, xmm2
+    pxor    xmm3, xmm3
+    pxor    xmm4, xmm4
+    pxor    xmm5, xmm5
     mov     eax, dword ptr [rbp-40]
+    FRAME_EPILOG
+    ret
+go_bad:
+    mov     eax, 1
     FRAME_EPILOG
     ret
 gcm_open endp
 
 ; =============================================================================
-; Variable-key-size AES (128/192/256) for the WinZip-AES ZIP extractor.
+; Variable-key-size AES (128/192/256) for WinZip-AES ZIP encryption/extraction.
 ; -----------------------------------------------------------------------------
-; The GCM path above uses the dedicated AES-NI aes256_expand + AES_ENC.  WinZip
-; AES, however, can use 128- or 192-bit keys too, so the unzip path computes the
-; key schedule in software (FIPS-197, S-box based) - producing the SAME round-key
-; byte layout the AES-NI `aesenc` instruction consumes - and runs the rounds with
-; AES-NI via a round count.  This keeps one code path for all three key sizes.
+; Uses hardware AES-NI `aeskeygenassist` for constant-time S-box SubWord and
+; RotWord(SubWord) across all three FIPS-197 key sizes (no memory S-box table).
 ; =============================================================================
-.const
-align 16
-aes_sbox \
- db 063h,07ch,077h,07bh,0f2h,06bh,06fh,0c5h,030h,001h,067h,02bh,0feh,0d7h,0abh,076h
- db 0cah,082h,0c9h,07dh,0fah,059h,047h,0f0h,0adh,0d4h,0a2h,0afh,09ch,0a4h,072h,0c0h
- db 0b7h,0fdh,093h,026h,036h,03fh,0f7h,0cch,034h,0a5h,0e5h,0f1h,071h,0d8h,031h,015h
- db 004h,0c7h,023h,0c3h,018h,096h,005h,09ah,007h,012h,080h,0e2h,0ebh,027h,0b2h,075h
- db 009h,083h,02ch,01ah,01bh,06eh,05ah,0a0h,052h,03bh,0d6h,0b3h,029h,0e3h,02fh,084h
- db 053h,0d1h,000h,0edh,020h,0fch,0b1h,05bh,06ah,0cbh,0beh,039h,04ah,04ch,058h,0cfh
- db 0d0h,0efh,0aah,0fbh,043h,04dh,033h,085h,045h,0f9h,002h,07fh,050h,03ch,09fh,0a8h
- db 051h,0a3h,040h,08fh,092h,09dh,038h,0f5h,0bch,0b6h,0dah,021h,010h,0ffh,0f3h,0d2h
- db 0cdh,00ch,013h,0ech,05fh,097h,044h,017h,0c4h,0a7h,07eh,03dh,064h,05dh,019h,073h
- db 060h,081h,04fh,0dch,022h,02ah,090h,088h,046h,0eeh,0b8h,014h,0deh,05eh,00bh,0dbh
- db 0e0h,032h,03ah,00ah,049h,006h,024h,05ch,0c2h,0d3h,0ach,062h,091h,095h,0e4h,079h
- db 0e7h,0c8h,037h,06dh,08dh,0d5h,04eh,0a9h,06ch,056h,0f4h,0eah,065h,07ah,0aeh,008h
- db 0bah,078h,025h,02eh,01ch,0a6h,0b4h,0c6h,0e8h,0ddh,074h,01fh,04bh,0bdh,08bh,08ah
- db 070h,03eh,0b5h,066h,048h,003h,0f6h,00eh,061h,035h,057h,0b9h,086h,0c1h,01dh,09eh
- db 0e1h,0f8h,098h,011h,069h,0d9h,08eh,094h,09bh,01eh,087h,0e9h,0ceh,055h,028h,0dfh
- db 08ch,0a1h,089h,00dh,0bfh,0e6h,042h,068h,041h,099h,02dh,00fh,0b0h,054h,0bbh,016h
-
-.code
-
-; SUBWORD - eax = SubWord(eax) via aes_sbox.  Clobbers edx, r9, r10d.
-; (loads the S-box base RIP-relative; a [label+reg] form would force an
-; absolute fixup that fails to link under high-entropy ASLR.)
-SUBWORD macro
-    lea     r9, [aes_sbox]
-    movzx   r10d, al
-    movzx   r10d, byte ptr [r9+r10]
-    mov     edx, eax
-    shr     edx, 8
-    movzx   edx, dl
-    movzx   edx, byte ptr [r9+rdx]
-    shl     edx, 8
-    or      r10d, edx
-    mov     edx, eax
-    shr     edx, 16
-    movzx   edx, dl
-    movzx   edx, byte ptr [r9+rdx]
-    shl     edx, 16
-    or      r10d, edx
-    mov     edx, eax
-    shr     edx, 24
-    movzx   edx, dl
-    movzx   edx, byte ptr [r9+rdx]
-    shl     edx, 24
-    or      r10d, edx
-    mov     eax, r10d
-endm
 
 ; =============================================================================
 ; aes_expand_key(rcx=key, rdx=keylen{16,24,32}, r8=rkout) -> eax = Nr (10/12/14)
-; FIPS-197 key schedule.  rkout receives (Nr+1)*16 bytes.
+;   Returns 0 on an unsupported key length.  rkout receives (Nr+1)*16 bytes.
 ; =============================================================================
 public aes_expand_key
 aes_expand_key proc frame
     FRAME_PROLOG 48
     ; [rbp-24]=rkout [rbp-32]=Nk [rbp-40]=totalwords [rbp-48]=rcon
+    cmp     rdx, 16
+    je      aek_valid
+    cmp     rdx, 24
+    je      aek_valid
+    cmp     rdx, 32
+    je      aek_valid
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+aek_valid:
     mov     qword ptr [rbp-24], r8
     mov     r9, rdx
     shr     r9, 2                            ; Nk
@@ -692,8 +728,11 @@ aek_loop:
     mov     eax, dword ptr [r8+r11*4-4]      ; temp = w[i-1]
     test    rdx, rdx
     jnz     aek_chk4
-    ror     eax, 8                           ; RotWord
-    SUBWORD
+    movd    xmm0, eax
+    pshufd  xmm0, xmm0, 0
+    aeskeygenassist xmm0, xmm0, 0
+    pshufd  xmm0, xmm0, 55h                  ; lane 1 = RotWord(SubWord(w[i-1]))
+    movd    eax, xmm0
     mov     edx, dword ptr [rbp-48]          ; rcon (low byte)
     xor     al, dl
     mov     edx, dword ptr [rbp-48]          ; rcon = xtime(rcon)
@@ -711,7 +750,10 @@ aek_chk4:
     jbe     aek_xor
     cmp     rdx, 4
     jne     aek_xor
-    SUBWORD
+    movd    xmm0, eax
+    pshufd  xmm0, xmm0, 0
+    aeskeygenassist xmm0, xmm0, 0
+    movd    eax, xmm0                        ; lane 0 = SubWord(w[i-1])
 aek_xor:
     mov     r8, qword ptr [rbp-24]
     mov     r9, qword ptr [rbp-32]
@@ -724,6 +766,9 @@ aek_xor:
     inc     r11
     jmp     aek_loop
 aek_done:
+    pxor    xmm0, xmm0
+    xor     ecx, ecx
+    xor     edx, edx
     mov     rax, qword ptr [rbp-32]
     add     rax, 6                           ; Nr = Nk + 6
     FRAME_EPILOG
@@ -736,6 +781,13 @@ aes_expand_key endp
 public aes_ecb_block
 aes_ecb_block proc frame
     FRAME_PROLOG 32
+    cmp     r8, 10
+    je      aeb_go
+    cmp     r8, 12
+    je      aeb_go
+    cmp     r8, 14
+    jne     aeb_out
+aeb_go:
     movdqu  xmm0, xmmword ptr [rdx]
     movdqu  xmm1, xmmword ptr [rcx]
     pxor    xmm0, xmm1                       ; round 0 (whitening)
@@ -755,6 +807,9 @@ aeb_last:
     movdqu  xmm1, xmmword ptr [rcx+r10]
     aesenclast xmm0, xmm1
     movdqu  xmmword ptr [rdx], xmm0
+    pxor    xmm0, xmm0
+    pxor    xmm1, xmm1
+aeb_out:
     FRAME_EPILOG
     ret
 aes_ecb_block endp
@@ -820,6 +875,8 @@ acx_pb:
 acx_done:
     pxor    xmm0, xmm0                       ; the last keystream block stays on
     movdqu  xmmword ptr [rbp-80], xmm0       ;   the stack otherwise (from Vordr)
+    pxor    xmm1, xmm1
+    xor     r10d, r10d
     FRAME_EPILOG
     ret
 aes_ctr_xor endp

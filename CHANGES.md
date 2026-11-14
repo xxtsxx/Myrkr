@@ -6,6 +6,60 @@ ISO-8601 (`YYYY-MM-DD`).
 This file is maintained by hand alongside every change; each entry summarizes
 what changed and why, not a raw commit dump.
 
+## [Unreleased]
+
+### Security & Hardening
+
+- **Authenticate-before-decrypt AES-GCM & hardware key schedule.** One-shot
+  `gcm_open` now verifies the GHASH authentication tag over the ciphertext and
+  AAD before writing a single byte to the output buffer, enforces NIST SP
+  800-38D plaintext/AAD length bounds, and expands AES-128/192/256 keys in
+  hardware (`aeskeygenassist`, with zero S-box tables in RAM and explicit key
+  length validation).
+- **Expanded secret-memory locking, dynamic panic wipe & register scrubbing.**
+  `secmem` now locks Argon2, BLAKE2b, and WinZip-AES buffers in `VirtualLock`ed
+  static regions, registers dynamic secret arenas (`g_arena`) for crash-time
+  wiping, wipes Argon2 `H0` (`g_hbuf`) immediately after lane seeding, and
+  scrubs SHA-1/SHA-256/BLAKE2b/HMAC/PBKDF2 stack frames and volatile `XMM`/`YMM`
+  (`vzeroupper`) registers on return.
+- **Shadow-stack, loader, heap & crash-containment hardening.** `FRAME_EPILOG`
+  now enforces strict top-of-stack shadow-stack equality (plus ancestor check
+  `redteam shadow_anc`), the shadow stack is flushed against its upper
+  `PAGE_NOACCESS` guard page, `_load_config_used` sets `DependentLoadFlags =
+  0x0800` (`LOAD_LIBRARY_SEARCH_SYSTEM32`) paired with startup
+  `SetDefaultDllDirectories`, `HeapEnableTerminationOnCorruption`, and
+  `SetProcessMitigationPolicy` (`ExtensionPointDisable`, `NoRemoteImages`),
+  `tagged_free` bounds zeroing to allocated capacity and poisons the rear
+  canary, and `crash_contain` latches atomically, wipes secrets before desktop
+  restore, excludes WER dynamically, and writes `%TEMP%\myrkr_crash.bin` only in
+  `DBG_TRACE` builds.
+- **Private desktop DACL, screen-capture exclusion & password EDIT scrubbing.**
+  The private password desktop now uses a 128-bit CSPRNG name per prompt,
+  applies an explicit `SE_DACL_PROTECTED` `TokenUser + SYSTEM` DACL (failing
+  closed if RNG or ACL setup fails), bounds `secdesk_prompt` with a 5-minute
+  watchdog, enables `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)` across
+  top-level windows by default (`AllowScreenCapture = 0`), detaches IME from
+  password `EDIT` controls, and runs a 3-step internal text/undo scrub before
+  teardown.
+- **Pre- and post-open filesystem, archive, policy & log guards.** File and log
+  opens reject Windows device paths (`\\.\`, `\\?\GLOBALROOT`), NTFS `:stream`
+  alternate data streams, non-disk handles, and name-surrogate reparse points
+  (`0x20000000`, blocking symlinks/junctions while preserving OneDrive cloud
+  hydration), collapse `.`/`..` segments in `normalize_path`, resolve default
+  audit-log paths from the process token (`GetUserProfileDirectoryW`), enforce
+  Zip64 sentinel resolution and LFH/Central Directory consistency in `unzip`,
+  and fail closed on malformed `HKLM\SOFTWARE\Myrkr` policy entries.
+- **Static gates, MSI `LaunchCondition` guards, CI & documentation.** Added
+  `tools/check_docs.py` (8 static checkers total, with updated `tools/floors.py`
+  coverage floors), software `SHA-256` fallback when `SHA-NI` is absent,
+  `OSXSAVE`+`XCR0` gate for `AVX2`, pure-Python AES-256-GCM in
+  `tests/indepdecrypttest.py`, MSI downgrade blocking (`NEWERVERSIONDETECTED`),
+  MSI property range/type-coercion `LaunchCondition` checks, `MYRKR_KDFTIME` /
+  `MYRKR_KDFMEMORY` / `MYRKR_SPLITSIZE` / `MYRKR_ALLOWCAPTURE` /
+  `MYRKR_ALLOWUNC` policy & default MSI properties (`301` verified checks),
+  GitHub Actions CI (`.github/workflows/build.yml`), and `docs/TRUST.md` +
+  refreshed `README.md`.
+
 ## [1.1.6] - 2026-10-12
 
 ### Fixed
@@ -97,7 +151,7 @@ what changed and why, not a raw commit dump.
 - Older Myrkr builds (1.1.4 and before) cannot open version 9 containers; they
   report a newer format version rather than damage.
 
-### Tests
+### Tests (1.1.5)
 
 - `myrkr selftest` adds the reference implementation's single-lane 64 MiB
   Argon2id vector - the case every container uses, which the RFC vector cannot
@@ -113,7 +167,7 @@ what changed and why, not a raw commit dump.
 
 ## [1.1.4] - 2026-10-11
 
-### Fixed
+### Fixed (1.1.4)
 
 - **A volume set that cannot be assembled** - a part missing, out of order, or
   from another set - went wrong three ways at once. The parts Myrkr had already

@@ -133,27 +133,34 @@ Check (($streams | ForEach-Object { $_[0] }) -contains "myrkr.cab") "cab stream 
 # --- policy surface ---------------------------------------------------------
 $PolicyKey = "SOFTWARE\Myrkr"
 $expectPolicies = @(
-    @{ Prop="MYRKR_MINLEN";     Value="MinLen" }
-    @{ Prop="MYRKR_MINCLASSES"; Value="MinClasses" }
-    @{ Prop="MYRKR_LOGLEVEL";   Value="LogLevel" }
-    @{ Prop="MYRKR_COMPRESS";   Value="Compress" }
-    @{ Prop="MYRKR_FORMAT";     Value="Format" }
+    @{ Prop="MYRKR_MINLEN";       Value="MinLen" }
+    @{ Prop="MYRKR_MINCLASSES";   Value="MinClasses" }
+    @{ Prop="MYRKR_LOGLEVEL";     Value="LogLevel" }
+    @{ Prop="MYRKR_COMPRESS";     Value="Compress" }
+    @{ Prop="MYRKR_FORMAT";       Value="Format" }
+    @{ Prop="MYRKR_KDFTIME";      Value="KdfTime" }
+    @{ Prop="MYRKR_KDFMEMORY";    Value="KdfMemory" }
+    @{ Prop="MYRKR_SPLITSIZE";    Value="SplitSize" }
+    @{ Prop="MYRKR_ALLOWCAPTURE"; Value="AllowScreenCapture" }
+    @{ Prop="MYRKR_ALLOWUNC";     Value="AllowUnc" }
 )
-# The SAME nine values under a different key, meaning the opposite: a starting
+# The SAME eleven values under a different key, meaning the opposite: a starting
 # value rather than an enforced one.  Checked separately from $expectPolicies
 # because the two must not drift into each other - a "default" written to the
 # policy key would lock the setting it was meant to leave open.
 $DefaultsKey = "SOFTWARE\Myrkr\Defaults"
 $expectDefaults = @(
-    @{ Prop="MYRKR_DEF_MINLEN";     Value="MinLen" }
-    @{ Prop="MYRKR_DEF_MINCLASSES"; Value="MinClasses" }
-    @{ Prop="MYRKR_DEF_LOGLEVEL";   Value="LogLevel" }
-    @{ Prop="MYRKR_DEF_COMPRESS";   Value="Compress" }
-    @{ Prop="MYRKR_DEF_FORMAT";     Value="Format" }
-    @{ Prop="MYRKR_DEF_SECUREDESK"; Value="SecureDesktop" }
-    @{ Prop="MYRKR_DEF_KDFTIME";    Value="KdfTime" }
-    @{ Prop="MYRKR_DEF_KDFMEMORY";  Value="KdfMemory" }
-    @{ Prop="MYRKR_DEF_SPLITSIZE";  Value="SplitSize" }
+    @{ Prop="MYRKR_DEF_MINLEN";       Value="MinLen" }
+    @{ Prop="MYRKR_DEF_MINCLASSES";   Value="MinClasses" }
+    @{ Prop="MYRKR_DEF_LOGLEVEL";     Value="LogLevel" }
+    @{ Prop="MYRKR_DEF_COMPRESS";     Value="Compress" }
+    @{ Prop="MYRKR_DEF_FORMAT";       Value="Format" }
+    @{ Prop="MYRKR_DEF_SECUREDESK";   Value="SecureDesktop" }
+    @{ Prop="MYRKR_DEF_KDFTIME";      Value="KdfTime" }
+    @{ Prop="MYRKR_DEF_KDFMEMORY";    Value="KdfMemory" }
+    @{ Prop="MYRKR_DEF_SPLITSIZE";    Value="SplitSize" }
+    @{ Prop="MYRKR_DEF_ALLOWCAPTURE"; Value="AllowScreenCapture" }
+    @{ Prop="MYRKR_DEF_ALLOWUNC";     Value="AllowUnc" }
 )
 $secure = ($props["SecureCustomProperties"] -split ";")
 $regRows = Query "SELECT ``Registry``,``Root``,``Key``,``Name``,``Value``,``Component_`` FROM ``Registry``" 6
@@ -359,20 +366,46 @@ if ($shellFile) {
           "the CLSID rows belong to the same component as the DLL"
 }
 
-# --- upgrade + sequence -----------------------------------------------------
-$upg = Query "SELECT ``UpgradeCode``,``VersionMin``,``VersionMax``,``Attributes``,``ActionProperty`` FROM ``Upgrade``" 5
-Check ($upg.Count -eq 1) "one Upgrade row"
-if ($upg.Count -eq 1) {
-    $attr = [int]$upg[0][3]
+# --- upgrade + downgrade guard + launch conditions + sequence -----------------
+$upg    = Query "SELECT ``UpgradeCode``,``VersionMin``,``VersionMax``,``Attributes``,``ActionProperty`` FROM ``Upgrade``" 5
+$lcRows = Query "SELECT ``Condition``,``Description`` FROM ``LaunchCondition``" 2
+$upgOld = @($upg | Where-Object { $_[4] -eq "OLDERVERSIONBEINGUPGRADED" })
+$upgNew = @($upg | Where-Object { $_[4] -eq "NEWERVERSIONDETECTED" })
+Check ($upg.Count -eq 2)    "two Upgrade rows (replace older/same + block downgrade)"
+Check ($upgOld.Count -eq 1) "one OLDERVERSIONBEINGUPGRADED Upgrade row"
+if ($upgOld.Count -eq 1) {
+    $attr = [int]$upgOld[0][3]
     Check (($attr -band 512) -ne 0) "Upgrade.Attributes has VersionMaxInclusive (0x200)"
     Check (($attr -band 256) -ne 0) "Upgrade.Attributes has VersionMinInclusive (0x100)"
-    Check ($upg[0][2] -eq $pv)      "VersionMax equals this ProductVersion"
+    Check (($attr -band 2) -eq 0)   "OLDERVERSIONBEINGUPGRADED is not OnlyDetect"
+    Check ($upgOld[0][2] -eq $pv)   "VersionMax equals this ProductVersion"
+}
+Check ($upgNew.Count -eq 1) "one NEWERVERSIONDETECTED Upgrade row (downgrade guard)"
+if ($upgNew.Count -eq 1) {
+    $attr = [int]$upgNew[0][3]
+    Check ($upgNew[0][1] -eq $pv)                       "NEWERVERSIONDETECTED VersionMin equals ProductVersion"
+    Check ([string]::IsNullOrEmpty($upgNew[0][2]))      "NEWERVERSIONDETECTED VersionMax is unbounded"
+    Check (($attr -band 2) -ne 0)                       "NEWERVERSIONDETECTED has OnlyDetect (0x2)"
+    Check (($attr -band 256) -eq 0)                     "NEWERVERSIONDETECTED omits VersionMinInclusive (same-version rebuild allowed)"
+}
+Check ($secure -contains "NEWERVERSIONDETECTED") "NEWERVERSIONDETECTED is in SecureCustomProperties"
+$lcConds = @($lcRows | ForEach-Object { $_[0] })
+Check ($lcConds -contains "NOT NEWERVERSIONDETECTED") "LaunchCondition blocks downgrades (NOT NEWERVERSIONDETECTED)"
+$expectLcCount = 1 + $expectPolicies.Count + $expectDefaults.Count + 1
+Check ($lcRows.Count -eq $expectLcCount) ("LaunchCondition has all {0} guards (downgrade + policies + defaults + SecureDesktop)" -f $expectLcCount)
+foreach ($propName in @(($expectPolicies | ForEach-Object { $_.Prop }) + ($expectDefaults | ForEach-Object { $_.Prop }) + @("MYRKR_SECUREDESKTOP"))) {
+    $guarded = @($lcConds | Where-Object { $_ -match ("\b" + [regex]::Escape($propName) + "\b") })
+    Check ($guarded.Count -eq 1) ("LaunchCondition validates {0} against type-coercion / bad range" -f $propName)
 }
 
 $seq = @{}
 foreach ($r in (Query "SELECT ``Action``,``Sequence`` FROM ``InstallExecuteSequence``" 2)) { $seq[$r[0]] = [int]$r[1] }
-foreach ($a in @("WriteRegistryValues","RemoveRegistryValues","RemoveExistingProducts","FindRelatedProducts","InstallFinalize")) {
+foreach ($a in @("WriteRegistryValues","RemoveRegistryValues","RemoveExistingProducts","FindRelatedProducts","LaunchConditions","InstallFinalize")) {
     Check ($seq.ContainsKey($a)) ("InstallExecuteSequence has {0}" -f $a)
+}
+if ($seq.ContainsKey("FindRelatedProducts") -and $seq.ContainsKey("LaunchConditions")) {
+    Check ($seq["FindRelatedProducts"] -lt $seq["LaunchConditions"]) `
+          ("InstallExecuteSequence runs FindRelatedProducts ({0}) before LaunchConditions ({1})" -f $seq["FindRelatedProducts"], $seq["LaunchConditions"])
 }
 if ($seq.ContainsKey("RemoveExistingProducts")) {
     $before = $seq.GetEnumerator() | Where-Object { $_.Value -lt $seq["RemoveExistingProducts"] } |
@@ -425,8 +458,13 @@ Check ($props["MSIRESTARTMANAGERCONTROL"] -eq "Disable") `
       ("Restart Manager is disabled (MSIRESTARTMANAGERCONTROL='{0}')" -f $props["MSIRESTARTMANAGERCONTROL"])
 
 $uiSeq = @{}
-foreach ($r in (Query "SELECT ``Action`` FROM ``InstallUISequence``" 1)) { $uiSeq[$r[0]] = $true }
+foreach ($r in (Query "SELECT ``Action``,``Sequence`` FROM ``InstallUISequence``" 2)) { $uiSeq[$r[0]] = [int]$r[1] }
 Check ($uiSeq.ContainsKey("FindRelatedProducts")) "FindRelatedProducts also in InstallUISequence (else skipped as 'already done on client side')"
+Check ($uiSeq.ContainsKey("LaunchConditions"))    "LaunchConditions also in InstallUISequence"
+if ($uiSeq.ContainsKey("FindRelatedProducts") -and $uiSeq.ContainsKey("LaunchConditions")) {
+    Check ($uiSeq["FindRelatedProducts"] -lt $uiSeq["LaunchConditions"]) `
+          ("InstallUISequence runs FindRelatedProducts ({0}) before LaunchConditions ({1})" -f $uiSeq["FindRelatedProducts"], $uiSeq["LaunchConditions"])
+}
 
 [void][Runtime.InteropServices.Marshal]::ReleaseComObject($db)
 
@@ -468,6 +506,11 @@ try {
         $st = Comp-State $s $compName
         Check ($st -ne $INSTALLSTATE_LOCAL) ("without {0}: policy component not installed" -f $p.Prop)
     }
+    foreach ($d in $expectDefaults) {
+        $compName = ($regRows | Where-Object { $_[2] -eq $DefaultsKey -and $_[3] -eq $d.Value })[5]
+        $st = Comp-State $s $compName
+        Check ($st -ne $INSTALLSTATE_LOCAL) ("without {0}: default component not installed" -f $d.Prop)
+    }
     Check ((Comp-State $s "FileAssoc")  -eq $INSTALLSTATE_LOCAL) "by default: .mrk association IS installed"
     Check ((Comp-State $s "CtxHandler") -eq $INSTALLSTATE_LOCAL) "by default: the context-menu handler IS installed"
     Check ((Comp-State $s "ShellExt")  -eq $INSTALLSTATE_LOCAL) "by default: the drag-drop handler IS installed"
@@ -488,13 +531,18 @@ try {
     }
     [void][Runtime.InteropServices.Marshal]::ReleaseComObject($s)
 
-    # (b) properties set: each named policy component must be selected
-    $line = ($expectPolicies | ForEach-Object { $_.Prop + "=1" }) -join " "
+    # (b) properties set: each named policy and default component must be selected
+    $line = (($expectPolicies | ForEach-Object { $_.Prop + "=1" }) + ($expectDefaults | ForEach-Object { $_.Prop + "=1" })) -join " "
     $s = Cost-Session $line
     foreach ($p in $expectPolicies) {
         $compName = ($regRows | Where-Object { $_[2] -eq $PolicyKey -and $_[3] -eq $p.Value })[5]
         $st = Comp-State $s $compName
         Check ($st -eq $INSTALLSTATE_LOCAL) ("with {0}=1: policy component IS installed" -f $p.Prop)
+    }
+    foreach ($d in $expectDefaults) {
+        $compName = ($regRows | Where-Object { $_[2] -eq $DefaultsKey -and $_[3] -eq $d.Value })[5]
+        $st = Comp-State $s $compName
+        Check ($st -eq $INSTALLSTATE_LOCAL) ("with {0}=1: default component IS installed" -f $d.Prop)
     }
     [void][Runtime.InteropServices.Marshal]::ReleaseComObject($s)
 

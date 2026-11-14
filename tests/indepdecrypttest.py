@@ -30,14 +30,147 @@ Myrkr's own `verify` ("OK (authentic)"), and failed every container case here
 with "MAC check failed".  That is the class of mistake this file exists for.
 
 Needs a dbg build: the segmented and split cases use MYRKR_DBG_SEGBYTES and
-MYRKR_DBG_VOLBYTES, and encrypt takes -p.  pycryptodomex comes with pyzipper.
+MYRKR_DBG_VOLBYTES, and encrypt takes -p.  Stdlib only (zero third-party deps).
 
     python tests/indepdecrypttest.py <dbg myrkr.exe>
 """
-import os, sys, re, struct, hashlib, ctypes, subprocess, tempfile, shutil, uuid
-from Cryptodome.Cipher import AES
+import os, sys, re, struct, hashlib, hmac, ctypes, subprocess, tempfile, shutil, uuid
 
 sys.stdout.reconfigure(encoding='utf-8')
+
+# =============================================== Pure-Python AES-256-GCM ====
+_SBOX = bytes.fromhex(
+    "637c777bf26b6fc53001672bfed7ab76ca82c97dfa5947f0add4a2af9ca472c0"
+    "b7fd9326363ff7cc34a5e5f171d8311504c723c31896059a071280e2eb27b275"
+    "09832c1a1b6e5aa0523bd6b329e32f8453d100ed20fcb15b6acbbe394a4c58cf"
+    "d0efaafb434d338545f9027f503c9fa851a3408f929d38f5bcb6da2110fff3d2"
+    "cd0c13ec5f974417c4a77e3d645d197360814fdc222a908846eeb814de5e0bdb"
+    "e0323a0a4906245cc2d3ac629195e479e7c8376d8dd54ea96c56f4ea657aae08"
+    "ba78252e1ca6b4c6e8dd741f4bbd8b8a703eb5664803f60e613557b986c11d9e"
+    "e1f8981169d98e949b1e87e9ce5528df8ca1890dbfe6426841992d0fb054bb16"
+)
+_RCON = [0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1B, 0x36, 0x6C, 0xD8, 0xAB, 0x4D]
+
+def _xtime(a):
+    a <<= 1
+    return (a ^ 0x11B) & 0xFF if (a & 0x100) else (a & 0xFF)
+
+def _mul(a, b):
+    p = 0
+    for _ in range(8):
+        if b & 1:
+            p ^= a
+        b >>= 1
+        a = _xtime(a)
+    return p & 0xFF
+
+def _key_expansion_256(key):
+    assert len(key) == 32
+    nk, nr = 8, 14
+    words = [list(key[i:i + 4]) for i in range(0, 32, 4)]
+    for i in range(nk, 4 * (nr + 1)):
+        temp = list(words[i - 1])
+        if i % nk == 0:
+            temp = [_SBOX[b] for b in (temp[1:] + temp[:1])]
+            temp[0] ^= _RCON[i // nk - 1]
+        elif i % nk == 4:
+            temp = [_SBOX[b] for b in temp]
+        words.append([words[i - nk][j] ^ temp[j] for j in range(4)])
+    return [[b for w in range(4) for b in words[r * 4 + w]] for r in range(nr + 1)]
+
+def _aes256_block(block, rk):
+    s = [[block[r + 4 * c] for c in range(4)] for r in range(4)]
+    def add_rk(rkey):
+        for c in range(4):
+            for r in range(4):
+                s[r][c] ^= rkey[c * 4 + r]
+    add_rk(rk[0])
+    for rnd in range(1, 14):
+        for r in range(4):
+            for c in range(4):
+                s[r][c] = _SBOX[s[r][c]]
+        s[1] = s[1][1:] + s[1][:1]
+        s[2] = s[2][2:] + s[2][:2]
+        s[3] = s[3][3:] + s[3][:3]
+        for c in range(4):
+            col = [s[r][c] for r in range(4)]
+            s[0][c] = _mul(col[0], 2) ^ _mul(col[1], 3) ^ col[2] ^ col[3]
+            s[1][c] = col[0] ^ _mul(col[1], 2) ^ _mul(col[2], 3) ^ col[3]
+            s[2][c] = col[0] ^ col[1] ^ _mul(col[2], 2) ^ _mul(col[3], 3)
+            s[3][c] = _mul(col[0], 3) ^ col[1] ^ col[2] ^ _mul(col[3], 2)
+        add_rk(rk[rnd])
+    for r in range(4):
+        for c in range(4):
+            s[r][c] = _SBOX[s[r][c]]
+    s[1] = s[1][1:] + s[1][:1]
+    s[2] = s[2][2:] + s[2][:2]
+    s[3] = s[3][3:] + s[3][:3]
+    add_rk(rk[14])
+    return bytes(s[r][c] for c in range(4) for r in range(4))
+
+def _ghash_htable(h_int):
+    # Precompute 4-bit Shoup table M[0..15] for H in GF(2^128) so 300 KB segments
+    # authenticate in milliseconds in pure Python without external libraries.
+    def gf_mul(x, y):
+        z, v = 0, x
+        for bit in range(127, -1, -1):
+            if (y >> bit) & 1:
+                z ^= v
+            v = ((v >> 1) ^ (0xE1 << 120)) if (v & 1) else (v >> 1)
+        return z
+    return [gf_mul(h_int, i << 124) for i in range(16)]
+
+_RED4 = [0] * 16
+for _i in range(16):
+    _v = _i
+    _r = 0
+    for _ in range(4):
+        if _v & 1:
+            _r = (_r >> 1) ^ (0xE1 << 120)
+        else:
+            _r >>= 1
+        _v >>= 1
+    _RED4[_i] = _r
+
+def _ghash(htab, data):
+    y = 0
+    for i in range(0, len(data), 16):
+        blk = data[i:i + 16]
+        if len(blk) < 16:
+            blk = blk + b"\x00" * (16 - len(blk))
+        x = y ^ int.from_bytes(blk, "big")
+        z = 0
+        for nib_shift in range(0, 128, 4):
+            nib = (x >> nib_shift) & 0xF
+            rem = z & 0xF
+            z = (z >> 4) ^ _RED4[rem] ^ htab[nib]
+        y = z
+    return y
+
+_KEY_CACHE = {}
+def _gcm_ctx(key):
+    ctx = _KEY_CACHE.get(key)
+    if ctx is None:
+        rk = _key_expansion_256(key)
+        h_int = int.from_bytes(_aes256_block(b"\x00" * 16, rk), "big")
+        ctx = (rk, _ghash_htable(h_int))
+        _KEY_CACHE[key] = ctx
+    return ctx
+
+def _pad16(b):
+    rem = len(b) & 15
+    return b + (b"\x00" * (16 - rem)) if rem else b
+
+def gcm_selftest():
+    key = b"\x00" * 32
+    rk, htab = _gcm_ctx(key)
+    j0 = b"\x00" * 12 + b"\x00\x00\x00\x01"
+    ctr1 = b"\x00" * 12 + b"\x00\x00\x00\x02"
+    ct = _aes256_block(ctr1, rk)
+    s = _ghash(htab, _pad16(ct) + struct.pack(">QQ", 0, 128))
+    tag = (s ^ int.from_bytes(_aes256_block(j0, rk), "big")).to_bytes(16, "big")
+    assert ct.hex() == "cea7403d4d606b6e074ec5d3baf39d18", ct.hex()
+    assert tag.hex() == "d0d1c8a799996bf0265b98b5d48ab919", tag.hex()
 
 # ============================================================== Argon2id ====
 M64 = (1 << 64) - 1
@@ -163,9 +296,26 @@ def read_logical(path):
         n += 1
 
 def gcm_open(key, counter, seg, aad, ct, tag):
-    c = AES.new(key, AES.MODE_GCM, nonce=struct.pack('<QI', counter, seg), mac_len=16)
-    c.update(aad)
-    return c.decrypt_and_verify(ct, tag)
+    if len(tag) != 16:
+        raise ValueError('MAC check failed')
+    rk, htab = _gcm_ctx(key)
+    iv = struct.pack('<QI', counter, seg)
+    j0 = iv + b'\x00\x00\x00\x01'
+    ghash_in = _pad16(aad) + _pad16(ct) + struct.pack('>QQ', len(aad) * 8, len(ct) * 8)
+    s = _ghash(htab, ghash_in)
+    ej0 = _aes256_block(j0, rk)
+    calc_tag = (s ^ int.from_bytes(ej0, 'big')).to_bytes(16, 'big')
+    if not hmac.compare_digest(calc_tag, bytes(tag)):
+        raise ValueError('MAC check failed')
+    out = bytearray()
+    ctr_hi = iv
+    ctr_lo = 1
+    for i in range(0, len(ct), 16):
+        ctr_lo = (ctr_lo + 1) & 0xFFFFFFFF
+        ks = _aes256_block(ctr_hi + struct.pack('>I', ctr_lo), rk)
+        chunk = ct[i:i + 16]
+        out += bytes(a ^ b for a, b in zip(chunk, ks))
+    return bytes(out)
 
 _cab = None
 def xpress(payload, orig):
@@ -244,7 +394,9 @@ def main():
         if not ok: fails.append(what)
 
     # ---- the reference itself, before it is trusted with anything ----------
-    print('== Argon2id reference ==')
+    print('== AES-256-GCM + Argon2id reference ==')
+    gcm_selftest()
+    check(True, 'NIST SP 800-38D AES-256-GCM all-zero vector (pure Python)')
     check(argon2id(b'\x01' * 32, b'\x02' * 16, 3, 32, 4, 32, b'\x03' * 8, b'\x04' * 12).hex()
           == '0d640df58d78766c08c037a34a8b53c9d01ef0452d75b65eb52520e96b01e659',
           'RFC 9106 5.3 vector (t=3, m=32 KiB, p=4, secret, ad)')

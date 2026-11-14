@@ -24,14 +24,15 @@ FADE_TAG    = 0xFADE0000
 # a working control report FAIL on roughly a third of runs.
 # None still means "expect a bare access violation" if a future case needs it.
 CASES = {
-    "canary":    0x0002,   # FF_STACK_COOKIE
-    "shadow":    0xF001,   # FF_SHADOW_STACK
-    "dlpv":      0x000A,   # FF_GUARD_ICALL
-    "overflow":  0xF005,   # FF_OVERFLOW
-    "bounds":    0xF004,   # FF_BOUNDS
-    "typemagic": 0xF003,   # FF_TYPE_MAGIC
-    "heaptag":   0xF002,   # FF_HEAP_TAG
-    "iat":       0x1A70,   # FF_IAT_RO: AV on a write to the locked IAT slot
+    "canary":     0x0002,   # FF_STACK_COOKIE
+    "shadow":     0xF001,   # FF_SHADOW_STACK
+    "shadow_anc": 0xF001,   # FF_SHADOW_STACK: pivot to live ancestor return address
+    "dlpv":       0x000A,   # FF_GUARD_ICALL
+    "overflow":   0xF005,   # FF_OVERFLOW
+    "bounds":     0xF004,   # FF_BOUNDS
+    "typemagic":  0xF003,   # FF_TYPE_MAGIC
+    "heaptag":    0xF002,   # FF_HEAP_TAG
+    "iat":        0x1A70,   # FF_IAT_RO: AV on a write to the locked IAT slot
 }
 
 def run(exe, args):

@@ -48,8 +48,24 @@ externdef g_passw:word                  ; gui.asm: wide password as typed
 externdef g_confirmw:word               ; gui.asm: wide confirm field
 externdef g_pkctx:byte                  ; pack.asm: streaming GCM ctx (round keys)
 externdef g_gctx:byte                   ; cmd.asm: single-file GCM ctx (round keys)
+externdef g_b2bctx:byte                 ; argon2.asm: BLAKE2b H0 pre-hash ctx
+externdef g_hbuf:byte                   ; argon2.asm: H0 (64) + lane/blk header
+externdef g_inp:byte                    ; argon2.asm: index/input scratch block
+externdef g_addr:byte                   ; argon2.asm: address scratch block
+externdef zip_keys:byte                 ; zip.asm: WinZip-AES PBKDF2 output
+externdef zip_rk:byte                   ; zip.asm: WinZip-AES expanded round keys
+externdef zip_ipad:byte                 ; zip.asm: HMAC-SHA1 inner pad
+externdef zip_opad:byte                 ; zip.asm: HMAC-SHA1 outer pad
+externdef zip_sctx:byte                 ; zip.asm: HMAC-SHA1 context
+externdef zip_inner:byte                ; zip.asm: HMAC-SHA1 inner digest
+externdef uz_keys:byte                  ; unzip.asm: WinZip-AES PBKDF2 output
+externdef uz_rk:byte                    ; unzip.asm: WinZip-AES expanded round keys
+externdef uz_ipad:byte                  ; unzip.asm: HMAC-SHA1 inner pad
+externdef uz_opad:byte                  ; unzip.asm: HMAC-SHA1 outer pad
+externdef uz_sctx:byte                  ; unzip.asm: HMAC-SHA1 context
+externdef uz_inner:byte                 ; unzip.asm: HMAC-SHA1 inner digest
 
-SECMEM_MAX      equ 8              ; registered regions (2 used; room to grow)
+SECMEM_MAX      equ 32             ; registered static secret regions
 ; Slack added to the working set when a lock is refused for quota.  One lock is
 ; at most a couple of pages, but the quota is granted in whole pages and the
 ; process needs headroom for its own pages too.
@@ -58,6 +74,8 @@ SECMEM_WS_SLACK equ 1048576        ; 1 MiB
 .data?
 g_sm_ptr        dq SECMEM_MAX dup (?)   ; region base
 g_sm_len        dq SECMEM_MAX dup (?)   ; region length in bytes
+g_sm_dyn_ptr    dq ?                    ; transient KDF arena base (wipe-only on crash)
+g_sm_dyn_len    dq ?                    ; transient KDF arena byte length
 g_sm_count      dd ?                    ; registered regions
 g_sm_ok         dd ?                    ; 1 = every region locked successfully
 
@@ -171,9 +189,97 @@ secmem_init proc frame
     mov     rdx, 336
     call    secmem_add
 
+    ; Argon2id static working buffers (H0 pre-hash + address/input blocks)
+    lea     rcx, [g_b2bctx]
+    mov     rdx, 256
+    call    secmem_add
+
+    lea     rcx, [g_hbuf]
+    mov     rdx, 80
+    call    secmem_add
+
+    lea     rcx, [g_inp]
+    mov     rdx, 1024
+    call    secmem_add
+
+    lea     rcx, [g_addr]
+    mov     rdx, 1024
+    call    secmem_add
+
+    ; WinZip-AES ZIP writer / extractor key material & HMAC state
+    lea     rcx, [zip_keys]
+    mov     rdx, 72
+    call    secmem_add
+
+    lea     rcx, [zip_rk]
+    mov     rdx, 240
+    call    secmem_add
+
+    lea     rcx, [zip_ipad]
+    mov     rdx, 64
+    call    secmem_add
+
+    lea     rcx, [zip_opad]
+    mov     rdx, 64
+    call    secmem_add
+
+    lea     rcx, [zip_sctx]
+    mov     rdx, SHA1_CTX_SIZE
+    call    secmem_add
+
+    lea     rcx, [zip_inner]
+    mov     rdx, 20
+    call    secmem_add
+
+    lea     rcx, [uz_keys]
+    mov     rdx, 72
+    call    secmem_add
+
+    lea     rcx, [uz_rk]
+    mov     rdx, 240
+    call    secmem_add
+
+    lea     rcx, [uz_ipad]
+    mov     rdx, 64
+    call    secmem_add
+
+    lea     rcx, [uz_opad]
+    mov     rdx, 64
+    call    secmem_add
+
+    lea     rcx, [uz_sctx]
+    mov     rdx, SHA1_CTX_SIZE
+    call    secmem_add
+
+    lea     rcx, [uz_inner]
+    mov     rdx, 20
+    call    secmem_add
+
+    mov     qword ptr [g_sm_dyn_ptr], 0
+    mov     qword ptr [g_sm_dyn_len], 0
+
     FRAME_EPILOG
     ret
 secmem_init endp
+
+; =============================================================================
+; secmem_register_range(rcx = ptr, rdx = len) / secmem_unregister_range()
+; Tracks a transient large region (such as the Argon2id arena) for crash-time
+; secure_zero without attempting to VirtualLock hundreds of MiB.
+; =============================================================================
+public secmem_register_range
+secmem_register_range proc
+    mov     qword ptr [g_sm_dyn_ptr], rcx
+    mov     qword ptr [g_sm_dyn_len], rdx
+    ret
+secmem_register_range endp
+
+public secmem_unregister_range
+secmem_unregister_range proc
+    mov     qword ptr [g_sm_dyn_ptr], 0
+    mov     qword ptr [g_sm_dyn_len], 0
+    ret
+secmem_unregister_range endp
 
 ; =============================================================================
 ; secmem_locked -> eax = 1 if every registered region is pinned, else 0.
@@ -211,6 +317,16 @@ sw_loop:
     inc     dword ptr [rbp-24]
     jmp     sw_loop
 sw_done:
+    mov     rcx, qword ptr [g_sm_dyn_ptr]
+    mov     rdx, qword ptr [g_sm_dyn_len]
+    mov     qword ptr [g_sm_dyn_ptr], 0
+    mov     qword ptr [g_sm_dyn_len], 0
+    test    rcx, rcx
+    jz      sw_nodin
+    test    rdx, rdx
+    jz      sw_nodin
+    call    secure_zero
+sw_nodin:
     FRAME_EPILOG
     ret
 secmem_wipe_all endp

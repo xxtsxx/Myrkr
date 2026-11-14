@@ -99,10 +99,9 @@ keeps a stricter CLI value), Compress and SecureDesktop are pinned exactly. KDF 
 should be a **floor**, matching the password-policy rows: a higher cost is stronger,
 so an administrator's value must not be lowered but may be exceeded.
 
-The MSI does not expose these as properties. HKLM still works — an administrator can
-write the values by hand — but adding `MYRKR_KDFTIME`/`MYRKR_KDFMEMORY` to
-`tools/make_msi.ps1` (and their assertions to `verify_msi.ps1`, which counts 126)
-would make them first-class. That is a separate change.
+At the time of 1.0.9, the MSI did not yet expose these as properties (`MYRKR_KDFTIME`,
+`MYRKR_KDFMEMORY`, and `MYRKR_SPLITSIZE` were subsequently added to `tools/make_msi.ps1`
+and `tools/verify_msi.ps1` alongside `MYRKR_DEF_*`).
 
 ## 6. How it was verified
 

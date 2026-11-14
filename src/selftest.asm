@@ -10,7 +10,9 @@
 include macros.inc
 
 extern sha256_hash:proc
+extern sha256_compress_sw:proc
 extern ct_memcmp:proc
+extern secure_zero:proc
 extern print_a:proc
 extern gcm_seal:proc
 extern gcm_open:proc
@@ -33,6 +35,7 @@ externdef g_cfg_splitidx:dword
 extern secmem_locked:proc               ; secmem.asm: 1 = all secret regions pinned
 extern crc32_update:proc
 extern sha1_hash:proc
+extern hmac_sha1:proc
 extern pbkdf2_hmac_sha1:proc
 extern inflate:proc
 extern aes_expand_key:proc
@@ -72,6 +75,11 @@ st_abc          db "abc"
 ; SHA-256("abc")
 sha_abc_exp     db 0bah,078h,016h,0bfh,08fh,001h,0cfh,0eah,041h,041h,040h,0deh,05dh,0aeh,022h,023h
                 db 0b0h,003h,061h,0a3h,096h,017h,07ah,09ch,0b4h,010h,0ffh,061h,0f2h,000h,015h,0adh
+align 4
+sha_sw_iv       dd 06a09e667h,0bb67ae85h,03c6ef372h,0a54ff53ah,0510e527fh,09b05688ch,01f83d9abh,05be0cd19h
+sha_sw_blk      db 'a','b','c',080h
+                db 52 dup (0)
+                db 0,0,0,0,0,0,0,24
 
 CSTR st_pass_sha,  "  [PASS] sha-256  (FIPS 180-4 'abc')",13,10
 CSTR st_fail_sha,  "  [FAIL] sha-256",13,10
@@ -129,6 +137,10 @@ pw_oneclass db "abcdefghijklmnopqrs"         ; 19 lower only (too few classes)
 pw_oneclass_n equ $ - pw_oneclass
 pw_good3    db "Abcdefghij12"                ; 12 chars, U+L+D = 3 classes
 pw_good3_n  equ $ - pw_good3
+pw_utf8_11  db "Ab1defghij", 0C3h, 0A9h      ; 11 UTF-8 code points (12 bytes), 4 classes -> too short (1)
+pw_utf8_11_n equ $ - pw_utf8_11
+pw_utf8_2c  db "aaaaaaaaaaa", 0C3h, 0A9h     ; 12 UTF-8 code points ('e-acute'), L+S = 2 classes -> too few (2)
+pw_utf8_2c_n equ $ - pw_utf8_2c
 
 ; ---- nonce layout vectors ---------------------------------------------------
 ; Each row is: counter (8), segment (4), then the 12 bytes nonce_set must write.
@@ -329,6 +341,12 @@ crc_msg     db "123456789"
 crc_msg_n   equ $ - crc_msg
 sha1_abc    db "abc"
 sha1_abc_exp db 0a9h,099h,03eh,036h,047h,006h,081h,06ah,0bah,03eh,025h,071h,078h,050h,0c2h,06ch,09ch,0d0h,0d8h,09dh
+; RFC 2202 HMAC-SHA1 Test Case 6: 80-byte key (>64 block size -> hashed first)
+hm6_key     db 80 dup (0AAh)
+hm6_msg     db "Test Using Larger Than Block-Size Key - Hash Key First"
+hm6_msg_n   equ $ - hm6_msg
+hm6_exp     db 0aah,04ah,0e5h,0e1h,052h,072h,0d0h,00eh,095h,070h
+            db 056h,037h,0ceh,08ah,03bh,055h,0edh,040h,021h,012h
 pbk_exp:
             db 0efh,0d0h,0b0h,036h,023h,00bh,0c8h,074h,08bh,0f2h,017h,0feh,033h,025h,073h,025h
             db 08ah,02dh,0a7h,0f3h,05eh,0cdh,09ah,0ech,025h,0a8h,000h,08ch,01fh,0e9h,056h,0a8h
@@ -418,6 +436,7 @@ gcm_tag2b       db 16 dup (?)
 align 16
 gcm_ip_pt       db 20 dup (?)        ; 20 bytes -> 1 block + 4-byte tail
 gcm_ip_buf      db 20 dup (?)        ; in-place work buffer
+gcm_ip_ct       db 20 dup (?)        ; saved ciphertext for forged-tag preservation check
 gcm_ip_tag      db 16 dup (?)
 align 16
 arg_x           db 1024 dup (?)
@@ -509,11 +528,35 @@ run_selftest proc frame
     mov     edx, st_hdr_len
     call    print_a
 
-    ; ---- SHA-256("abc") -----------------------------------------------------
+    ; ---- SHA-256("abc") (hardware + scalar fallback) ------------------------
     lea     rcx, [st_abc]
     mov     rdx, 3
     lea     r8, [st_out]
     call    sha256_hash
+    lea     rcx, [st_out]
+    lea     rdx, [sha_abc_exp]
+    mov     r8, 32
+    call    ct_memcmp
+    test    eax, eax
+    jnz     st_sha_fail
+    ; verify scalar sha256_compress_sw matches FIPS 180-4 "abc"
+    movdqu  xmm0, xmmword ptr [sha_sw_iv]
+    movdqu  xmmword ptr [st_out], xmm0
+    movdqu  xmm0, xmmword ptr [sha_sw_iv+16]
+    movdqu  xmmword ptr [st_out+16], xmm0
+    lea     rcx, [st_out]
+    lea     rdx, [sha_sw_blk]
+    mov     r8, 1
+    call    sha256_compress_sw
+    lea     rcx, [st_out]
+    xor     r9d, r9d
+st_sha_sw_bswap:
+    mov     eax, dword ptr [rcx + r9*4]
+    bswap   eax
+    mov     dword ptr [rcx + r9*4], eax
+    inc     r9d
+    cmp     r9d, 8
+    jb      st_sha_sw_bswap
     lea     rcx, [st_out]
     lea     rdx, [sha_abc_exp]
     mov     r8, 32
@@ -653,6 +696,27 @@ st_after_aad:
     mov     qword ptr [greq].GCMREQ.tag, rax
     lea     rcx, [greq]
     call    gcm_seal
+    ; snapshot sealed ciphertext into gcm_ip_ct, flip tag bit, verify in-place
+    ; gcm_open rejects AND leaves gcm_ip_buf completely untouched!
+    movdqu  xmm0, xmmword ptr [gcm_ip_buf]
+    movdqu  xmmword ptr [gcm_ip_ct], xmm0
+    mov     eax, dword ptr [gcm_ip_buf+16]
+    mov     dword ptr [gcm_ip_ct+16], eax
+    xor     byte ptr [gcm_ip_tag], 1
+    lea     rax, [gcm_ip_buf]
+    mov     qword ptr [greq].GCMREQ.inp, rax
+    mov     qword ptr [greq].GCMREQ.outp, rax
+    lea     rcx, [greq]
+    call    gcm_open
+    cmp     eax, 1
+    jne     st_ip_fail
+    lea     rcx, [gcm_ip_buf]
+    lea     rdx, [gcm_ip_ct]
+    mov     r8, 20
+    call    ct_memcmp
+    test    eax, eax
+    jnz     st_ip_fail
+    xor     byte ptr [gcm_ip_tag], 1
     ; open in place: inp == outp == ip_buf
     lea     rax, [gcm_ip_buf]
     mov     qword ptr [greq].GCMREQ.inp, rax
@@ -897,6 +961,10 @@ st_after_a2l:
     mov     dword ptr [r12].ARGON2REQ.flags, 0
 
     ; ---- password policy (default min 12 chars / 3 of 4 classes) ------------
+    mov     eax, dword ptr [g_cfg_pwminlen]
+    mov     dword ptr [rbp-32], eax
+    mov     eax, dword ptr [g_cfg_pwminclasses]
+    mov     dword ptr [rbp-36], eax
     mov     dword ptr [g_cfg_pwminlen], 12
     mov     dword ptr [g_cfg_pwminclasses], 3
     LOADPW  pw_short, pw_short_n            ; 5 chars -> too short (1)
@@ -911,6 +979,14 @@ st_after_a2l:
     call    check_password_policy
     test    eax, eax
     jnz     st_pw_fail
+    LOADPW  pw_utf8_11, pw_utf8_11_n        ; 11 UTF-8 code points (12 bytes) -> too short (1)
+    call    check_password_policy
+    cmp     eax, 1
+    jne     st_pw_fail
+    LOADPW  pw_utf8_2c, pw_utf8_2c_n        ; 12 UTF-8 code points, 2 classes -> too few (2)
+    call    check_password_policy
+    cmp     eax, 2
+    jne     st_pw_fail
     lea     rcx, [st_pass_pw]
     mov     edx, st_pass_pw_len
     call    print_a
@@ -921,6 +997,14 @@ st_pw_fail:
     call    print_a
     inc     qword ptr [rbp-24]
 st_after_pw:
+    mov     eax, dword ptr [rbp-32]
+    mov     dword ptr [g_cfg_pwminlen], eax
+    mov     eax, dword ptr [rbp-36]
+    mov     dword ptr [g_cfg_pwminclasses], eax
+    mov     dword ptr [g_cfg_passlen], 0
+    lea     rcx, [g_cfg_pass]
+    mov     edx, MAX_PASSWORD_BYTES+1
+    call    secure_zero
 
     ; ---- archive entry-name path-traversal safety --------------------------
     lea     rcx, [san_safe1]
@@ -1317,6 +1401,14 @@ st_after_crc:
     call    ct_memcmp
     test    eax, eax
     jnz     st_sha1_fail
+    ; also verify HMAC-SHA1 >64-byte key path (RFC 2202 case 6, 80-byte key)
+    WINCALL hmac_sha1, addr hm6_key, 80, addr hm6_msg, hm6_msg_n, addr sha1_out
+    lea     rcx, [sha1_out]
+    lea     rdx, [hm6_exp]
+    mov     r8, 20
+    call    ct_memcmp
+    test    eax, eax
+    jnz     st_sha1_fail
     lea     rcx, [st_pass_sha1]
     mov     edx, st_pass_sha1_len
     call    print_a
@@ -1388,6 +1480,13 @@ st_after_inf:
     AESKAT  16, aeskat_c128
     AESKAT  24, aeskat_c192
     AESKAT  32, aeskat_c256
+    ; invalid key length (20) must be rejected with Nr = 0
+    lea     rcx, [aeskat_key]
+    mov     rdx, 20
+    lea     r8, [aeskat_rk]
+    call    aes_expand_key
+    test    eax, eax
+    jnz     st_aes_fail
     lea     rcx, [st_pass_aes]
     mov     edx, st_pass_aes_len
     call    print_a
