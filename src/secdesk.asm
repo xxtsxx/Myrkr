@@ -38,16 +38,21 @@
 include macros.inc
 
 extern CreateDesktopW:proc
+extern OpenDesktopW:proc
 extern CloseDesktop:proc
 extern SetThreadDesktop:proc
 extern GetThreadDesktop:proc
 extern OpenInputDesktop:proc
 extern SwitchDesktop:proc
 extern SetUserObjectSecurity:proc
+extern CreateWindowExW:proc
+extern DestroyWindow:proc
 extern GetCurrentThreadId:proc
+extern CreateThread:proc
+extern WaitForSingleObject:proc
+extern Sleep:proc
 extern OpenProcessToken:proc
 extern GetTokenInformation:proc
-extern CreateWellKnownSid:proc
 extern InitializeAcl:proc
 extern AddAccessAllowedAce:proc
 extern InitializeSecurityDescriptor:proc
@@ -56,38 +61,46 @@ extern SetSecurityDescriptorControl:proc
 extern CloseHandle:proc
 extern rng_fill:proc
 extern secure_zero:proc
-ifdef DBG_TRACE
-extern CreateThread:proc
-extern WaitForSingleObject:proc
-extern Sleep:proc
-extern print_a:proc
 extern sstk_thread_init:proc
 extern sstk_thread_free:proc
+ifdef DBG_TRACE
+extern print_a:proc
 endif
 
 GENERIC_ALL             equ 10000000h
+DESKTOP_MAXALLOWED_     equ 02000000h   ; MAXIMUM_ALLOWED
 DESKTOP_CREATE_ACCESS_  equ 000601FFh   ; READ_CONTROL | WRITE_DAC | DESKTOP_ALL(01FFh)
 DESKTOP_USER_STRIPPED_  equ 00020146h   ; READ_CONTROL | SWITCH | ENUM | CREATEMENU | CREATEWINDOW
                                         ; (strips READOBJECTS, WRITEOBJECTS, HOOKCONTROL, JOURNAL*)
 ACL_REVISION_           equ 2
 SD_REVISION_            equ 1
 SE_DACL_PROTECTED_      equ 1000h
-WIN_LOCAL_SYSTEM_SID_   equ 22
+SECDESK_TRIES_          equ 6
+SECDESK_WAIT_           equ 40          ; ms between SwitchDesktop retries
 
 .const
 align 4
-sd_dacl_si  dd 4                        ; DACL_SECURITY_INFORMATION (passed by pointer)
-sd_hex      db "0123456789abcdef"
+sd_dacl_si      dd 4                                                ; DACL_SECURITY_INFORMATION (by pointer)
+sid_local_sys   db 1, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0              ; S-1-5-18 (NT AUTHORITY\SYSTEM)
+sid_dwm_grp     db 1, 2, 0, 0, 0, 0, 0, 5, 90, 0, 0, 0, 0, 0, 0, 0  ; S-1-5-90-0 (Window Manager\DWM-*)
+sid_umfd_grp    db 1, 2, 0, 0, 0, 0, 0, 5, 96, 0, 0, 0, 0, 0, 0, 0  ; S-1-5-96-0 (Font Driver Host\UMFD-*)
+sd_hex          db "0123456789abcdef"
+WSTR w_desk_def,  <Default>
+WSTR w_sd_static, <STATIC>
+even
+w_sd_empty      dw 0
 
 .data?
 public g_sd_prev_input                  ; hardening.asm's crash containment reads it
 align 8
 g_sd_prev_input  dq ?                   ; input desktop that was active before us
 g_sd_prev_thread dq ?                   ; calling thread's desktop before us
-g_sd_tokbuf      db 128 dup (?)         ; TOKEN_USER scratch
-g_sd_syssid      db 68 dup (?)          ; WinLocalSystemSid scratch
-g_sd_acl         db 256 dup (?)         ; explicit protected ACL
-g_sd_sd          db 40 dup (?)          ; SECURITY_DESCRIPTOR (40 bytes on x64)
+g_sd_kat_h       dq ?                   ; secdesk_selftest worker target HDESK
+g_sd_tokbuf      dq 16 dup (?)          ; TOKEN_USER scratch (128 bytes, 8-aligned)
+g_sd_acl         dq 32 dup (?)          ; explicit protected ACL (256 bytes, 8-aligned)
+g_sd_sd          dq 5 dup (?)           ; SECURITY_DESCRIPTOR (40 bytes; MUST be 8-aligned
+                                        ;   or NtSetSecurityObject fails with ERROR_NOACCESS)
+g_sd_kat_ok      dd ?                   ; secdesk_selftest worker result
 align 2
 g_sd_name        dw 40 dup (?)          ; "Myrkr-" + 32 hex chars + NUL
 
@@ -174,21 +187,27 @@ sdo_hex:
     cmp     dword ptr [rbp-44], 0
     je      sdo_close_fail
 
-    ; Build WinLocalSystemSid
-    mov     dword ptr [rbp-40], 68
-    WINCALL CreateWellKnownSid, WIN_LOCAL_SYSTEM_SID_, 0, addr g_sd_syssid, addr rbp-40
-    test    eax, eax
-    jz      sdo_close_fail
-
-    ; Build protected explicit DACL: TokenUser (stripped) + SYSTEM (GENERIC_ALL)
+    ; Build protected explicit DACL:
+    ;   - TokenUser stripped (0x00020146: no HOOKCONTROL / READOBJECTS / WRITEOBJECTS / JOURNAL*)
+    ;   - LocalSystem (S-1-5-18): GENERIC_ALL
+    ;   - Window Manager group (S-1-5-90-0): GENERIC_ALL (DWM desktop composition)
+    ;   - Font Driver Host group (S-1-5-96-0): GENERIC_ALL (UMFD font rasterization)
     WINCALL InitializeAcl, addr g_sd_acl, 256, ACL_REVISION_
     test    eax, eax
     jz      sdo_close_fail
     mov     r9, qword ptr [g_sd_tokbuf]             ; TOKEN_USER.User.Sid
+    test    r9, r9
+    jz      sdo_close_fail
     WINCALL AddAccessAllowedAce, addr g_sd_acl, ACL_REVISION_, DESKTOP_USER_STRIPPED_, r9
     test    eax, eax
     jz      sdo_close_fail
-    WINCALL AddAccessAllowedAce, addr g_sd_acl, ACL_REVISION_, GENERIC_ALL, addr g_sd_syssid
+    WINCALL AddAccessAllowedAce, addr g_sd_acl, ACL_REVISION_, GENERIC_ALL, addr sid_local_sys
+    test    eax, eax
+    jz      sdo_close_fail
+    WINCALL AddAccessAllowedAce, addr g_sd_acl, ACL_REVISION_, GENERIC_ALL, addr sid_dwm_grp
+    test    eax, eax
+    jz      sdo_close_fail
+    WINCALL AddAccessAllowedAce, addr g_sd_acl, ACL_REVISION_, GENERIC_ALL, addr sid_umfd_grp
     test    eax, eax
     jz      sdo_close_fail
 
@@ -224,31 +243,46 @@ secdesk_open endp
 ; MUST be called on the thread that will create the prompt window, and before it
 ; creates any window: SetThreadDesktop fails once a thread owns one.  Saves both
 ; the thread's previous desktop and the previously active INPUT desktop so
-; secdesk_leave can put the user back where they were.
+; secdesk_leave can put the user back where they were.  Never switches away if
+; OpenInputDesktop returned 0 (no handle to return to).
 ; =============================================================================
 public secdesk_enter
 secdesk_enter proc frame
     FRAME_PROLOG 64
     mov     qword ptr [rbp-24], rcx
-    ; remember what was on screen before we take over
-    WINCALL OpenInputDesktop, 0, 0, GENERIC_ALL
+    ; remember what was on screen before we take over (MAXIMUM_ALLOWED so an
+    ; elevated/filtered token lacking WRITE_DAC on Default still opens cleanly)
+    WINCALL OpenInputDesktop, 0, 0, DESKTOP_MAXALLOWED_
     mov     qword ptr [g_sd_prev_input], rax
+    test    rax, rax
+    jz      sde_fail
     WINCALL GetCurrentThreadId
     WINCALL GetThreadDesktop, eax
     mov     qword ptr [g_sd_prev_thread], rax
-    ; attach this thread, then put the private desktop on screen
+    ; attach this thread, then put the private desktop on screen (with retry)
     WINCALL SetThreadDesktop, qword ptr [rbp-24]
     test    eax, eax
-    jz      sde_fail
+    jz      sde_close_prev
+    mov     dword ptr [rbp-32], 0
+sde_sw_loop:
     WINCALL SwitchDesktop, qword ptr [rbp-24]
     test    eax, eax
-    jz      sde_unset
+    jnz     sde_ok
+    inc     dword ptr [rbp-32]
+    cmp     dword ptr [rbp-32], SECDESK_TRIES_
+    jae     sde_unset
+    WINCALL Sleep, SECDESK_WAIT_
+    jmp     sde_sw_loop
+sde_ok:
     mov     eax, 1
     jmp     sde_done
 sde_unset:
-    ; the switch failed but the thread is attached; put it back so the caller is
-    ; not left on a desktop it cannot draw on
+    ; the switch failed after retries; detach and close saved input desktop
     WINCALL SetThreadDesktop, qword ptr [g_sd_prev_thread]
+    mov     qword ptr [g_sd_prev_thread], 0
+sde_close_prev:
+    WINCALL CloseDesktop, qword ptr [g_sd_prev_input]
+    mov     qword ptr [g_sd_prev_input], 0
 sde_fail:
     xor     eax, eax
 sde_done:
@@ -258,14 +292,32 @@ secdesk_enter endp
 
 ; =============================================================================
 ; secdesk_leave - put the user back on the desktop they came from.
-; Safe to call whether or not secdesk_enter succeeded.
+; Retries transient SwitchDesktop contention and falls back to "Default" by name
+; if the saved handle cannot be switched to, matching Vordr's secdesk_restore.
 ; =============================================================================
 public secdesk_leave
 secdesk_leave proc frame
-    FRAME_PROLOG 48
+    FRAME_PROLOG 80
+    mov     dword ptr [rbp-24], 0
+sdl_sw_loop:
     cmp     qword ptr [g_sd_prev_input], 0
     je      sdl_thread
     WINCALL SwitchDesktop, qword ptr [g_sd_prev_input]
+    test    eax, eax
+    jnz     sdl_close_prev
+    inc     dword ptr [rbp-24]
+    cmp     dword ptr [rbp-24], SECDESK_TRIES_
+    jae     sdl_byname
+    WINCALL Sleep, SECDESK_WAIT_
+    jmp     sdl_sw_loop
+sdl_byname:
+    WINCALL OpenDesktopW, addr w_desk_def, 0, 0, DESKTOP_MAXALLOWED_
+    test    rax, rax
+    jz      sdl_close_prev
+    mov     qword ptr [rbp-32], rax
+    WINCALL SwitchDesktop, rax
+    WINCALL CloseDesktop, qword ptr [rbp-32]
+sdl_close_prev:
     WINCALL CloseDesktop, qword ptr [g_sd_prev_input]
     mov     qword ptr [g_sd_prev_input], 0
 sdl_thread:
@@ -293,6 +345,98 @@ sdc_done:
     FRAME_EPILOG
     ret
 secdesk_close endp
+
+; =============================================================================
+; secdesk_selftest -> eax = 1 pass, 0 fail.
+; Live non-flickering KAT run by `myrkr selftest`:
+;   - Skips gracefully (returns 1) in non-interactive service sessions where
+;     OpenInputDesktop returns 0.
+;   - Calls secdesk_open (CreateDesktopW + SetUserObjectSecurity protected DACL).
+;   - Verifies OpenDesktopW(g_sd_name, DESKTOP_HOOKCONTROL=8) and
+;     OpenDesktopW(g_sd_name, DESKTOP_READOBJECTS=1) are both denied (0).
+;   - Attaches a fresh worker thread via SetThreadDesktop (without SwitchDesktop,
+;     so zero screen flash), creates and destroys a window on the private desktop,
+;     detaches, and closes the desktop.
+; =============================================================================
+sd_kat_thread proc
+    push    rbp
+    mov     rbp, rsp
+    and     rsp, -16
+    sub     rsp, 128
+    mov     dword ptr [g_sd_kat_ok], 0
+    call    sstk_thread_init
+    WINCALL GetCurrentThreadId
+    WINCALL GetThreadDesktop, eax
+    mov     qword ptr [rbp-16], rax
+    WINCALL SetThreadDesktop, qword ptr [g_sd_kat_h]
+    test    eax, eax
+    jz      skt_done
+    WINCALL CreateWindowExW, 0, addr w_sd_static, addr w_sd_empty, 0, 0, 0, 8, 8, 0, 0, 0, 0
+    test    rax, rax
+    jz      skt_restore
+    WINCALL DestroyWindow, rax
+    mov     dword ptr [g_sd_kat_ok], 1
+skt_restore:
+    cmp     qword ptr [rbp-16], 0
+    je      skt_done
+    WINCALL SetThreadDesktop, qword ptr [rbp-16]
+skt_done:
+    call    sstk_thread_free
+    xor     eax, eax
+    mov     rsp, rbp
+    pop     rbp
+    ret
+sd_kat_thread endp
+
+public secdesk_selftest
+secdesk_selftest proc frame
+    FRAME_PROLOG 80
+    WINCALL OpenInputDesktop, 0, 0, DESKTOP_MAXALLOWED_
+    test    rax, rax
+    jz      sds_skip                        ; headless service session -> skip
+    WINCALL CloseDesktop, rax
+
+    call    secdesk_open
+    test    rax, rax
+    jz      sds_fail
+    mov     qword ptr [g_sd_kat_h], rax
+
+    ; Peer hook / object-read probes by desktop name MUST be refused by our DACL
+    WINCALL OpenDesktopW, addr g_sd_name, 0, 0, 8       ; DESKTOP_HOOKCONTROL
+    test    rax, rax
+    jnz     sds_leaked_desk
+    WINCALL OpenDesktopW, addr g_sd_name, 0, 0, 1       ; DESKTOP_READOBJECTS
+    test    rax, rax
+    jnz     sds_leaked_desk
+
+    WINCALL CreateThread, 0, 0, addr sd_kat_thread, 0, 0, 0
+    test    rax, rax
+    jz      sds_close_fail
+    mov     qword ptr [rbp-24], rax
+    WINCALL WaitForSingleObject, rax, 5000
+    WINCALL CloseHandle, qword ptr [rbp-24]
+
+    mov     rcx, qword ptr [g_sd_kat_h]
+    mov     qword ptr [g_sd_kat_h], 0
+    call    secdesk_close
+    mov     eax, dword ptr [g_sd_kat_ok]
+    jmp     sds_ret
+
+sds_leaked_desk:
+    WINCALL CloseDesktop, rax
+sds_close_fail:
+    mov     rcx, qword ptr [g_sd_kat_h]
+    mov     qword ptr [g_sd_kat_h], 0
+    call    secdesk_close
+sds_fail:
+    xor     eax, eax
+    jmp     sds_ret
+sds_skip:
+    mov     eax, 1
+sds_ret:
+    FRAME_EPILOG
+    ret
+secdesk_selftest endp
 
 ifdef DBG_TRACE
 ; =============================================================================

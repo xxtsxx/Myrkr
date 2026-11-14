@@ -1386,7 +1386,7 @@ Three design decisions are worth recording:
 ### 11.1 Password entry on a private desktop
 
 `read_password` does not read the dialog's own password field. It calls
-`secdesk_prompt`, which creates a desktop of its own (`Myrkr-Secure`), starts a
+`secdesk_prompt`, which creates a CSPRNG-named desktop of its own (`Myrkr-<32 hex>`), starts a
 thread, attaches *that* thread to the desktop, builds a small prompt window and
 pump there, switches the display to it, and returns the typed password to the
 caller before switching back.
@@ -1404,15 +1404,18 @@ sounds, and the code says so where it lives:
   observes nothing typed here, and the prompt does not appear in a shared-screen
   meeting.
 
-**What it does not buy:** a same-user attacker who can call `SetThreadDesktop`
-reaches it. The desktop is owned by this user, so any DACL that lets Myrkr use it
-lets them use it — `secdesk_open` therefore passes `NULL` security attributes
-deliberately rather than inventing an ACL that would imply a boundary that does
-not exist. UAC's desktop is protected because it belongs to Winlogon/SYSTEM, a
-context a user-mode process cannot claim. What raises the cost is the
-*environment*: reaching another desktop requires direct API calls, which a WDAC
-policy with Constrained Language Mode does not let a script host make. The
-control is strong in that estate and weaker outside it.
+**What it does not buy:** a same-user attacker with full Win32 API access is the
+object owner (`WRITE_DAC`) and can rewrite the desktop DACL to attach. However,
+`secdesk_open` applies an explicit `SE_DACL_PROTECTED` DACL (`TokenUser`
+`0x00020146` + `SYSTEM` / `DWM` / `UMFD` `GENERIC_ALL`) that strips the
+`WinSta0`-inherited logon-session `DESKTOP_ALL` ACE so opportunistic same-session
+peers are denied `DESKTOP_HOOKCONTROL` and `DESKTOP_READOBJECTS` unless they
+actively overwrite the DACL. UAC's desktop is stronger because it belongs to
+Winlogon/SYSTEM, a context a user-mode process cannot claim. What raises the
+cost further is the *environment*: reaching or re-ACLing another desktop
+requires direct Win32 calls, which a WDAC policy with Constrained Language Mode
+does not let a script host make. The control is strong in that estate and weaker
+outside it.
 
 `CreateDesktopW` is called with flags `0`, not `DF_ALLOWOTHERACCOUNTHOOK` — that
 flag would let processes of other accounts install hooks on this desktop, the

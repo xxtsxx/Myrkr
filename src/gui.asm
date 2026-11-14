@@ -3322,12 +3322,20 @@ mb_zwc:
     mov     dword ptr [g_mb_reg], 1
 mb_haveclass:
     ; ---- centre over the parent when there is one, else the screen ---------
+    ; On the private-desktop password prompt (g_sd_hwnd != 0), g_sd_hwnd is the
+    ; active parent on this thread and desktop; g_hwnd lives on the interactive
+    ; desktop and cannot own a window across desktops.
+    mov     rax, qword ptr [g_sd_hwnd]
+    test    rax, rax
+    jnz     @F
+    mov     rax, qword ptr [g_hwnd]
+@@: mov     qword ptr [rbp-8], rax
     mov     dword ptr [rbp-48], MB_W
     mov     eax, dword ptr [g_mb_h]
     mov     dword ptr [rbp-52], eax
-    cmp     qword ptr [g_hwnd], 0
+    cmp     qword ptr [rbp-8], 0
     je      mb_centre_screen
-    WINCALL GetWindowRect, qword ptr [g_hwnd], addr g_mb_prc
+    WINCALL GetWindowRect, qword ptr [rbp-8], addr g_mb_prc
     mov     eax, dword ptr [g_mb_prc+0]
     add     eax, dword ptr [g_mb_prc+8]
     sar     eax, 1
@@ -3353,7 +3361,7 @@ mb_centre_screen:
 mb_create:
     WINCALL CreateWindowExW, <WS_EX_TOOLWINDOW or WS_EX_LAYERED>, addr wc_mbox, qword ptr [g_mb_title], \
             ST_MAINWND, dword ptr [rbp-72], dword ptr [rbp-76], dword ptr [rbp-48], dword ptr [rbp-52], \
-            qword ptr [g_hwnd], 0, qword ptr [g_hinst], 0
+            qword ptr [rbp-8], 0, qword ptr [g_hinst], 0
     mov     qword ptr [g_mb_hwnd], rax
     test    rax, rax
     jz      mb_ret                               ; creation failed: return IDCANCEL
@@ -3367,9 +3375,9 @@ mb_create:
     WINCALL CreateRoundRectRgn, 0, 0, r8d, r9d, WIN_ROUND, WIN_ROUND
     WINCALL SetWindowRgn, qword ptr [g_mb_hwnd], rax, 1
     ; modal: block the parent for as long as the box is up
-    cmp     qword ptr [g_hwnd], 0
+    cmp     qword ptr [rbp-8], 0
     je      @F
-    WINCALL EnableWindow, qword ptr [g_hwnd], 0
+    WINCALL EnableWindow, qword ptr [rbp-8], 0
 @@:
     WINCALL ShowWindow, qword ptr [g_mb_hwnd], SW_SHOW
     WINCALL UpdateWindow, qword ptr [g_mb_hwnd]
@@ -3396,9 +3404,9 @@ mb_check:
     je      mb_loop
 mb_finish:
     ; re-enable BEFORE destroying anything else, or focus lands on another app
-    cmp     qword ptr [g_hwnd], 0
+    cmp     qword ptr [rbp-8], 0
     je      @F
-    WINCALL EnableWindow, qword ptr [g_hwnd], 1
+    WINCALL EnableWindow, qword ptr [rbp-8], 1
     ; Nothing to repaint on the way out.  A RDW_ALLCHILDREN erase stood here for
     ; one release, on the theory that draw_button greys from IsWindowEnabled and
     ; that IsWindowEnabled is FALSE for every child of a disabled parent - so the
@@ -3413,7 +3421,7 @@ mb_finish:
     ;
     ; The report it was written for was the Exit button being genuinely disabled
     ; after a removal, fixed in on_done.  Nothing here.
-    WINCALL SetFocus, qword ptr [g_hwnd]
+    WINCALL SetFocus, qword ptr [rbp-8]
 @@:
     mov     qword ptr [g_mb_hwnd], 0
 mb_ret:
@@ -16353,7 +16361,10 @@ sdb_have:
             0, 0, qword ptr [g_hinst], 0
     mov     qword ptr [g_sd_hwnd], rax
     test    rax, rax
-    jz      sdb_done
+    jnz     sdb_created
+    mov     dword ptr [g_sd_result], SDR_UNAVAILABLE
+    jmp     sdb_done
+sdb_created:
     mov     rcx, rax
     call    gui_protect_hwnd
     mov     r8d, SD_W
@@ -16483,17 +16494,21 @@ sdp_secure:
     add     rax, 300000                              ; 5-minute bounded UI wait
     mov     qword ptr [rbp-16], rax
 sdp_wait:
-    WINCALL MsgWaitForMultipleObjects, 1, addr rbp-8, 0, 250, 0020h ; QS_PAINT
+    WINCALL MsgWaitForMultipleObjects, 1, addr rbp-8, 0, 250, 0060h ; QS_SENDMESSAGE | QS_PAINT
     test    eax, eax                                 ; WAIT_OBJECT_0 (0) -> worker finished
     jz      sdp_joined
-    cmp     eax, 1                                   ; WAIT_OBJECT_0 + 1 -> paint message
+    cmp     eax, 1                                   ; WAIT_OBJECT_0 + 1 -> paint / sendmsg
     jne     sdp_chk_deadline
 sdp_pump_paint:
     WINCALL PeekMessageW, addr rbp-80, 0, 0Fh, 0Fh, 1 ; WM_PAINT = 0Fh, PM_REMOVE = 1
     test    eax, eax
-    jz      sdp_chk_deadline
+    jz      sdp_pump_mark
     WINCALL DispatchMessageW, addr rbp-80
     jmp     sdp_pump_paint
+sdp_pump_mark:
+    ; Dispatch any pending inter-thread SendMessage and mark remaining queue bits
+    ; seen so MsgWaitForMultipleObjects sleeps for its slice instead of spinning.
+    WINCALL PeekMessageW, addr rbp-80, 0, 0, 0, 0
 sdp_chk_deadline:
     WINCALL GetTickCount64
     cmp     rax, qword ptr [rbp-16]

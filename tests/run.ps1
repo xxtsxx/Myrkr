@@ -114,6 +114,11 @@ foreach ($m in @("MYRKR_TEST_IO_BUILD", "redteam")) {
     }
 }
 if (-not $leftover) { Write-Host "  bin\myrkr.exe is a release build - ok" }
+$stProc = Start-Process -FilePath $exe -ArgumentList @("selftest") -Wait -PassThru -NoNewWindow
+if ($stProc.ExitCode -ne 0) {
+    Write-Host "  FAIL: release selftest exited $($stProc.ExitCode)"
+    $leftover = 1
+}
 Remove-Item $dbg -Force -EA SilentlyContinue
 
 Write-Host "`n================= SUITE RESULT ================="

@@ -33,6 +33,7 @@ extern vsplit_bytes:proc
 externdef g_idxrev:dword
 externdef g_cfg_splitidx:dword
 extern secmem_locked:proc               ; secmem.asm: 1 = all secret regions pinned
+extern secdesk_selftest:proc            ; secdesk.asm: live private-desktop + DACL KAT
 extern crc32_update:proc
 extern sha1_hash:proc
 extern hmac_sha1:proc
@@ -109,6 +110,8 @@ CSTR st_pass_spl,  "  [PASS] split presets  (Off is 0, sizes strictly increasing
 CSTR st_fail_spl,  "  [FAIL] split presets  (Off is 0, sizes strictly increasing)",13,10
 CSTR st_pass_lock, "  [PASS] secret buffers locked (non-pageable)",13,10
 CSTR st_fail_lock, "  [FAIL] secret buffers NOT locked - password/key may page to disk",13,10
+CSTR st_pass_sdesk,"  [PASS] private desktop  (protected DACL + attach)",13,10
+CSTR st_fail_sdesk,"  [FAIL] private desktop  (creation or protected DACL failed)",13,10
 san_safe1   db "tree/a.txt",0
 san_safe2   db "a/b/c.txt",0
 san_bad1    db "../evil",0
@@ -1755,6 +1758,21 @@ st_rl_fail:
     call    print_a
     inc     qword ptr [rbp-24]
 st_after_rlog:
+
+    ; ---- private desktop creation + protected DACL + worker attach ----------
+    call    secdesk_selftest
+    test    eax, eax
+    jz      st_sdesk_fail
+    lea     rcx, [st_pass_sdesk]
+    mov     edx, st_pass_sdesk_len
+    call    print_a
+    jmp     st_after_sdesk
+st_sdesk_fail:
+    lea     rcx, [st_fail_sdesk]
+    mov     edx, st_fail_sdesk_len
+    call    print_a
+    inc     qword ptr [rbp-24]
+st_after_sdesk:
 
     mov     r12, qword ptr [rbp-56]
     mov     r13, qword ptr [rbp-64]

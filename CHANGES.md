@@ -35,12 +35,14 @@ what changed and why, not a raw commit dump.
   `DBG_TRACE` builds.
 - **Private desktop DACL, screen-capture exclusion & password EDIT scrubbing.**
   The private password desktop now uses a 128-bit CSPRNG name per prompt,
-  applies an explicit `SE_DACL_PROTECTED` `TokenUser + SYSTEM` DACL (failing
-  closed if RNG or ACL setup fails), bounds `secdesk_prompt` with a 5-minute
-  watchdog, enables `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)` across
-  top-level windows by default (`AllowScreenCapture = 0`), detaches IME from
-  password `EDIT` controls, and runs a 3-step internal text/undo scrub before
-  teardown.
+  applies an explicit 8-byte-aligned `SE_DACL_PROTECTED` DACL (`TokenUser`
+  `0x00020146` stripping `DESKTOP_HOOKCONTROL` and `DESKTOP_READOBJECTS`, plus
+  `SYSTEM`, Window Manager `S-1-5-90-0`, and Font Driver Host `S-1-5-96-0`
+  `GENERIC_ALL`; verified live by `selftest`), fails closed if RNG or ACL setup
+  fails, bounds `secdesk_prompt` with a 5-minute watchdog, enables
+  `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)` across top-level windows by
+  default (`AllowScreenCapture = 0`), detaches IME from password `EDIT`
+  controls, and runs a 3-step internal text/undo scrub before teardown.
 - **Pre- and post-open filesystem, archive, policy & log guards.** File and log
   opens reject Windows device paths (`\\.\`, `\\?\GLOBALROOT`), NTFS `:stream`
   alternate data streams, non-disk handles, and name-surrogate reparse points
