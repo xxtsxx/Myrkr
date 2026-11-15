@@ -96,6 +96,7 @@ extern sstk_thread_free:proc
 extern ExitProcess:proc
 extern GetFileAttributesW:proc
 extern GetFileAttributesExW:proc
+extern DeleteFileW:proc
 extern FindFirstFileW:proc
 extern FindNextFileW:proc
 extern FindClose:proc
@@ -229,6 +230,7 @@ externdef g_pfx_arena:byte
 extern pfx_reset:proc
 extern pfx_stage:proc
 externdef g_key:byte
+externdef g_pkhdr:byte
 extern MultiByteToWideChar:proc
 externdef g_idxptr:qword
 extern idx_find:proc
@@ -243,6 +245,14 @@ extern cfmount_unmount:proc
 extern cfmount_is_mounted:proc
 extern cfmount_letter:proc
 extern cfmount_open_explorer:proc
+extern cfmount_is_rw:proc
+extern cfmount_is_dirty:proc
+extern cfmount_prepare_commit:proc
+extern cfmount_finish_commit:proc
+extern delta_path_for:proc
+extern mrk_can_mount_rw:proc
+extern delta_inspect:proc
+extern merge_delta_mrk:proc
 DO_count            equ 16                   ; mirrors estream.asm
 DRAGNAME_BYTES      equ 4096
 externdef g_idxlen:qword
@@ -481,6 +491,7 @@ WM_APP_INDEXED      equ 08002h          ; WM_APP+2 posted by the indexer thread
 ; warning is shown AFTER IDropTarget::Drop returns: a modal box inside Drop would
 ; hold the drag source (Explorer) until it was dismissed.
 WM_APP_ADDWARN      equ 08005h
+WM_APP_DELTASYNC    equ 08006h          ; WM_APP+6 posted by cfmount delta watcher
 ifdef DBG_TRACE
 ; WM_APP+3, test builds only: run the registered IDropTarget against the data
 ; object currently on the clipboard.  Carries no pointer, so it crosses the
@@ -1320,9 +1331,18 @@ WSTR s_tip_extract, <Copy entries out of the archive. The archive is unchanged.>
 WSTR s_tip_clear,     <Remove every item from the list>
 WSTR s_tip_settings,  <Settings>
 WSTR s_open_tcvc,     <Open TrueCrypt/VeraCrypt container>
-WSTR s_tip_mountdrv,  <Mount container as read-only drive>
+WSTR s_tip_mountdrv,  <Mount container as drive>
 WSTR s_tip_unmount_pfx, <Unmount drive (>
+WSTR s_mnt_pfx,       <Mounted >
+WSTR s_mnt_rw,        < (Read/Write)>
+WSTR s_mnt_rw_dlt,    < (Read/Write - unsaved)>
+WSTR s_mnt_ro,        < (Read-Only)>
 WSTR m_mount_fail,    <Could not mount the container as a drive letter. Windows Cloud Files may be unavailable on this edition, or no drive letters (D:-Z:) are free.>
+WSTR t_delta_recov,   <Myrkr - unsaved volume changes>
+WSTR m_delta_merge,   <Unmerged volume changes from an interrupted session were found in the .delta.mrk file beside this container. Merge them into the container now? Choose Cancel to keep .delta.mrk separate and mount read-only.>
+WSTR m_delta_stale,   <An older .delta.mrk file was found beside this container from a session whose changes were already saved. Remove the obsolete .delta.mrk file now?>
+WSTR m_delta_bad,     <A .delta.mrk file exists beside this container, but it could not be unlocked with this password. It was left untouched and this container will mount read-only.>
+WSTR m_commit_fail,   <Volume changes could not be merged into the container. Your encrypted changes remain safe in the .delta.mrk file beside it.>
 WSTR t_pick_kf,       <Select keyfile(s)>
 WSTR t_pick_kfdir,    <Select keyfile folder>
 WSTR s_kf_none,       <Keyfiles: none>
@@ -1642,7 +1662,7 @@ WSTR t_about,     <About Myrkr>
 ; belongs to the no-args window that this replaced.  This is the short version:
 ; enough to identify the build, with the repo one click away on the version
 ; label at the bottom left of the main window.
-WSTR m_about_body, <Myrkr v1.1.6 - AES-256-GCM + Argon2id file encryption. Drop files or folders onto the window, or use Add files. Project page: github.com/xxtsxx/Myrkr>
+WSTR m_about_body, <Myrkr v1.2.0 - AES-256-GCM + Argon2id file encryption. Drop files or folders onto the window, or use Add files. Project page: github.com/xxtsxx/Myrkr>
 WSTR m_nocpu,   <This CPU lacks the required AES-NI / PCLMULQDQ instructions.>
 CSTR c_nocpu,   "error: CPU lacks required features (AES-NI, PCLMULQDQ, SSE4.1)",13,10
 WSTR m_nopass,  <Please enter a password.>
@@ -1692,7 +1712,7 @@ WSTR s_ab_name,    <Myrkr>                  ; heading beside the icon
 ; the VERSIONINFO resource cheaply from here, so it is kept in step by hand:
 ; bump this WHENEVER myrkr.rc's FILEVERSION changes.  tools/constcheck.py cannot
 ; catch the drift - one side is an .rc, not an equ.
-WSTR s_ab_ver,     <Version 1.1.6.0>        ; version line (accent)
+WSTR s_ab_ver,     <Version 1.2.0.0>        ; version line (accent)
 WSTR s_ab_tag,     <AES-256-GCM authenticated encryption  -  Argon2id KDF>
 WSTR s_ab_foot,    <github.com/xxtsxx/Myrkr>
 WSTR s_ab_url,     <https://github.com/xxtsxx/Myrkr>   ; what clicking s_ab_foot opens
@@ -1724,9 +1744,12 @@ WSTR s_pg_items,   < items>       ; files AND folders - see draw_progwin
 WSTR wc_busy,      <myrkr_busy>
 WSTR s_busy_mount, <Opening container...>
 WSTR s_busy_vol,   <Mounting volume...>
+WSTR s_busy_save,  <Saving volume...>
 WSTR s_busy_kdf,   <Deriving keys and unlocking header...>
 WSTR s_busy_fs,    <Reading volume filesystem...>
 WSTR s_busy_drv,   <Preparing read-only drive for File Explorer...>
+WSTR s_busy_drv_rw,<Preparing drive for File Explorer...>
+WSTR s_busy_merge, <Merging changes into container...>
 WSTR s_busy_ext,   <Extracting files...>
 WSTR s_busy_prep,  <Preparing output files...>
 WSTR s_rate_mbs,   < MB/s>
@@ -2222,8 +2245,14 @@ g_busy_mode   dd ?                           ; 0 = mounting, 1 = extracting
 g_busy_phase  dd ?                           ; 0 = header KDF, 1 = FS enum, 2 = drive mount
 g_busy_reg    dd ?                           ; 1 once wc_busy is registered
 g_tcvc_mnt_rc dd ?                           ; EXIT_* from tcvc_mount_thread
-g_cfm_is_tcvc dd ?                           ; isTcvc input for cfmount_thread
+g_cfm_is_tcvc dd ?                           ; modeFlags input for cfmount_thread
 g_cfm_letter  dd ?                           ; drive letter output from cfmount_thread
+g_automount_mrk  dd ?                        ; 1 = auto-mount .mrk archive on open
+g_force_ro_mount dd ?                        ; 1 = mount Read-Only (unmerged .delta.mrk kept)
+g_commit_mode    dd ?                        ; 0 = finish_commit+merge, 1 = crash-recovery merge
+g_commit_rc      dd ?                        ; EXIT_* from commit_thread
+g_saved_setid    db 16 dup (?)               ; 12B CONTAINER_HDR.set_id snapshot
+g_gui_delta_w    dw MAX_PATH_CHARS dup (?)   ; <stem>.delta.mrk wide path
 g_busy_rc     dd 4 dup (?)                   ; scratch RECT for busy card paint
 
 .code
@@ -7347,7 +7376,7 @@ create_controls endp
 switch_to_output proc frame
     FRAME_PROLOG 64
     mov     dword ptr [g_remount_after_edit], 0
-    call    cfmount_unmount
+    call    busy_unmount_commit
     call    tcvc_close
     call    wipe_gui_keyfiles
     ; the file just written becomes the one input
@@ -7399,6 +7428,7 @@ switch_to_output proc frame
     je      @F
     WINCALL EnableWindow, qword ptr [g_hopentc], 1
 @@:
+    mov     dword ptr [g_automount_mrk], 1
     call    container_load
 sto_ret:
     FRAME_EPILOG
@@ -7832,7 +7862,7 @@ otp_uninit:
 
     ; Tear down any prior container/session secrets cleanly before switching
     mov     dword ptr [g_remount_after_edit], 0
-    call    cfmount_unmount
+    call    busy_unmount_commit
     call    tcvc_close
     call    wipe_gui_keyfiles
     lea     rcx, [g_key]
@@ -7984,17 +8014,30 @@ smu_stat_mrk:
 
 smu_stat_mrk_mnt:
     lea     rcx, [g_mrk_statw]
-    lea     rdx, [s_edits_saved]
+    lea     rdx, [s_mnt_pfx]
     WBOUND  r8, g_mrk_statw, STATUSW_CHARS
     call    wcopy
-    mov     word ptr [rax+0], ' '
-    mov     word ptr [rax+2], 00B7h
-    mov     word ptr [rax+4], ' '
     mov     ecx, dword ptr [rbp-16]
-    mov     word ptr [rax+6], cx
-    mov     word ptr [rax+8], ':'
-    mov     word ptr [rax+10], '\'
-    mov     word ptr [rax+12], 0
+    mov     word ptr [rax+0], cx
+    mov     word ptr [rax+2], ':'
+    mov     word ptr [rax+4], '\'
+    lea     rcx, [rax+6]
+    mov     qword ptr [rbp-24], rcx
+    call    cfmount_is_rw
+    test    eax, eax
+    jz      smu_mrk_ro
+    call    cfmount_is_dirty
+    lea     rdx, [s_mnt_rw]
+    test    eax, eax
+    jz      smu_mrk_app
+    lea     rdx, [s_mnt_rw_dlt]
+    jmp     smu_mrk_app
+smu_mrk_ro:
+    lea     rdx, [s_mnt_ro]
+smu_mrk_app:
+    mov     rcx, qword ptr [rbp-24]
+    WBOUND  r8, g_mrk_statw, STATUSW_CHARS
+    call    wcopy
     WINCALL SetWindowTextW, qword ptr [g_hstatus], addr g_mrk_statw
 
 smu_ret:
@@ -8020,19 +8063,23 @@ toggle_drive_mount proc frame
     test    eax, eax
     jz      tdm_do_mount
 
-    call    cfmount_unmount
+    call    busy_unmount_commit
+    cmp     eax, 1
+    jne     @F
+    call    refresh_mrk_listing
+@@:
     call    sync_mount_ui
     jmp     tdm_ret
 
 tdm_do_mount:
     cmp     dword ptr [g_is_tcvc], 0
-    jne     tdm_call_mount
+    jne     tdm_call_tcvc
 
     ; .mrk container: ensure g_key is live (od_restore wipes g_key + g_cfg_pass
     ; after an Extract All while browsing).
     call    es_key_live
     test    eax, eax
-    jnz     tdm_call_mount
+    jnz     tdm_call_mrk
     cmp     dword ptr [g_cfg_passlen], 0
     jne     @F
     mov     dword ptr [g_pw_ready], 0
@@ -8047,7 +8094,7 @@ tdm_do_mount:
     call    idx_read
     mov     dword ptr [g_keep_key], 0
     test    eax, eax
-    jz      tdm_call_mount
+    jz      tdm_call_mrk
     mov     dword ptr [g_pw_ready], 0
     lea     rcx, [m_auth]
     lea     rdx, [t_err]
@@ -8055,8 +8102,26 @@ tdm_do_mount:
     call    mbox
     jmp     tdm_ret
 
-tdm_call_mount:
-    mov     ecx, dword ptr [g_is_tcvc]
+tdm_call_tcvc:
+    mov     ecx, 1
+    jmp     tdm_run_mount
+
+tdm_call_mrk:
+    mov     dword ptr [rbp-24], 0
+    WINCALL delta_path_for, addr g_filepath_w, addr g_gui_delta_w, MAX_PATH_CHARS
+    test    eax, eax
+    jz      tdm_mrk_flags
+    WINCALL GetFileAttributesW, addr g_gui_delta_w
+    cmp     eax, -1
+    jne     tdm_mrk_flags                   ; unmerged .delta.mrk kept -> Read-Only
+    WINCALL mrk_can_mount_rw, addr g_filepath_w
+    test    eax, eax
+    jz      tdm_mrk_flags
+    mov     dword ptr [rbp-24], 2
+tdm_mrk_flags:
+    mov     ecx, dword ptr [rbp-24]
+
+tdm_run_mount:
     call    busy_cfmount
     mov     dword ptr [rbp-16], eax
     call    sync_mount_ui
@@ -11884,8 +11949,16 @@ car_haveprefix:
 car_confirmed:
     call    cfmount_is_mounted
     mov     dword ptr [g_remount_after_edit], eax
-    call    cfmount_unmount
+    call    busy_unmount_commit
+    mov     dword ptr [rbp-24], eax
     call    sync_mount_ui
+    cmp     dword ptr [rbp-24], 0
+    jge     car_go
+    mov     dword ptr [g_remount_after_edit], 0
+    mov     rax, qword ptr [rbp-16]
+    mov     qword ptr [g_poscount], rax
+    jmp     car_ret
+car_go:
     lea     rax, [g_filepath_w]
     mov     qword ptr [g_cfg_in], rax
     ; g_poscount is NOT put back here - the worker is about to walk
@@ -12116,7 +12189,23 @@ crs_marked:
     je      crs_wipekey                     ; nothing selected that is in there
     call    cfmount_is_mounted
     mov     dword ptr [g_remount_after_edit], eax
-    call    cfmount_unmount
+    call    busy_unmount_commit
+    cmp     eax, 0
+    jl      crs_commit_err
+    je      crs_unmounted
+    ; .delta.mrk was merged into g_filepath_w -> re-read merged index & re-mark
+    lea     rax, [g_filepath_w]
+    mov     qword ptr [g_cfg_in], rax
+    mov     dword ptr [g_keep_key], 1
+    call    idx_read
+    mov     dword ptr [g_keep_key], 0
+    test    eax, eax
+    jnz     crs_commit_err
+    mov     r8d, IDXEF_DROPPED
+    call    container_mark_selected
+    cmp     rax, 0
+    je      crs_merged_noop
+crs_unmounted:
     call    sync_mount_ui
     ; Both size classes use the same fresh-key, cancellable rewrite.
     mov     dword ptr [g_wt_job], 2
@@ -12124,6 +12213,14 @@ crs_marked:
 crs_ret:
     FRAME_EPILOG
     ret
+crs_merged_noop:
+    mov     dword ptr [g_remount_after_edit], 0
+    call    refresh_mrk_listing
+    call    sync_mount_ui
+    jmp     crs_wipekey
+crs_commit_err:
+    mov     dword ptr [g_remount_after_edit], 0
+    call    sync_mount_ui
 crs_wipekey:
     lea     rcx, [g_key]
     mov     rdx, 32
@@ -12177,9 +12274,42 @@ container_remove_selected endp
 ; eax = 0 when the listing is up, non-zero when it is not (cancelled, wrong
 ; password, or a container with nothing to list).
 ; =============================================================================
-container_load proc frame
+refresh_mrk_listing proc frame
     FRAME_PROLOG 64
-    call    cfmount_unmount
+    lea     rax, [g_filepath_w]
+    mov     qword ptr [g_cfg_in], rax
+    mov     dword ptr [g_keep_key], 1
+    call    idx_read
+    mov     dword ptr [g_keep_key], 0
+    test    eax, eax
+    jnz     rml_ret
+    call    populate_list
+    call    container_expand_top
+    call    populate_list
+    call    idx_summarise
+    mov     rax, qword ptr [g_idx_files]
+    mov     qword ptr [g_scan_files], rax
+    mov     rax, qword ptr [g_idx_dirs]
+    mov     qword ptr [g_scan_dirs], rax
+    mov     rax, qword ptr [g_idx_bytes]
+    mov     qword ptr [g_scan_bytes], rax
+    lea     rcx, [s_empty]
+    call    fmt_summary
+    WINCALL SetWindowTextW, qword ptr [g_hscan], addr g_summbuf
+    call    container_update_action
+    xor     eax, eax
+rml_ret:
+    FRAME_EPILOG
+    ret
+refresh_mrk_listing endp
+
+container_load proc frame
+    FRAME_PROLOG 80
+    mov     eax, dword ptr [g_automount_mrk]
+    mov     dword ptr [g_automount_mrk], 0
+    mov     dword ptr [rbp-24], eax
+    mov     dword ptr [g_force_ro_mount], 0
+    call    busy_unmount_commit
     lea     rax, [g_filepath_w]
     mov     qword ptr [g_cfg_in], rax
     cmp     dword ptr [g_is_tcvc], 0
@@ -12204,6 +12334,71 @@ container_load proc frame
     ; which this window deliberately keeps for its lifetime: the process.
     ; secmem locks and wipes g_key at exit, and every re-listing re-derives it,
     ; so an add or a delete leaves it correct rather than stale.
+    mov     dword ptr [g_keep_key], 1
+    call    idx_read
+    mov     dword ptr [g_keep_key], 0
+    test    eax, eax
+    jnz     cl_fail
+
+    ; Check for an unmerged crash-recovery <stem>.delta.mrk sidecar beside this .mrk
+    WINCALL delta_path_for, addr g_filepath_w, addr g_gui_delta_w, MAX_PATH_CHARS
+    test    eax, eax
+    jz      cl_listed
+    WINCALL GetFileAttributesW, addr g_gui_delta_w
+    cmp     eax, -1
+    je      cl_listed
+
+    mov     rax, qword ptr [g_pkhdr + CONTAINER_HDR.set_id]
+    mov     qword ptr [g_saved_setid + 0], rax
+    mov     eax, dword ptr [g_pkhdr + CONTAINER_HDR.set_id + 8]
+    mov     dword ptr [g_saved_setid + 8], eax
+
+    WINCALL delta_inspect, addr g_gui_delta_w, addr g_saved_setid
+    cmp     eax, 0
+    je      cl_delta_match
+    cmp     eax, 1
+    je      cl_delta_stale
+
+    mov     dword ptr [g_force_ro_mount], 1
+    lea     rcx, [m_delta_bad]
+    lea     rdx, [t_delta_recov]
+    mov     r8d, MB_OK or MB_ICONWARNING
+    call    mbox
+    jmp     cl_delta_reread
+
+cl_delta_match:
+    lea     rcx, [m_delta_merge]
+    lea     rdx, [t_delta_recov]
+    mov     r8d, MB_OKCANCEL or MB_ICONWARNING
+    call    mbox
+    cmp     eax, IDOK
+    jne     cl_delta_keep_ro
+    call    busy_recover_delta
+    test    eax, eax
+    jz      cl_delta_reread
+    mov     dword ptr [g_force_ro_mount], 1
+    lea     rcx, [m_commit_fail]
+    lea     rdx, [t_err]
+    mov     r8d, MB_OK or MB_ICONWARNING
+    call    mbox
+    jmp     cl_delta_reread
+
+cl_delta_stale:
+    lea     rcx, [m_delta_stale]
+    lea     rdx, [t_delta_recov]
+    mov     r8d, MB_OKCANCEL or MB_ICONINFORMATION
+    call    mbox
+    cmp     eax, IDOK
+    jne     cl_delta_keep_ro
+    WINCALL DeleteFileW, addr g_gui_delta_w
+    jmp     cl_delta_reread
+
+cl_delta_keep_ro:
+    mov     dword ptr [g_force_ro_mount], 1
+
+cl_delta_reread:
+    lea     rax, [g_filepath_w]
+    mov     qword ptr [g_cfg_in], rax
     mov     dword ptr [g_keep_key], 1
     call    idx_read
     mov     dword ptr [g_keep_key], 0
@@ -12307,10 +12502,21 @@ cl_listed:
     jne     cl_mount_synced
     cmp     dword ptr [g_is_zip], 0
     jne     cl_mount_synced
-    cmp     dword ptr [g_remount_after_edit], 0
-    je      cl_mount_synced
+    mov     eax, dword ptr [g_remount_after_edit]
     mov     dword ptr [g_remount_after_edit], 0
-    xor     ecx, ecx
+    or      eax, dword ptr [rbp-24]
+    jz      cl_mount_synced
+    cmp     byte ptr [g_pkhdr + CONTAINER_HDR.archive], 1
+    jne     cl_mount_synced
+    mov     dword ptr [rbp-32], 0
+    cmp     dword ptr [g_force_ro_mount], 0
+    jne     cl_do_mrk_mount
+    WINCALL mrk_can_mount_rw, addr g_filepath_w
+    test    eax, eax
+    jz      cl_do_mrk_mount
+    mov     dword ptr [rbp-32], 2
+cl_do_mrk_mount:
+    mov     ecx, dword ptr [rbp-32]
     call    busy_cfmount
 cl_mount_synced:
     mov     dword ptr [g_remount_after_edit], 0
@@ -13185,6 +13391,20 @@ sd_havedest:
     call    pick_reset
     cmp     dword ptr [g_container], 0
     je      sd_havepick
+    cmp     dword ptr [g_is_tcvc], 0
+    jne     sd_mark_pick
+    cmp     dword ptr [g_is_zip], 0
+    jne     sd_mark_pick
+    call    cfmount_is_dirty
+    test    eax, eax
+    jz      sd_mark_pick
+    call    busy_unmount_commit
+    cmp     eax, 0
+    jl      sd_ret
+    je      sd_mark_pick
+    call    refresh_mrk_listing
+    call    sync_mount_ui
+sd_mark_pick:
     mov     r8d, IDXEF_PICK
     call    container_mark_selected
     test    rax, rax
@@ -13435,6 +13655,7 @@ dps_hide:
     lea     rdx, [g_tcvc_statw]
 @@:
     WINCALL SetWindowTextW, qword ptr [g_hstatus], rdx
+    call    sync_mount_ui
 dps_ret:
     add     rsp, 48
     pop     rbp
@@ -15179,6 +15400,8 @@ wndproc proc
     je      wp_appindexed
     cmp     rax, WM_APP_ADDWARN
     je      wp_addwarn
+    cmp     rax, WM_APP_DELTASYNC
+    je      wp_deltasync
     cmp     rax, WM_DRAWITEM
     je      wp_drawitem
     cmp     rax, WM_NOTIFY
@@ -15937,6 +16160,7 @@ wp_cancel:
     ; Exit button: while idle -> close the window; while running -> cancel the op
     cmp     dword ptr [g_running], 0
     jne     wp_exit_cancel
+    call    busy_unmount_commit
     WINCALL DestroyWindow, qword ptr [rbp-8]
     jmp     wp_zero
 wp_exit_cancel:
@@ -16032,9 +16256,14 @@ wp_addwarn:
     call    mbox
     jmp     wp_zero
 
+wp_deltasync:
+    call    sync_mount_ui
+    jmp     wp_zero
+
 wp_close:
     cmp     dword ptr [g_running], 0
     jne     wp_zero
+    call    busy_unmount_commit
     WINCALL DestroyWindow, qword ptr [rbp-8]
     jmp     wp_zero
 
@@ -16441,6 +16670,7 @@ gm_notbadset:
     ; only to decide whether to ask before the window appears.
     cmp     dword ptr [g_container], 0
     je      gm_notcontainer
+    mov     dword ptr [g_automount_mrk], 1
     call    container_load
     test    eax, eax
     jnz     gm_cl_failed
@@ -18425,8 +18655,13 @@ draw_busy_card proc
     jmp     dbc_head_ok
 dbc_chk_head_vol:
     cmp     dword ptr [g_busy_phase], 2
-    jne     dbc_head_ok
+    jne     @F
     lea     rax, [s_busy_vol]
+    jmp     dbc_head_ok
+@@:
+    cmp     dword ptr [g_busy_phase], 3
+    jne     dbc_head_ok
+    lea     rax, [s_busy_save]
 dbc_head_ok:
     mov     qword ptr [rbp-48], rax
     mov     dword ptr [g_busy_rc+0], 20
@@ -18449,6 +18684,12 @@ dbc_head_ok:
     je      dbc_sub_ok
     lea     rax, [s_busy_fs]
     cmp     dword ptr [g_busy_phase], 1
+    je      dbc_sub_ok
+    lea     rax, [s_busy_merge]
+    cmp     dword ptr [g_busy_phase], 3
+    je      dbc_sub_ok
+    lea     rax, [s_busy_drv_rw]
+    cmp     dword ptr [g_is_tcvc], 0
     je      dbc_sub_ok
     lea     rax, [s_busy_drv]
 dbc_sub_ok:
@@ -18724,7 +18965,12 @@ bmt_create:
     cmp     dword ptr [g_busy_phase], 2
     jne     @F
     lea     r8, [s_busy_vol]
+    jmp     bmt_do_cw
 @@:
+    cmp     dword ptr [g_busy_phase], 3
+    jne     bmt_do_cw
+    lea     r8, [s_busy_save]
+bmt_do_cw:
     WINCALL CreateWindowExW, <WS_EX_TOOLWINDOW or WS_EX_LAYERED or WS_EX_TOPMOST>, addr wc_busy, r8, \
             ST_MAINWND, dword ptr [rbp-28], dword ptr [rbp-32], BUSY_W, BUSY_H, \
             qword ptr [rbp-16], 0, qword ptr [g_hinst], 0
@@ -18828,6 +19074,96 @@ busy_cfmount proc
     pop     rbp
     ret
 busy_cfmount endp
+
+; =============================================================================
+; commit_work / commit_thread / busy_unmount_commit / busy_recover_delta
+; Flush & atomically merge <stem>.delta.mrk into <stem>.mrk under UI busy card.
+; =============================================================================
+commit_work proc
+    push    rbp
+    mov     rbp, rsp
+    sub     rsp, 48
+    cmp     dword ptr [g_commit_mode], 0
+    jne     cmw_merge
+    WINCALL cfmount_finish_commit, addr g_gui_delta_w, MAX_PATH_CHARS
+    test    eax, eax
+    jns     cmw_merge
+    mov     dword ptr [g_commit_rc], EXIT_IO
+    jmp     cmw_ret
+cmw_merge:
+    WINCALL merge_delta_mrk, addr g_filepath_w, addr g_gui_delta_w
+    mov     dword ptr [g_commit_rc], eax
+cmw_ret:
+    add     rsp, 48
+    pop     rbp
+    ret
+commit_work endp
+
+commit_thread proc
+    call    sstk_thread_init
+    sub     rsp, 40
+    call    commit_work
+    call    sstk_thread_free
+    xor     eax, eax
+    add     rsp, 40
+    ret
+commit_thread endp
+
+; Returns: 0 = clean/unmounted, 1 = merged .delta.mrk into .mrk, -1 = merge error
+busy_unmount_commit proc
+    push    rbp
+    mov     rbp, rsp
+    sub     rsp, 48
+    call    cfmount_prepare_commit
+    test    eax, eax
+    jz      buc_clean
+    mov     dword ptr [g_commit_mode], 0
+    mov     dword ptr [g_commit_rc], EXIT_IO
+    lea     rcx, [commit_thread]
+    mov     edx, 3
+    call    busy_run_popup
+    test    eax, eax
+    jz      @F
+    call    commit_work
+@@:
+    cmp     dword ptr [g_commit_rc], 0
+    jne     buc_fail
+    mov     eax, 1
+    jmp     buc_ret
+buc_fail:
+    lea     rcx, [m_commit_fail]
+    lea     rdx, [t_err]
+    mov     r8d, MB_OK or MB_ICONWARNING
+    call    mbox
+    mov     eax, -1
+    jmp     buc_ret
+buc_clean:
+    xor     eax, eax
+buc_ret:
+    add     rsp, 48
+    pop     rbp
+    ret
+busy_unmount_commit endp
+
+; Returns: EXIT_* from merge_delta_mrk (0 = merged ok)
+busy_recover_delta proc
+    push    rbp
+    mov     rbp, rsp
+    sub     rsp, 48
+    mov     dword ptr [g_commit_mode], 1
+    mov     dword ptr [g_commit_rc], EXIT_IO
+    lea     rcx, [commit_thread]
+    mov     edx, 3
+    call    busy_run_popup
+    test    eax, eax
+    jz      @F
+    call    commit_work
+@@:
+    mov     eax, dword ptr [g_commit_rc]
+    add     rsp, 48
+    pop     rbp
+    ret
+busy_recover_delta endp
 
 ; =============================================================================
 ; draw_progwin(rcx = DRAWITEMSTRUCT*) - the whole progress half, in one pass.

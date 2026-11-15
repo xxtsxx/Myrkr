@@ -6,7 +6,7 @@ ISO-8601 (`YYYY-MM-DD`).
 This file is maintained by hand alongside every change; each entry summarizes
 what changed and why, not a raw commit dump.
 
-## [Unreleased]
+## [1.2.0] - 2026-11-15
 
 ### Added
 
@@ -41,16 +41,23 @@ what changed and why, not a raw commit dump.
     status line), single-file `.tc`/`.hc` right-drag classification in
     `myrkrshell.dll`, and `.tc`/`.hc` → `Myrkr.VolumeContainer` MSI registration
     (`MYRKR_NOTCASSOC=1` opt-out).
-- **User-mode read-only Windows drive mounting (`src/cfmount.asm`).** Open
-  TrueCrypt/VeraCrypt (`.tc`/`.hc`) volumes now auto-mount as a session Windows
-  drive letter (`Z:` downward) for direct File Explorer access without kernel
-  drivers or UAC elevation, and a new command-bar **Mount as read-only drive**
-  glyph button (`ID_MOUNTDRV`) toggles drive mounting for both `.tc`/`.hc` and
-  native `.mrk` containers (`tests/cfmounttest.ps1`). Backed by inbox
-  `cldapi.dll` + `DefineDosDeviceW`, non-indexed sync-root folders, fail-closed
-  AES-256-GCM authentication before hydration on `.mrk` streams, automatic
-  placeholder dehydration (`0` on-disk bytes) on handle close, and stale-mount
-  sweeping on startup.
+- **User-mode Windows drive mounting with Read/Write `.mrk` `.delta.mrk` sidecar
+  overlay (`src/cfmount.asm`, `src/pack.asm`).** Standard native `.mrk` archive
+  containers now auto-mount on open as a **Read/Write** session Windows drive
+  letter (`Z:` downward) for direct File Explorer editing without kernel drivers
+  or UAC elevation (`tests/cfmounttest.ps1`). Edits stay zero-touch on the base
+  `.mrk` while mounted: additions, in-place edits, renames, and deletions lazily
+  emit a visible, 100% format-v9-compliant `<stem>.delta.mrk` sidecar (fresh
+  CSPRNG salt + `set_id`, RFC 9106 Argon2id, segmented AES-256-GCM, `.myrkr-delta`
+  `base-id` manifest + deletion tombstones) and merge atomically via
+  `ReplaceFileW` (`Saving volume...` → `merge_delta_mrk`) into a freshly keyed
+  `.mrk` on controlled dismount or post-crash recovery. TrueCrypt/VeraCrypt
+  (`.tc`/`.hc`) volumes, single-file `.mrk` streams, split `.partNNN.mrk` sets,
+  direct `.delta.mrk` salvage opens, and write-protected folders mount
+  **Read-Only**, toggled anytime via the command-bar drive button (`ID_MOUNTDRV`).
+  Backed by inbox `cldapi.dll` + `DefineDosDeviceW`, non-indexed sync-root
+  folders, fail-closed AES-256-GCM authentication before hydration, automatic
+  placeholder dehydration on handle close, and stale-mount sweeping on startup.
 - **Animated indeterminate mount/extract progress & OS volume metadata
   filtering.** Added a topmost sweeping-bar busy popup while unlocking,
   scanning, and mounting TrueCrypt & VeraCrypt volumes (`Opening container...`

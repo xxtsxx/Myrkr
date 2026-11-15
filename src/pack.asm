@@ -237,6 +237,11 @@ CSTR e_del_nf,       "error: no such entry in the container: "
 CSTR e_del_usage,    "error: name at least one entry to remove",13,10
 CSTR lbl_pack,       "packing"
 CSTR lbl_unpack,     "unpacking"
+WSTR w_delta_ext,    <.delta.mrk>
+WSTR w_mrk_ext,      <.mrk>
+a_delta_manifest     db ".myrkr-delta", 0
+a_delta_magic_hdr    db "myrkr-delta-v1", 10, "base-id: "
+a_delta_del_pfx      db "del: "
 
 .data?
 public g_bare
@@ -6306,6 +6311,1381 @@ dw_isset:
     FRAME_EPILOG
     ret
 do_remove_marked endp
+
+; =============================================================================
+; delta_path_for(rcx = basePathW, rdx = outDeltaPathW, r8d = capChars)
+;   -> eax = 1 built "<stem>.delta.mrk", 0 ineligible (.delta.mrk or overflow)
+; =============================================================================
+public delta_path_for
+delta_path_for proc frame
+    FRAME_PROLOG 128
+    mov     qword ptr [rbp-16], rbx
+    mov     qword ptr [rbp-24], r12
+    mov     qword ptr [rbp-32], r13
+    mov     qword ptr [rbp-40], r14
+
+    mov     rbx, rcx                        ; basePathW
+    mov     r12, rdx                        ; outDeltaPathW
+    mov     r13d, r8d                       ; capChars
+
+    test    rbx, rbx
+    jz      dpf_fail
+    test    r12, r12
+    jz      dpf_fail
+
+    xor     r14d, r14d
+dpf_len:
+    cmp     word ptr [rbx + r14*2], 0
+    je      dpf_got_len
+    inc     r14d
+    cmp     r14d, MAX_PATH_CHARS
+    jb      dpf_len
+    jmp     dpf_fail
+
+dpf_got_len:
+    test    r14d, r14d
+    jz      dpf_fail
+
+    ; Reject paths already ending in ".delta.mrk" (10 chars) so opening a
+    ; sidecar directly for salvage never creates ".delta.delta.mrk".
+    cmp     r14d, 10
+    jb      dpf_chk_mrk
+    mov     eax, r14d
+    sub     eax, 10
+    lea     rcx, [rbx + rax*2]
+    WINCALL CompareStringOrdinal, rcx, 10, addr w_delta_ext, 10, 1
+    cmp     eax, 2
+    je      dpf_fail
+
+dpf_chk_mrk:
+    ; Strip trailing ".mrk" (4 chars) iff preceded by a non-separator stem char
+    cmp     r14d, 5
+    jb      dpf_append
+    mov     eax, r14d
+    sub     eax, 5
+    movzx   ecx, word ptr [rbx + rax*2]
+    cmp     ecx, '\'
+    je      dpf_append
+    cmp     ecx, '/'
+    je      dpf_append
+    cmp     ecx, ':'
+    je      dpf_append
+    inc     eax
+    lea     rcx, [rbx + rax*2]
+    WINCALL CompareStringOrdinal, rcx, 4, addr w_mrk_ext, 4, 1
+    cmp     eax, 2
+    jne     dpf_append
+    sub     r14d, 4
+
+dpf_append:
+    mov     eax, r14d
+    add     eax, 11                         ; ".delta.mrk" (10) + NUL (1)
+    cmp     eax, r13d
+    ja      dpf_fail
+
+    xor     ecx, ecx
+dpf_cpy:
+    cmp     ecx, r14d
+    jae     dpf_suf
+    mov     ax, word ptr [rbx + rcx*2]
+    mov     word ptr [r12 + rcx*2], ax
+    inc     ecx
+    jmp     dpf_cpy
+
+dpf_suf:
+    lea     rdx, [w_delta_ext]
+    xor     r8d, r8d
+dpf_suf_lp:
+    mov     ax, word ptr [rdx + r8*2]
+    mov     word ptr [r12 + rcx*2], ax
+    test    ax, ax
+    jz      dpf_ok
+    inc     ecx
+    inc     r8d
+    jmp     dpf_suf_lp
+
+dpf_ok:
+    mov     eax, 1
+    jmp     dpf_out
+
+dpf_fail:
+    xor     eax, eax
+
+dpf_out:
+    mov     rbx, qword ptr [rbp-16]
+    mov     r12, qword ptr [rbp-24]
+    mov     r13, qword ptr [rbp-32]
+    mov     r14, qword ptr [rbp-40]
+    FRAME_EPILOG
+    ret
+delta_path_for endp
+
+; =============================================================================
+; mrk_can_mount_rw(rcx = basePathW) -> eax = 1 eligible for R/W, 0 fallback R/O
+; Assumes g_pkhdr holds the authenticated header of basePathW.
+; =============================================================================
+public mrk_can_mount_rw
+mrk_can_mount_rw proc frame
+    FRAME_PROLOG 144
+    mov     qword ptr [rbp-16], rbx
+    mov     rbx, rcx
+
+    cmp     byte ptr [g_pkhdr + CONTAINER_HDR.archive], 1
+    jne     mcmr_no
+
+    mov     rcx, rbx
+    lea     rdx, [g_outdir_np]
+    call    normalize_path
+    test    eax, eax
+    jnz     mcmr_no
+
+    lea     rcx, [g_outdir_np]
+    call    vol_is_set
+    test    eax, eax
+    jnz     mcmr_no
+
+    mov     rcx, rbx
+    lea     rdx, [g_extw]
+    mov     r8d, MAX_PATH_CHARS - 48
+    call    delta_path_for
+    test    eax, eax
+    jz      mcmr_no
+
+    lea     rcx, [g_extw]
+    lea     rdx, [g_outdir_np]
+    call    normalize_path
+    test    eax, eax
+    jnz     mcmr_no
+
+    ; Probe parent directory writability via a random DELETE_ON_CLOSE sibling
+    lea     rcx, [rbp-48]
+    mov     edx, 8
+    call    rng_fill
+    test    eax, eax
+    jz      mcmr_no
+
+    lea     r10, [g_outdir_np]
+    xor     r9d, r9d
+mcmr_scan:
+    cmp     r9d, MAX_PATH_CHARS - 32
+    jae     mcmr_no
+    cmp     word ptr [r10 + r9*2], 0
+    je      mcmr_suf
+    inc     r9d
+    jmp     mcmr_scan
+
+mcmr_suf:
+    mov     word ptr [r10 + r9*2 + 0], '.'
+    mov     word ptr [r10 + r9*2 + 2], 'r'
+    mov     word ptr [r10 + r9*2 + 4], 'w'
+    mov     word ptr [r10 + r9*2 + 6], '.'
+    add     r9d, 4
+    lea     r11, [rbp-48]
+    xor     ecx, ecx
+mcmr_hex:
+    movzx   eax, byte ptr [r11 + rcx]
+    mov     edx, eax
+    shr     eax, 4
+    and     edx, 15
+    add     eax, 'a'
+    add     edx, 'a'
+    mov     word ptr [r10 + r9*2], ax
+    mov     word ptr [r10 + r9*2 + 2], dx
+    add     r9d, 2
+    inc     ecx
+    cmp     ecx, 8
+    jb      mcmr_hex
+    mov     word ptr [r10 + r9*2 + 0], '.'
+    mov     word ptr [r10 + r9*2 + 2], 't'
+    mov     word ptr [r10 + r9*2 + 4], 'm'
+    mov     word ptr [r10 + r9*2 + 6], 'p'
+    mov     word ptr [r10 + r9*2 + 8], 0
+
+    ; GENERIC_WRITE=40000000h, CREATE_NEW=1, ATTR_NORMAL|DELETE_ON_CLOSE=04000080h
+    WINCALL CreateFileW, addr g_outdir_np, 40000000h, 0, 0, 1, 04000080h, 0
+    cmp     rax, INVALID
+    je      mcmr_no
+    mov     rcx, rax
+    call    file_close
+    mov     eax, 1
+    jmp     mcmr_out
+
+mcmr_no:
+    xor     eax, eax
+
+mcmr_out:
+    mov     rbx, qword ptr [rbp-16]
+    FRAME_EPILOG
+    ret
+mrk_can_mount_rw endp
+
+; =============================================================================
+; delta_hex_nib(ecx = ascii byte) -> eax = 0..15 or -1
+; =============================================================================
+delta_hex_nib proc
+    cmp     ecx, '0'
+    jb      dhn_bad
+    cmp     ecx, '9'
+    ja      dhn_alpha
+    mov     eax, ecx
+    sub     eax, '0'
+    ret
+dhn_alpha:
+    or      ecx, 20h
+    cmp     ecx, 'a'
+    jb      dhn_bad
+    cmp     ecx, 'f'
+    ja      dhn_bad
+    mov     eax, ecx
+    sub     eax, ('a' - 10)
+    ret
+dhn_bad:
+    mov     eax, -1
+    ret
+delta_hex_nib endp
+
+; =============================================================================
+; delta_parse_manifest(rcx = bufPtr, rdx = bufLen, r8 = outBaseId12Ptr)
+;   -> rax = byte offset of body lines (49), or -1 on malformed manifest
+; =============================================================================
+delta_parse_manifest proc frame
+    FRAME_PROLOG 64
+    mov     qword ptr [rbp-16], rbx
+    mov     qword ptr [rbp-24], r12
+    mov     qword ptr [rbp-32], r13
+
+    mov     rbx, rcx                        ; bufPtr
+    mov     r12, rdx                        ; bufLen
+    mov     r13, r8                         ; outBaseId12Ptr
+
+    cmp     r12, 49
+    jb      dpm_bad
+
+    lea     r10, [a_delta_magic_hdr]
+    xor     ecx, ecx
+dpm_hdr_lp:
+    mov     al, byte ptr [rbx + rcx]
+    cmp     al, byte ptr [r10 + rcx]
+    jne     dpm_bad
+    inc     ecx
+    cmp     ecx, 24
+    jb      dpm_hdr_lp
+
+    cmp     byte ptr [rbx + 48], 10         ; '\n'
+    jne     dpm_bad
+
+    xor     r9d, r9d                        ; 0..11 byte index
+dpm_id_lp:
+    movzx   ecx, byte ptr [rbx + 24 + r9*2]
+    call    delta_hex_nib
+    test    eax, eax
+    js      dpm_bad
+    shl     eax, 4
+    mov     edx, eax
+    movzx   ecx, byte ptr [rbx + 25 + r9*2]
+    call    delta_hex_nib
+    test    eax, eax
+    js      dpm_bad
+    or      eax, edx
+    mov     byte ptr [r13 + r9], al
+    inc     r9d
+    cmp     r9d, 12
+    jb      dpm_id_lp
+
+    mov     eax, 49
+    jmp     dpm_out
+
+dpm_bad:
+    mov     rax, -1
+
+dpm_out:
+    mov     rbx, qword ptr [rbp-16]
+    mov     r12, qword ptr [rbp-24]
+    mov     r13, qword ptr [rbp-32]
+    FRAME_EPILOG
+    ret
+delta_parse_manifest endp
+
+; =============================================================================
+; delta_inspect(rcx = deltaPathW, rdx = baseSetId12Ptr) -> eax:
+;   0             = valid .delta.mrk matching baseSetId12Ptr (ready to merge)
+;   1             = valid .delta.mrk under password, stale base-id (orphan)
+;   EXIT_AUTH/etc = authentication failed or corrupt sidecar
+; Note: Clobbers g_pkhdr / g_idxptr; caller re-runs idx_read on base if needed.
+; =============================================================================
+public delta_inspect
+delta_inspect proc frame
+    FRAME_PROLOG 176
+    mov     qword ptr [rbp-16], rbx
+    mov     qword ptr [rbp-24], r12
+    mov     qword ptr [rbp-32], r13
+    mov     qword ptr [rbp-40], r14
+    mov     qword ptr [rbp-48], r15
+
+    mov     rbx, rcx                        ; deltaPathW
+    mov     r12, rdx                        ; baseSetId12Ptr
+    xor     r13d, r13d                      ; manifestBuf
+    xor     r14d, r14d                      ; manifestAllocLen
+    xor     r15d, r15d                      ; deltaEs
+
+    mov     rax, qword ptr [g_cfg_in]
+    mov     qword ptr [rbp-56], rax
+    mov     qword ptr [g_cfg_in], rbx
+    mov     dword ptr [g_keep_key], 1
+    call    idx_read
+    mov     dword ptr [g_keep_key], 0
+    mov     rcx, qword ptr [rbp-56]
+    mov     qword ptr [g_cfg_in], rcx
+    test    eax, eax
+    jnz     di_err_eax
+
+    cmp     byte ptr [g_pkhdr + CONTAINER_HDR.archive], 1
+    jne     di_corrupt
+
+    lea     rcx, [a_delta_manifest]
+    mov     edx, 12
+    call    idx_find
+    test    rax, rax
+    js      di_corrupt
+
+    mov     r10, qword ptr [g_idxptr]
+    add     r10, rax
+    test    dword ptr [r10 + IDXE_flags], IDXEF_DIR
+    jnz     di_corrupt
+    mov     rax, qword ptr [r10 + IDXE_size]
+    cmp     rax, 49
+    jb      di_corrupt
+    cmp     rax, 1000000h                   ; 16 MiB manifest sanity cap
+    ja      di_corrupt
+    mov     qword ptr [rbp-64], r10         ; entry ptr
+    mov     qword ptr [rbp-72], rax         ; manifest size
+
+    lea     rcx, [rax + 1]
+    mov     r14, rcx
+    call    mem_alloc
+    test    rax, rax
+    jz      di_oom
+    mov     r13, rax
+
+    mov     rcx, rbx
+    call    es_new
+    test    rax, rax
+    jz      di_io
+    mov     r15, rax
+
+    mov     rcx, r15
+    mov     rdx, qword ptr [rbp-64]
+    lea     r8,  [g_key]
+    call    es_bind
+    test    eax, eax
+    jnz     di_corrupt
+
+    mov     rcx, r15
+    mov     rdx, r13
+    mov     r8,  qword ptr [rbp-72]
+    call    es_consume
+    test    eax, eax
+    jnz     di_es_err
+
+    mov     rcx, r13
+    mov     rdx, qword ptr [rbp-72]
+    lea     r8,  [rbp-96]                   ; 12-byte parsed baseSetId
+    call    delta_parse_manifest
+    test    rax, rax
+    js      di_corrupt
+
+    lea     rcx, [rbp-96]
+    mov     rdx, r12
+    mov     r8d, 12
+    call    ct_memcmp
+    test    eax, eax
+    jz      di_match
+    mov     eax, 1                          ; stale base-id
+    jmp     di_cleanup
+
+di_match:
+    xor     eax, eax
+    jmp     di_cleanup
+
+di_es_err:
+    mov     rcx, r15
+    call    es_code
+    test    eax, eax
+    jnz     di_cleanup
+di_corrupt:
+    mov     eax, EXIT_CORRUPT
+    jmp     di_cleanup
+di_oom:
+    mov     eax, EXIT_OOM
+    jmp     di_cleanup
+di_io:
+    mov     eax, EXIT_IO
+di_err_eax:
+di_cleanup:
+    mov     dword ptr [rbp-80], eax
+    test    r15, r15
+    jz      @F
+    mov     rcx, r15
+    call    es_destroy
+@@:
+    test    r13, r13
+    jz      @F
+    mov     rcx, r13
+    mov     rdx, r14
+    call    mem_free
+@@:
+    lea     rcx, [g_key]
+    mov     edx, 32
+    call    secure_zero
+    mov     eax, dword ptr [rbp-80]
+    mov     rbx, qword ptr [rbp-16]
+    mov     r12, qword ptr [rbp-24]
+    mov     r13, qword ptr [rbp-32]
+    mov     r14, qword ptr [rbp-40]
+    mov     r15, qword ptr [rbp-48]
+    FRAME_EPILOG
+    ret
+delta_inspect endp
+
+; =============================================================================
+; idx_mark_dropped_ci(rcx = utf8Name, rdx = nameLen, r8d = includeSubtree)
+; Case-insensitively marks matching entry (and "<name>/..." subtree when
+; includeSubtree != 0) with IDXEF_DROPPED in g_idxptr.
+; =============================================================================
+idx_mark_dropped_ci proc frame
+    FRAME_PROLOG 128
+    mov     qword ptr [rbp-16], rbx
+    mov     qword ptr [rbp-24], r12
+    mov     qword ptr [rbp-32], r13
+    mov     qword ptr [rbp-40], r14
+    mov     qword ptr [rbp-48], r15
+
+    test    rdx, rdx
+    jz      imdci_out
+    cmp     rdx, ENTRY_NAME_MAX
+    ja      imdci_out
+
+    mov     r12d, r8d                       ; includeSubtree
+    WINCALL MultiByteToWideChar, CP_UTF8, 0, rcx, edx, addr g_clash_wa, 4095
+    test    eax, eax
+    jle     imdci_out
+    mov     r13d, eax                       ; waLen (UTF-16 units)
+
+    xor     r14d, r14d                      ; cursor in g_idxptr
+    mov     r15, qword ptr [g_idxcount]     ; entries left
+
+imdci_loop:
+    test    r15, r15
+    jz      imdci_out
+    mov     rax, r14
+    add     rax, IDXE_FIXED
+    cmp     rax, qword ptr [g_idxlen]
+    ja      imdci_out
+    mov     rbx, qword ptr [g_idxptr]
+    add     rbx, r14
+    mov     edx, dword ptr [rbx + IDXE_namelen]
+    add     rax, rdx
+    cmp     rax, qword ptr [g_idxlen]
+    ja      imdci_out
+    mov     qword ptr [rbp-56], rax         ; next cursor
+
+    test    edx, edx
+    jz      imdci_next
+    cmp     edx, 4095
+    ja      imdci_next
+
+    lea     rcx, [rbx + IDXE_name]
+    WINCALL MultiByteToWideChar, CP_UTF8, 0, rcx, edx, addr g_clash_wb, 4095
+    test    eax, eax
+    jle     imdci_next
+
+    cmp     eax, r13d
+    jb      imdci_next
+    je      imdci_cmp_exact
+
+    ; Longer than target: only check prefix if includeSubtree != 0 and wb[waLen] == '/'
+    test    r12d, r12d
+    jz      imdci_next
+    lea     rcx, [g_clash_wb]
+    cmp     word ptr [rcx + r13*2], '/'
+    jne     imdci_next
+
+imdci_cmp_exact:
+    WINCALL CompareStringOrdinal, addr g_clash_wa, r13d, addr g_clash_wb, r13d, 1
+    cmp     eax, 2
+    jne     imdci_next
+    or      dword ptr [rbx + IDXE_flags], IDXEF_DROPPED
+
+imdci_next:
+    mov     r14, qword ptr [rbp-56]
+    dec     r15
+    jmp     imdci_loop
+
+imdci_out:
+    mov     rbx, qword ptr [rbp-16]
+    mov     r12, qword ptr [rbp-24]
+    mov     r13, qword ptr [rbp-32]
+    mov     r14, qword ptr [rbp-40]
+    mov     r15, qword ptr [rbp-48]
+    FRAME_EPILOG
+    ret
+idx_mark_dropped_ci endp
+
+; =============================================================================
+; merge_delta_mrk(rcx = basePathW, rdx = deltaPathW) -> eax = EXIT_*
+;
+; Authenticates <stem>.delta.mrk and <stem>.mrk under g_cfg_pass, verifies
+; .myrkr-delta's base-id matches <stem>.mrk's set_id, streams surviving base
+; entries plus delta entries into a freshly salted/keyed v9 sibling temp file,
+; atomically commits via ReplaceFileW, and deletes <stem>.delta.mrk ONLY after
+; ReplaceFileW succeeds.
+; =============================================================================
+public merge_delta_mrk
+merge_delta_mrk proc frame
+    FRAME_PROLOG 640
+    ; Callee-saved:
+    ;   [rbp-16]=rbx [rbp-24]=r12 [rbp-32]=r13 [rbp-40]=r14 [rbp-48]=r15
+    ;   [rbp-56]=rsi [rbp-64]=rdi
+    ; Pointers & handles:
+    ;   [rbp-72]=basePathW       [rbp-80]=deltaPathW      [rbp-88]=saved_cfg_in
+    ;   [rbp-96]=baseEs          [rbp-104]=deltaEs        [rbp-112]=hout_tmp
+    ;   [rbp-120]=baseIdxBuf     [rbp-128]=baseIdxLen     [rbp-136]=deltaIdxBuf
+    ;   [rbp-144]=deltaIdxLen    [rbp-152]=manifestBuf    [rbp-160]=manifestAlloc
+    ;   [rbp-168]=manifestSize   [rbp-176]=manifestBodyOff [rbp-184]=baseFileSize
+    ;   [rbp-192]=deltaFileSize  [rbp-200]=cursor         [rbp-208]=entryPtr
+    ;   [rbp-216]=remBytes       [rbp-224]=chunkBytes     [rbp-232]=ownedTmp
+    ;   [rbp-240]=exitCode       [rbp-256..-245]=expectedBaseId(12B)
+    ;   [rbp-288..-257]=baseKey(32B)    [rbp-320..-289]=deltaKey(32B)
+    ;   [rbp-400..-321]=baseHdr(80B)    [rbp-448..-401]=baseTail(48B)
+    ;   [rbp-528..-449]=snapScratch(80B) [rbp-544..-529]=rngTmp(16B)
+    mov     qword ptr [rbp-16], rbx
+    mov     qword ptr [rbp-24], r12
+    mov     qword ptr [rbp-32], r13
+    mov     qword ptr [rbp-40], r14
+    mov     qword ptr [rbp-48], r15
+    mov     qword ptr [rbp-56], rsi
+    mov     qword ptr [rbp-64], rdi
+
+    mov     qword ptr [rbp-72], rcx
+    mov     qword ptr [rbp-80], rdx
+    mov     rax, qword ptr [g_cfg_in]
+    mov     qword ptr [rbp-88], rax
+
+    mov     qword ptr [rbp-96], 0           ; baseEs
+    mov     qword ptr [rbp-104], 0          ; deltaEs
+    mov     qword ptr [rbp-112], INVALID    ; hout_tmp
+    mov     qword ptr [rbp-120], 0          ; baseIdxBuf
+    mov     qword ptr [rbp-128], 0          ; baseIdxLen
+    mov     qword ptr [rbp-136], 0          ; deltaIdxBuf
+    mov     qword ptr [rbp-144], 0          ; deltaIdxLen
+    mov     qword ptr [rbp-152], 0          ; manifestBuf
+    mov     qword ptr [rbp-160], 0          ; manifestAlloc
+    mov     dword ptr [rbp-232], 0          ; ownedTmp
+    mov     qword ptr [g_packerr], 0
+
+    ; ---- 1. Authenticate <stem>.delta.mrk and read .myrkr-delta -------------
+    mov     rax, qword ptr [rbp-80]
+    mov     qword ptr [g_cfg_in], rax
+    mov     dword ptr [g_keep_key], 1
+    call    idx_read
+    mov     dword ptr [g_keep_key], 0
+    test    eax, eax
+    jnz     mdm_cleanup
+
+    cmp     byte ptr [g_pkhdr + CONTAINER_HDR.archive], 1
+    jne     mdm_corrupt
+
+    lea     rcx, [rbp-320]                  ; deltaKey
+    lea     rdx, [g_key]
+    mov     r8d, 32
+    call    nr_copy
+
+    mov     rax, qword ptr [g_idxlen]
+    mov     qword ptr [rbp-144], rax
+    lea     rcx, [rax + 1]
+    call    mem_alloc
+    test    rax, rax
+    jz      mdm_oom
+    mov     qword ptr [rbp-136], rax
+    mov     rcx, rax
+    mov     rdx, qword ptr [g_idxptr]
+    mov     r8,  qword ptr [rbp-144]
+    call    nr_copy
+
+    mov     rcx, qword ptr [rbp-80]
+    call    es_new
+    test    rax, rax
+    jz      mdm_io
+    mov     qword ptr [rbp-104], rax
+
+    mov     rcx, rax
+    call    es_handle
+    mov     rcx, rax
+    lea     rdx, [rbp-192]                  ; deltaFileSize
+    call    vol_size
+    test    eax, eax
+    jnz     mdm_io
+
+    lea     rcx, [a_delta_manifest]
+    mov     edx, 12
+    call    idx_find
+    test    rax, rax
+    js      mdm_corrupt
+    mov     r10, qword ptr [g_idxptr]
+    add     r10, rax
+    test    dword ptr [r10 + IDXE_flags], IDXEF_DIR
+    jnz     mdm_corrupt
+    mov     r12, qword ptr [r10 + IDXE_size]
+    cmp     r12, 49
+    jb      mdm_corrupt
+    cmp     r12, 1000000h
+    ja      mdm_corrupt
+    mov     qword ptr [rbp-168], r12
+    mov     qword ptr [rbp-208], r10
+
+    lea     rcx, [r12 + 1]
+    mov     qword ptr [rbp-160], rcx
+    call    mem_alloc
+    test    rax, rax
+    jz      mdm_oom
+    mov     qword ptr [rbp-152], rax
+
+    mov     rcx, qword ptr [rbp-104]
+    mov     rdx, qword ptr [rbp-208]
+    lea     r8,  [rbp-320]
+    call    es_bind
+    test    eax, eax
+    jnz     mdm_corrupt
+
+    mov     rcx, qword ptr [rbp-104]
+    mov     rdx, qword ptr [rbp-152]
+    mov     r8,  qword ptr [rbp-168]
+    call    es_consume
+    test    eax, eax
+    jnz     mdm_delta_decode_err
+
+    mov     rcx, qword ptr [rbp-152]
+    mov     rdx, qword ptr [rbp-168]
+    lea     r8,  [rbp-256]                  ; expectedBaseId(12B)
+    call    delta_parse_manifest
+    test    rax, rax
+    js      mdm_corrupt
+    mov     qword ptr [rbp-176], rax        ; manifestBodyOff
+
+    ; ---- 2. Authenticate <stem>.mrk & lock source handle --------------------
+    mov     rcx, qword ptr [rbp-72]
+    lea     rdx, [g_pk_np]
+    call    normalize_path
+    test    eax, eax
+    jnz     mdm_io
+
+    lea     rcx, [g_pk_np]
+    call    vol_is_set
+    test    eax, eax
+    jnz     mdm_unsup
+
+    mov     rax, qword ptr [rbp-72]
+    mov     qword ptr [g_cfg_in], rax
+    mov     dword ptr [g_keep_key], 1
+    call    idx_read
+    mov     dword ptr [g_keep_key], 0
+    test    eax, eax
+    jnz     mdm_cleanup
+
+    ; Verify base container set_id matches .myrkr-delta's base-id
+    lea     rcx, [g_pkhdr + 52]
+    lea     rdx, [rbp-256]
+    mov     r8d, 12
+    call    ct_memcmp
+    test    eax, eax
+    jnz     mdm_corrupt
+
+    lea     rcx, [rbp-288]                  ; baseKey
+    lea     rdx, [g_key]
+    mov     r8d, 32
+    call    nr_copy
+    lea     rcx, [rbp-400]                  ; baseHdr
+    lea     rdx, [g_pkhdr]
+    mov     r8d, HDR_BYTES
+    call    nr_copy
+    lea     rcx, [rbp-448]                  ; baseTail (tag + trl)
+    lea     rdx, [g_pktag2]
+    mov     r8d, 16
+    call    nr_copy
+    lea     rcx, [rbp-432]
+    lea     rdx, [g_idxtrl]
+    mov     r8d, 32
+    call    nr_copy
+
+    lea     rcx, [g_pk_np]
+    call    es_new_edit
+    test    rax, rax
+    jz      mdm_io
+    mov     qword ptr [rbp-96], rax
+
+    ; Verify snapshot of base container has not changed between idx_read & lock
+    mov     rcx, rax
+    call    es_handle
+    mov     rcx, rax
+    lea     rdx, [rbp-184]                  ; baseFileSize
+    call    get_file_size
+    test    eax, eax
+    jnz     mdm_io
+    cmp     qword ptr [rbp-184], HDR_BYTES + 48
+    jb      mdm_corrupt
+
+    mov     rcx, qword ptr [rbp-96]
+    call    es_handle
+    mov     rcx, rax
+    xor     edx, edx
+    lea     r8,  [rbp-528]
+    mov     r9d, HDR_BYTES
+    call    file_read_at
+    test    eax, eax
+    jnz     mdm_io
+    lea     rcx, [rbp-400]
+    lea     rdx, [rbp-528]
+    mov     r8d, HDR_BYTES
+    call    ct_memcmp
+    test    eax, eax
+    jnz     mdm_corrupt
+
+    mov     rcx, qword ptr [rbp-96]
+    call    es_handle
+    mov     rcx, rax
+    mov     rdx, qword ptr [rbp-184]
+    sub     rdx, 48
+    lea     r8,  [rbp-528]
+    mov     r9d, 48
+    call    file_read_at
+    test    eax, eax
+    jnz     mdm_io
+    lea     rcx, [rbp-448]
+    lea     rdx, [rbp-528]
+    mov     r8d, 48
+    call    ct_memcmp
+    test    eax, eax
+    jnz     mdm_corrupt
+
+    ; ---- 3. Mark tombstones & overridden entries on base inventory ----------
+    mov     r12, qword ptr [rbp-152]        ; manifestBuf
+    mov     r13, qword ptr [rbp-168]        ; manifestSize
+    mov     r14, qword ptr [rbp-176]        ; cursor in manifestBuf
+mdm_del_lp:
+    cmp     r14, r13
+    jae     mdm_del_done
+    ; Find '\n' ending this line
+    mov     r15, r14
+mdm_find_nl:
+    cmp     r15, r13
+    jae     mdm_got_line
+    cmp     byte ptr [r12 + r15], 10
+    je      mdm_got_line
+    inc     r15
+    jmp     mdm_find_nl
+mdm_got_line:
+    mov     rbx, r15
+    sub     rbx, r14                        ; line length
+    cmp     rbx, 6                          ; at least "del: x"
+    jb      mdm_next_line
+    lea     r11, [r12 + r14]                ; linePtr
+    cmp     byte ptr [r11 + rbx - 1], 13
+    jne     @F
+    dec     rbx
+    cmp     rbx, 6
+    jb      mdm_next_line
+@@:
+    lea     r10, [a_delta_del_pfx]
+    xor     ecx, ecx
+mdm_chk_del:
+    mov     al, byte ptr [r11 + rcx]
+    cmp     al, byte ptr [r10 + rcx]
+    jne     mdm_next_line
+    inc     ecx
+    cmp     ecx, 5
+    jb      mdm_chk_del
+
+    lea     rcx, [r11 + 5]
+    mov     rdx, rbx
+    sub     rdx, 5
+    mov     r8d, 1                          ; include subtree
+    call    idx_mark_dropped_ci
+
+mdm_next_line:
+    lea     r14, [r15 + 1]
+    jmp     mdm_del_lp
+
+mdm_del_done:
+    ; Also mark any base entry replaced (case-insensitively) by a delta entry
+    xor     r14d, r14d                      ; cursor in deltaIdxBuf
+    mov     r13, qword ptr [rbp-144]        ; deltaIdxLen
+mdm_ov_lp:
+    mov     rax, r14
+    cmp     rax, r13
+    jae     mdm_ov_done
+    add     rax, IDXE_FIXED
+    cmp     rax, r13
+    ja      mdm_corrupt
+    mov     rbx, qword ptr [rbp-136]
+    add     rbx, r14
+    mov     edx, dword ptr [rbx + IDXE_namelen]
+    test    edx, edx
+    jz      mdm_corrupt
+    cmp     edx, 4095
+    ja      mdm_corrupt
+    add     rax, rdx
+    cmp     rax, r13
+    ja      mdm_corrupt
+    mov     r15, rax                        ; next cursor
+
+    ; Skip ".myrkr-delta"
+    cmp     edx, 12
+    jne     mdm_ov_mark
+    lea     r10, [a_delta_manifest]
+    xor     ecx, ecx
+mdm_ov_chk_mf:
+    mov     al, byte ptr [rbx + IDXE_name + rcx]
+    cmp     al, byte ptr [r10 + rcx]
+    jne     mdm_ov_mark
+    inc     ecx
+    cmp     ecx, 12
+    jb      mdm_ov_chk_mf
+    jmp     mdm_ov_next
+
+mdm_ov_mark:
+    lea     rcx, [rbx + IDXE_name]
+    mov     edx, dword ptr [rbx + IDXE_namelen]
+    xor     r8d, r8d                        ; exact match for dir; subtree for file
+    test    dword ptr [rbx + IDXE_flags], IDXEF_DIR
+    jnz     @F
+    mov     r8d, 1
+@@:
+    call    idx_mark_dropped_ci
+
+mdm_ov_next:
+    mov     r14, r15
+    jmp     mdm_ov_lp
+
+mdm_ov_done:
+    ; Copy marked base inventory to private buffer before idx_reset overwrites g_idxptr
+    mov     rax, qword ptr [g_idxlen]
+    mov     qword ptr [rbp-128], rax
+    lea     rcx, [rax + 1]
+    call    mem_alloc
+    test    rax, rax
+    jz      mdm_oom
+    mov     qword ptr [rbp-120], rax
+    mov     rcx, rax
+    mov     rdx, qword ptr [g_idxptr]
+    mov     r8,  qword ptr [rbp-128]
+    call    nr_copy
+
+    ; ---- 4. Disk space preflight + fresh v9 header/salt/key + temp file -----
+    mov     rdx, qword ptr [rbp-184]
+    add     rdx, qword ptr [rbp-192]
+    jc      mdm_nospace
+    add     rdx, CHUNK
+    jc      mdm_nospace
+    lea     rcx, [g_pk_np]
+    call    disk_has_space
+    cmp     eax, 1
+    je      mdm_nospace
+
+    mov     dword ptr [g_pkhdr + CONTAINER_HDR.version], HDR_VERSION
+    mov     byte ptr [g_pkhdr + CONTAINER_HDR.archive], 1
+    cmp     byte ptr [g_pkhdr + CONTAINER_HDR.seg_shift], 0
+    jne     @F
+    mov     byte ptr [g_pkhdr + CONTAINER_HDR.seg_shift], SEG_SHIFT_DEFAULT
+@@:
+    lea     rcx, [g_pkhdr + 20]
+    mov     edx, 44
+    call    rng_fill
+    test    eax, eax
+    jz      mdm_io
+
+    mov     eax, dword ptr [g_cfg_t]
+    cmp     eax, dword ptr [g_pkhdr + CONTAINER_HDR.t_cost]
+    jbe     @F
+    mov     dword ptr [g_pkhdr + CONTAINER_HDR.t_cost], eax
+@@:
+    mov     eax, dword ptr [g_cfg_m]
+    cmp     eax, dword ptr [g_pkhdr + CONTAINER_HDR.m_cost_kib]
+    jbe     @F
+    mov     dword ptr [g_pkhdr + CONTAINER_HDR.m_cost_kib], eax
+@@:
+    lea     rcx, [g_pkhdr + 20]
+    mov     edx, dword ptr [g_pkhdr + CONTAINER_HDR.t_cost]
+    mov     r8d, dword ptr [g_pkhdr + CONTAINER_HDR.m_cost_kib]
+    mov     r9d, HDR_VERSION
+    call    derive_key
+    test    eax, eax
+    jnz     mdm_oom
+    lea     rcx, [g_pkhdr + KCV_OFFSET]
+    call    compute_kcv
+
+    ; Random sibling temp "<g_pk_np>.<32hex>.tmp"
+    lea     rcx, [rbp-544]
+    mov     edx, 16
+    call    rng_fill
+    test    eax, eax
+    jz      mdm_io
+    lea     r10, [g_pk_np]
+    lea     r11, [g_temppath]
+    xor     r9d, r9d
+mdm_tpath:
+    cmp     r9d, MAX_PATH_CHARS - 40
+    jae     mdm_io
+    movzx   eax, word ptr [r10 + r9*2]
+    mov     word ptr [r11 + r9*2], ax
+    test    eax, eax
+    jz      mdm_tsuf
+    inc     r9
+    jmp     mdm_tpath
+mdm_tsuf:
+    mov     word ptr [r11 + r9*2], '.'
+    inc     r9
+    lea     r10, [rbp-544]
+    xor     ecx, ecx
+mdm_thex:
+    movzx   eax, byte ptr [r10 + rcx]
+    mov     edx, eax
+    shr     eax, 4
+    and     edx, 15
+    add     eax, 'a'
+    add     edx, 'a'
+    mov     word ptr [r11 + r9*2], ax
+    mov     word ptr [r11 + r9*2 + 2], dx
+    add     r9, 2
+    inc     ecx
+    cmp     ecx, 16
+    jb      mdm_thex
+    mov     word ptr [r11 + r9*2 + 0], '.'
+    mov     word ptr [r11 + r9*2 + 2], 't'
+    mov     word ptr [r11 + r9*2 + 4], 'm'
+    mov     word ptr [r11 + r9*2 + 6], 'p'
+    mov     word ptr [r11 + r9*2 + 8], 0
+
+    WINCALL CreateFileW, addr g_temppath, 40000000h, 0, 0, 1, 80h, 0
+    cmp     rax, INVALID
+    je      mdm_io
+    mov     qword ptr [rbp-112], rax
+    mov     dword ptr [rbp-232], 1
+    mov     qword ptr [g_sink_hout], rax
+
+    mov     rcx, rax
+    lea     rdx, [g_pkhdr]
+    mov     r8d, HDR_BYTES
+    call    file_write_all
+    test    eax, eax
+    jnz     mdm_io
+
+    call    idx_reset
+    mov     qword ptr [g_payoff], 0
+    mov     qword ptr [g_entnext], 0
+    mov     qword ptr [g_sinkfill], 0
+    mov     qword ptr [g_rawfill], 0
+    mov     dword ptr [g_bare], 0
+    movzx   eax, byte ptr [g_pkhdr + CONTAINER_HDR.compressed]
+    mov     qword ptr [g_compress], rax
+    test    eax, eax
+    jz      mdm_pass_base
+    call    comp_init
+    test    eax, eax
+    jnz     mdm_io
+
+    ; ---- 5a. Stream base entries (authenticating dropped ones too) ----------
+mdm_pass_base:
+    mov     qword ptr [rbp-200], 0
+mdm_base_ent:
+    mov     rax, qword ptr [rbp-200]
+    cmp     rax, qword ptr [rbp-128]
+    jae     mdm_pass_delta
+    add     rax, IDXE_FIXED
+    cmp     rax, qword ptr [rbp-128]
+    ja      mdm_corrupt
+    mov     r10, qword ptr [rbp-120]
+    add     r10, qword ptr [rbp-200]
+    mov     edx, dword ptr [r10 + IDXE_namelen]
+    test    edx, edx
+    jz      mdm_corrupt
+    cmp     edx, 4095
+    ja      mdm_corrupt
+    add     rax, rdx
+    cmp     rax, qword ptr [rbp-128]
+    ja      mdm_corrupt
+    mov     qword ptr [rbp-208], r10
+
+    mov     rcx, qword ptr [rbp-96]
+    mov     rdx, r10
+    lea     r8,  [rbp-288]
+    call    es_bind
+    test    eax, eax
+    jnz     mdm_base_decode_err
+
+    mov     r10, qword ptr [rbp-208]
+    mov     rax, qword ptr [r10 + IDXE_size]
+    mov     qword ptr [rbp-216], rax
+    test    dword ptr [r10 + IDXE_flags], IDXEF_DROPPED
+    jnz     mdm_base_data
+
+    lea     rcx, [g_rel]
+    lea     rdx, [r10 + IDXE_name]
+    mov     r8d, dword ptr [r10 + IDXE_namelen]
+    mov     qword ptr [g_rellen], r8
+    call    nr_copy
+    lea     r10, [g_rel]
+    mov     rax, qword ptr [g_rellen]
+    mov     byte ptr [r10 + rax], 0
+    lea     rcx, [g_rel]
+    mov     rdx, rax
+    call    split_name
+    test    eax, eax
+    jnz     mdm_corrupt
+    call    entry_begin
+    mov     r10, qword ptr [rbp-208]
+    mov     eax, '0'
+    test    dword ptr [r10 + IDXE_flags], IDXEF_DIR
+    jz      @F
+    mov     eax, '5'
+@@:
+    mov     qword ptr [rsp+32], rax
+    lea     rcx, [g_tarhdr]
+    lea     rdx, [g_namebuf]
+    lea     r8,  [g_prefixbuf]
+    mov     r9,  qword ptr [rbp-216]
+    call    tar_build_header
+    lea     rcx, [g_tarhdr]
+    mov     edx, 512
+    call    tar_out
+
+mdm_base_data:
+    mov     r8, qword ptr [rbp-216]
+    cmp     r8, CHUNK
+    jbe     @F
+    mov     r8d, CHUNK
+@@:
+    mov     qword ptr [rbp-224], r8
+    mov     rcx, qword ptr [rbp-96]
+    lea     rdx, [g_filebuf]
+    call    es_consume
+    test    eax, eax
+    jnz     mdm_base_decode_err
+    mov     r10, qword ptr [rbp-208]
+    test    dword ptr [r10 + IDXE_flags], IDXEF_DROPPED
+    jnz     mdm_base_chk
+    lea     rcx, [g_filebuf]
+    mov     rdx, qword ptr [rbp-224]
+    call    tar_out
+mdm_base_chk:
+    cmp     qword ptr [g_packerr], 0
+    jne     mdm_packerr
+    mov     rax, qword ptr [rbp-224]
+    sub     qword ptr [rbp-216], rax
+    jnz     mdm_base_data
+
+    mov     r10, qword ptr [rbp-208]
+    test    dword ptr [r10 + IDXE_flags], IDXEF_DROPPED
+    jnz     mdm_base_next
+    mov     rdx, qword ptr [r10 + IDXE_size]
+    neg     rdx
+    and     edx, 511
+    lea     rcx, [g_zeros]
+    call    tar_out
+    call    entry_end
+    mov     r10, qword ptr [rbp-208]
+    mov     rcx, qword ptr [r10 + IDXE_size]
+    mov     edx, dword ptr [r10 + IDXE_flags]
+    and     edx, IDXEF_DIR
+    call    idx_add
+    cmp     qword ptr [g_packerr], 0
+    jne     mdm_packerr
+
+mdm_base_next:
+    mov     r10, qword ptr [rbp-208]
+    mov     eax, dword ptr [r10 + IDXE_namelen]
+    add     rax, IDXE_FIXED
+    add     qword ptr [rbp-200], rax
+    jmp     mdm_base_ent
+
+    ; ---- 5b. Stream delta entries (excluding .myrkr-delta) ------------------
+mdm_pass_delta:
+    mov     qword ptr [rbp-200], 0
+mdm_delta_ent:
+    mov     rax, qword ptr [rbp-200]
+    cmp     rax, qword ptr [rbp-144]
+    jae     mdm_seal
+    mov     r10, qword ptr [rbp-136]
+    add     r10, rax
+    mov     qword ptr [rbp-208], r10
+    mov     edx, dword ptr [r10 + IDXE_namelen]
+
+    cmp     edx, 12
+    jne     mdm_delta_emit
+    lea     r11, [a_delta_manifest]
+    xor     ecx, ecx
+mdm_chk_mf2:
+    mov     al, byte ptr [r10 + IDXE_name + rcx]
+    cmp     al, byte ptr [r11 + rcx]
+    jne     mdm_delta_emit
+    inc     ecx
+    cmp     ecx, 12
+    jb      mdm_chk_mf2
+    jmp     mdm_delta_next
+
+mdm_delta_emit:
+    lea     rcx, [g_rel]
+    lea     rdx, [r10 + IDXE_name]
+    mov     r8d, dword ptr [r10 + IDXE_namelen]
+    cmp     r8d, ENTRY_NAME_MAX
+    ja      mdm_corrupt
+    mov     qword ptr [g_rellen], r8
+    call    nr_copy
+    lea     r10, [g_rel]
+    mov     rax, qword ptr [g_rellen]
+    mov     byte ptr [r10 + rax], 0
+    lea     rcx, [g_rel]
+    call    sanitize_name
+    test    eax, eax
+    jnz     mdm_corrupt
+
+    mov     rcx, qword ptr [rbp-104]
+    mov     rdx, qword ptr [rbp-208]
+    lea     r8,  [rbp-320]
+    call    es_bind
+    test    eax, eax
+    jnz     mdm_delta_decode_err
+
+    mov     r10, qword ptr [rbp-208]
+    mov     rax, qword ptr [r10 + IDXE_size]
+    mov     qword ptr [rbp-216], rax
+
+    lea     rcx, [g_rel]
+    mov     rdx, qword ptr [g_rellen]
+    call    split_name
+    test    eax, eax
+    jnz     mdm_corrupt
+    call    entry_begin
+    mov     r10, qword ptr [rbp-208]
+    mov     eax, '0'
+    test    dword ptr [r10 + IDXE_flags], IDXEF_DIR
+    jz      @F
+    mov     eax, '5'
+@@:
+    mov     qword ptr [rsp+32], rax
+    lea     rcx, [g_tarhdr]
+    lea     rdx, [g_namebuf]
+    lea     r8,  [g_prefixbuf]
+    mov     r9,  qword ptr [rbp-216]
+    call    tar_build_header
+    lea     rcx, [g_tarhdr]
+    mov     edx, 512
+    call    tar_out
+
+mdm_delta_data:
+    mov     r8, qword ptr [rbp-216]
+    cmp     r8, CHUNK
+    jbe     @F
+    mov     r8d, CHUNK
+@@:
+    mov     qword ptr [rbp-224], r8
+    mov     rcx, qword ptr [rbp-104]
+    lea     rdx, [g_filebuf]
+    call    es_consume
+    test    eax, eax
+    jnz     mdm_delta_decode_err
+    lea     rcx, [g_filebuf]
+    mov     rdx, qword ptr [rbp-224]
+    call    tar_out
+    cmp     qword ptr [g_packerr], 0
+    jne     mdm_packerr
+    mov     rax, qword ptr [rbp-224]
+    sub     qword ptr [rbp-216], rax
+    jnz     mdm_delta_data
+
+    mov     r10, qword ptr [rbp-208]
+    mov     rdx, qword ptr [r10 + IDXE_size]
+    neg     rdx
+    and     edx, 511
+    lea     rcx, [g_zeros]
+    call    tar_out
+    call    entry_end
+    mov     r10, qword ptr [rbp-208]
+    mov     rcx, qword ptr [r10 + IDXE_size]
+    mov     edx, dword ptr [r10 + IDXE_flags]
+    and     edx, IDXEF_DIR
+    call    idx_add
+    cmp     qword ptr [g_packerr], 0
+    jne     mdm_packerr
+
+mdm_delta_next:
+    mov     r10, qword ptr [rbp-208]
+    mov     eax, dword ptr [r10 + IDXE_namelen]
+    add     rax, IDXE_FIXED
+    add     qword ptr [rbp-200], rax
+    jmp     mdm_delta_ent
+
+    ; ---- 6. Seal inventory, FlushFileBuffers, ReplaceFileW, delete sidecar --
+mdm_seal:
+    cmp     qword ptr [g_idxcount], 0
+    jne     mdm_write_idx
+    call    entry_begin
+    call    entry_end
+    cmp     qword ptr [g_packerr], 0
+    jne     mdm_packerr
+
+mdm_write_idx:
+    mov     rcx, qword ptr [rbp-112]
+    call    idx_write
+    test    eax, eax
+    jnz     mdm_io
+    WINCALL FlushFileBuffers, qword ptr [rbp-112]
+    test    eax, eax
+    jz      mdm_io
+    mov     rcx, qword ptr [rbp-112]
+    call    file_close
+    mov     qword ptr [rbp-112], INVALID
+
+    WINCALL ReplaceFileW, addr g_pk_np, addr g_temppath, 0, 0, 0, 0
+    test    eax, eax
+    jz      mdm_replace_fail
+    mov     dword ptr [rbp-232], 0
+
+    ; Close baseEs and deltaEs BEFORE deleting <stem>.delta.mrk so no read
+    ; handle keeps the sidecar locked on Windows.
+    mov     rcx, qword ptr [rbp-96]
+    test    rcx, rcx
+    jz      @F
+    call    es_destroy
+    mov     qword ptr [rbp-96], 0
+@@:
+    mov     rcx, qword ptr [rbp-104]
+    test    rcx, rcx
+    jz      @F
+    call    es_destroy
+    mov     qword ptr [rbp-104], 0
+@@:
+    mov     rcx, qword ptr [rbp-80]
+    lea     rdx, [g_outdir_np]
+    call    normalize_path
+    test    eax, eax
+    jnz     @F
+    lea     rcx, [g_outdir_np]
+    call    file_delete
+@@:
+    xor     eax, eax
+    jmp     mdm_cleanup
+
+mdm_replace_fail:
+    mov     dword ptr [rbp-232], 0
+    mov     eax, EXIT_PARTIAL
+    jmp     mdm_cleanup
+
+mdm_base_decode_err:
+    mov     rcx, qword ptr [rbp-96]
+    call    es_code
+    test    eax, eax
+    jnz     mdm_cleanup
+    jmp     mdm_corrupt
+
+mdm_delta_decode_err:
+    mov     rcx, qword ptr [rbp-104]
+    call    es_code
+    test    eax, eax
+    jnz     mdm_cleanup
+mdm_corrupt:
+    mov     eax, EXIT_CORRUPT
+    jmp     mdm_cleanup
+mdm_packerr:
+    mov     eax, dword ptr [g_packerr]
+    jmp     mdm_cleanup
+mdm_unsup:
+    mov     eax, EXIT_UNSUPPORTED
+    jmp     mdm_cleanup
+mdm_nospace:
+    mov     eax, EXIT_NOSPACE
+    jmp     mdm_cleanup
+mdm_oom:
+    mov     eax, EXIT_OOM
+    jmp     mdm_cleanup
+mdm_io:
+    mov     eax, EXIT_IO
+
+mdm_cleanup:
+    mov     dword ptr [rbp-240], eax
+    mov     rax, qword ptr [rbp-88]
+    mov     qword ptr [g_cfg_in], rax
+
+    call    comp_close
+    mov     rcx, qword ptr [rbp-112]
+    call    file_close
+    cmp     dword ptr [rbp-232], 0
+    je      @F
+    lea     rcx, [g_temppath]
+    call    file_delete
+@@:
+    mov     rcx, qword ptr [rbp-96]
+    test    rcx, rcx
+    jz      @F
+    call    es_destroy
+@@:
+    mov     rcx, qword ptr [rbp-104]
+    test    rcx, rcx
+    jz      @F
+    call    es_destroy
+@@:
+    mov     rcx, qword ptr [rbp-120]
+    test    rcx, rcx
+    jz      @F
+    mov     rdx, qword ptr [rbp-128]
+    inc     rdx
+    call    mem_free
+@@:
+    mov     rcx, qword ptr [rbp-136]
+    test    rcx, rcx
+    jz      @F
+    mov     rdx, qword ptr [rbp-144]
+    inc     rdx
+    call    mem_free
+@@:
+    mov     rcx, qword ptr [rbp-152]
+    test    rcx, rcx
+    jz      @F
+    mov     rdx, qword ptr [rbp-160]
+    call    mem_free
+@@:
+    lea     rcx, [rbp-288]
+    mov     edx, 64                         ; baseKey + deltaKey
+    call    secure_zero
+    lea     rcx, [g_key]
+    mov     edx, 32
+    call    secure_zero
+    lea     rcx, [g_filebuf]
+    mov     edx, CHUNK
+    call    secure_zero
+    lea     rcx, [g_rawblk]
+    mov     edx, CBLOCK
+    call    secure_zero
+    lea     rcx, [g_compbuf]
+    mov     edx, 2*CBLOCK
+    call    secure_zero
+    lea     rcx, [g_sink]
+    mov     edx, CHUNK
+    call    secure_zero
+    lea     rcx, [g_pkctx]
+    mov     edx, GCTX_SIZE
+    call    secure_zero
+
+    mov     eax, dword ptr [rbp-240]
+    mov     rbx, qword ptr [rbp-16]
+    mov     r12, qword ptr [rbp-24]
+    mov     r13, qword ptr [rbp-32]
+    mov     r14, qword ptr [rbp-40]
+    mov     r15, qword ptr [rbp-48]
+    mov     rsi, qword ptr [rbp-56]
+    mov     rdi, qword ptr [rbp-64]
+    FRAME_EPILOG
+    ret
+merge_delta_mrk endp
 
 ; =============================================================================
 ; do_list -> eax exit code.  Print the inventory of a container.

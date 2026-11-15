@@ -21,6 +21,8 @@ extern VirtualLock:proc                 ; best-effort pin of the final block
 extern VirtualUnlock:proc
 extern secmem_register_range:proc
 extern secmem_unregister_range:proc
+extern AcquireSRWLockExclusive:proc
+extern ReleaseSRWLockExclusive:proc
 
 MEM_COMMIT      equ 1000h
 MEM_RESERVE     equ 2000h
@@ -749,6 +751,8 @@ g_inp     db 1024 dup (?)
 public g_addr
 g_addr    db 1024 dup (?)
 g_zero    db 1024 dup (?) ; stays zero (BSS, never written)
+align 8
+g_a2_lock dq ?            ; SRWLOCK_INIT (0): serializes static working buffers
 
 .code
 
@@ -792,7 +796,7 @@ endm
 ; =============================================================================
 public argon2id_hash
 argon2id_hash proc frame
-    FRAME_PROLOG 64
+    FRAME_PROLOG 80
     mov     qword ptr [rbp-24], rcx     ; req
     ; r12, r13 and r15 are scratch below (ref block, prev block, the pseudo-
     ; random word) and the Windows x64 ABI makes them CALLEE-saved.  They were
@@ -803,6 +807,8 @@ argon2id_hash proc frame
     mov     qword ptr [rbp-32], r12
     mov     qword ptr [rbp-40], r13
     mov     qword ptr [rbp-48], r15
+    WINCALL AcquireSRWLockExclusive, addr g_a2_lock
+    mov     rcx, qword ptr [rbp-24]
 
     ; ---- RFC 9106 parameter validation (prevents #DE on lanes=0 / q=0) -----
     test    rcx, rcx
@@ -1425,6 +1431,15 @@ a2_badparam:
     pxor    xmm5, xmm5
     mov     eax, 1
 a2_restore:
+    mov     dword ptr [rbp-56], eax
+    WINCALL ReleaseSRWLockExclusive, addr g_a2_lock
+    mov     eax, dword ptr [rbp-56]
+    pxor    xmm0, xmm0
+    pxor    xmm1, xmm1
+    pxor    xmm2, xmm2
+    pxor    xmm3, xmm3
+    pxor    xmm4, xmm4
+    pxor    xmm5, xmm5
     mov     r12, qword ptr [rbp-32]     ; callee-saved, see the prologue
     mov     r13, qword ptr [rbp-40]
     mov     r15, qword ptr [rbp-48]

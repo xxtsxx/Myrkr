@@ -66,8 +66,11 @@ externdef uz_sctx:byte                  ; unzip.asm: HMAC-SHA1 context
 externdef uz_inner:byte                 ; unzip.asm: HMAC-SHA1 inner digest
 externdef g_tcvc_sec:byte               ; tcvc.asm: TC/VC XTS schedule + KDF/keyfile secrets
 externdef g_cf_mrk_key:byte             ; cfmount.asm: mounted .mrk 32-byte container key
+externdef g_cf_delta_key:byte           ; cfmount.asm: .delta.mrk 32-byte key
+externdef g_cf_pass:byte                ; cfmount.asm: mounted .mrk password snapshot
+externdef g_cf_dctx:byte                ; cfmount.asm: .delta.mrk GCM streaming ctx
 
-SECMEM_MAX      equ 32             ; registered static secret regions
+SECMEM_MAX      equ 40             ; registered static secret regions
 ; Slack added to the working set when a lock is refused for quota.  One lock is
 ; at most a couple of pages, but the quota is granted in whole pages and the
 ; process needs headroom for its own pages too.
@@ -262,9 +265,21 @@ secmem_init proc frame
     mov     rdx, TCVC_SEC_SIZE
     call    secmem_add
 
-    ; Cloud-Files mounted .mrk container key copy
+    ; Cloud-Files mounted .mrk container key copy + R/W delta sidecar secrets
     lea     rcx, [g_cf_mrk_key]
     mov     rdx, KEY_LEN
+    call    secmem_add
+
+    lea     rcx, [g_cf_delta_key]
+    mov     rdx, KEY_LEN
+    call    secmem_add
+
+    lea     rcx, [g_cf_pass]
+    mov     rdx, MAX_PASSWORD_BYTES+1
+    call    secmem_add
+
+    lea     rcx, [g_cf_dctx]
+    mov     rdx, 336
     call    secmem_add
 
     mov     qword ptr [g_sm_dyn_ptr], 0

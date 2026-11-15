@@ -1,15 +1,22 @@
 # End-to-end verification for user-mode Windows Cloud Files drive mounting
-# (src/cfmount.asm + ID_MOUNTDRV=176 in src/gui.asm):
+# (src/cfmount.asm + src/pack.asm + ID_MOUNTDRV=176 in src/gui.asm):
 #   1. Crash-recovery startup sweep (cfmount_sweep_stale) reaps unlocked orphan
 #      sync-root folders and unmaps orphaned session drive letters.
-#   2. VeraCrypt (.hc) auto-mounts on GUI open, serves exact file contents to
-#      external processes, enforces read-only attributes, dehydrates placeholders
-#      back to 0 on-disk bytes after close completion, and toggles unmount/remount
-#      via command-bar button 176.
-#   3. Native Myrkr (.mrk) mounts via command-bar button 176, serves compressed
-#      and stored entries with SHA-256 parity, and fails closed with an I/O/CRC
-#      error (0 unauthenticated plaintext bytes) if an entry's ciphertext is
-#      tampered with.
+#   2. VeraCrypt (.hc) auto-mounts Read-Only on GUI open, serves exact file
+#      contents, blocks writes, dehydrates placeholders back to 0 on-disk bytes
+#      on handle close, and toggles unmount/remount via command-bar button 176.
+#   3. Native Myrkr (.mrk) archive auto-mounts Read/Write by default; closing
+#      with zero edits never creates .delta.mrk and leaves .mrk byte-identical.
+#   4. Live R/W edits on Z:\ (creates, nested dirs, partial overwrite of base
+#      placeholder, rename of unhydrated base placeholder, deletion) lazily
+#      write a 100% v9-compliant <stem>.delta.mrk verified by BOTH myrkr.exe
+#      and independent pure-Python decryption (indepdecrypttest.py) while
+#      leaving <stem>.mrk untouched; simulated crash + recovery prompt (Cancel
+#      keeps .delta.mrk & mounts Read-Only; OK merges atomically & deletes
+#      .delta.mrk); opening a .delta.mrk directly mounts Read-Only for salvage.
+#   5. Immediate controlled dismount (WM_CLOSE right after write, before 1s
+#      watcher debounce) flushes & merges cleanly into <stem>.mrk.
+#   6. Tampered .mrk entry fails closed before hydration with zero plaintext leaked.
 # Requires build dbg (MYRKR_DBG_NOSECDESK=1); touches only its own child processes.
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
@@ -88,7 +95,7 @@ function Start-Myrkr([string[]]$argList) {
 }
 
 function Wait-Win($proc, [string]$cls) {
-    for ($i = 0; $i -lt 150; $i++) {
+    for ($i = 0; $i -lt 200; $i++) {
         if ($proc.HasExited) { throw "Myrkr exited unexpectedly with code $($proc.ExitCode)" }
         $h = [CfMountGui]::Find([uint32]$proc.Id, $cls)
         if ($h -ne [IntPtr]::Zero) { return $h }
@@ -121,6 +128,18 @@ function Pick-FreeDriveBottomUp {
     throw "No free drive letter available between D: and Z:"
 }
 
+function Wait-DriveStatus($mainHwnd) {
+    $statusCtl = [CfMountGui]::Child($mainHwnd, 196)
+    for ($i = 0; $i -lt 120; $i++) {
+        $st = [CfMountGui]::Title($statusCtl)
+        if ($st -match '([D-Z]):\\') {
+            return [pscustomobject]@{ Letter = $Matches[1]; Root = "$($Matches[1]):\"; Status = $st }
+        }
+        Start-Sleep -Milliseconds 100
+    }
+    throw "Container did not mount a drive letter (status='$([CfMountGui]::Title($statusCtl))')"
+}
+
 try {
     [void](New-Item -ItemType Directory -Path $work -Force)
     $env:MYRKR_DBG_NOSECDESK = '1'
@@ -142,7 +161,6 @@ try {
     }
 
     $pSweep = Start-Myrkr @()
-    # Empty window is created hidden unless shown or args given; wait for window handle
     for ($i = 0; $i -lt 100; $i++) {
         $pSweep.Refresh()
         if ($pSweep.MainWindowHandle -ne [IntPtr]::Zero) { break }
@@ -163,8 +181,8 @@ try {
     'PASS: cfmount_sweep_stale wipes unlocked orphan sync roots and unmaps dead session drives'
 
     # -------------------------------------------------------------------------
-    # 2. VeraCrypt (.hc) auto-mount, child-PID hydration + close dehydration,
-    #    read-only enforcement, and WM_COMMAND 176 unmount/remount toggle
+    # 2. VeraCrypt (.hc) Read-Only auto-mount, child-PID hydration + close
+    #    dehydration, write denial, and WM_COMMAND 176 unmount/remount toggle
     # -------------------------------------------------------------------------
     $hc = Join-Path $work 'mount_vc.hc'
     $pyVc = @"
@@ -181,7 +199,9 @@ with open(r'$hc', 'wb') as f:
     f.write(vol)
 print(hashlib.sha256(big).hexdigest().upper())
 "@
-    $expectedVcBigHash = (& python -c $pyVc).Trim()
+    $pyVcPath = Join-Path $work 'build_vc.py'
+    [IO.File]::WriteAllText($pyVcPath, $pyVc, [Text.UTF8Encoding]::new($false))
+    $expectedVcBigHash = (& python $pyVcPath).Trim()
     if ($LASTEXITCODE -ne 0 -or $expectedVcBigHash.Length -ne 64) {
         throw "Failed to build mount_vc.hc fixture"
     }
@@ -197,17 +217,8 @@ print(hashlib.sha256(big).hexdigest().upper())
     if (([CfMountGui]::GetWindowLongW($mainVc, -20) -band 0x00000008) -ne 0) {
         throw "myrkr_window must NOT retain WS_EX_TOPMOST after initial front placement"
     }
-    $statusCtlVc = [CfMountGui]::Child($mainVc, 196)
-    $drvLetterVc = $null
-    for ($i = 0; $i -lt 100; $i++) {
-        $st = [CfMountGui]::Title($statusCtlVc)
-        if ($st -match '([D-Z]):\\') { $drvLetterVc = $Matches[1]; break }
-        Start-Sleep -Milliseconds 100
-    }
-    if (-not $drvLetterVc) {
-        throw "VeraCrypt container did not auto-mount a drive letter (status='$([CfMountGui]::Title($statusCtlVc))')"
-    }
-    $drvRootVc = "${drvLetterVc}:\"
+    $mntVc = Wait-DriveStatus $mainVc
+    $drvRootVc = $mntVc.Root
     $syncDirVc = @(Get-ChildItem -LiteralPath $mountsBase -Directory |
                    Where-Object { $_.FullName -notin $beforeDirs } |
                    Select-Object -ExpandProperty FullName)[0]
@@ -219,8 +230,6 @@ print(hashlib.sha256(big).hexdigest().upper())
         throw "$syncDirVc must NOT carry FILE_ATTRIBUTE_ENCRYPTED (triggers Windows EFS tray prompt)"
     }
 
-    # Verify recursive directory enumeration (FindFirstFileW / IRP_MJ_DIRECTORY_CONTROL)
-    # and real Windows Shell namespace enumeration complete fast without hanging
     $enumScript = @"
 `$ErrorActionPreference = 'Stop'
 `$entries = @(Get-ChildItem -LiteralPath '${drvRootVc}' -Recurse -Force | ForEach-Object { `$_.Name })
@@ -257,15 +266,12 @@ Write-Output 'ENUM_OK'
         throw "Directory / Windows Shell enumeration failed (rc=$($enumProc.ExitCode)): $enumOut $enumErr"
     }
 
-    # Before first content read, placeholder must occupy 0 on-disk bytes
     $phBigPath = Join-Path $syncDirVc 'big.txt'
     $preDisk = [CfMountGui]::OnDiskBytes($phBigPath)
     if ($preDisk -ne 0) {
         throw "Expected unhydrated placeholder big.txt OnDiskBytes == 0, got $preDisk"
     }
 
-    # Read from an external child process so cldflt.sys delivers NOTIFY_FILE_CLOSE_COMPLETION
-    # when the child closes its handle, and verify write attempts are denied.
     $childScript = @"
 `$ErrorActionPreference = 'Stop'
 `$h = (Get-FileHash -LiteralPath '${drvRootVc}big.txt' -Algorithm SHA256).Hash
@@ -283,7 +289,6 @@ Write-Output `$h
         throw "Mounted big.txt SHA-256 mismatch: expected $expectedVcBigHash, got $childOut"
     }
 
-    # Poll for close-completion placeholder dehydration back to 0 on-disk bytes
     $dehydrated = $false
     for ($i = 0; $i -lt 50; $i++) {
         if ([CfMountGui]::OnDiskBytes($phBigPath) -eq 0) { $dehydrated = $true; break }
@@ -294,7 +299,6 @@ Write-Output `$h
     }
     'PASS: VeraCrypt auto-mount serves verified plaintext, blocks writes, and dehydrates back to 0 bytes on close'
 
-    # Toggle unmount via ID_MOUNTDRV (176)
     [void][CfMountGui]::SendMessageW($mainVc, 0x0111, [IntPtr]176, [IntPtr]::Zero)
     if (Test-Path -LiteralPath $drvRootVc) {
         throw "Drive $drvRootVc still exists after clicking Unmount (176)"
@@ -303,13 +307,9 @@ Write-Output `$h
         throw "Sync-root directory $syncDirVc was not wiped/removed on unmount"
     }
 
-    # Toggle re-mount via ID_MOUNTDRV (176) (MYRKR_DBG_NOSECDESK=1 suppresses Explorer window)
     [void][CfMountGui]::SendMessageW($mainVc, 0x0111, [IntPtr]176, [IntPtr]::Zero)
-    $stRemount = [CfMountGui]::Title($statusCtlVc)
-    if ($stRemount -notmatch '([D-Z]):\\') {
-        throw "Clicking Mount (176) did not re-mount container (status='$stRemount')"
-    }
-    $drvRootVc2 = "$($Matches[1]):\"
+    $mntVc2 = Wait-DriveStatus $mainVc
+    $drvRootVc2 = $mntVc2.Root
     if ((Get-FileHash -LiteralPath "${drvRootVc2}big.txt" -Algorithm SHA256).Hash -ne $expectedVcBigHash) {
         throw "Re-mounted drive $drvRootVc2 big.txt SHA-256 mismatch"
     }
@@ -321,7 +321,7 @@ Write-Output `$h
     'PASS: Command-bar button 176 cleanly unmounts and re-mounts TC/VC volumes'
 
     # -------------------------------------------------------------------------
-    # 3. Native .mrk manual mount + compressed readback + fail-closed tamper check
+    # 3. Native .mrk default R/W auto-mount + zero-edit dismount invariance
     # -------------------------------------------------------------------------
     $mrkPass = 'Mount-Mrk-Strong#99'
     $srcDir = Join-Path $work 'mrk_src'
@@ -329,52 +329,302 @@ Write-Output `$h
     $mrkPayload = [Text.Encoding]::UTF8.GetBytes(('Authenticated native Myrkr Cloud Files stream line! ' * 2500))
     $mrkFileA = Join-Path $srcDir 'payload.txt'
     $mrkFileB = Join-Path $srcDir 'nested\small.bin'
+    $mrkFileKeep = Join-Path $srcDir 'untouched.txt'
     [IO.File]::WriteAllBytes($mrkFileA, $mrkPayload)
     [IO.File]::WriteAllBytes($mrkFileB, [byte[]](0..255))
+    [IO.File]::WriteAllText($mrkFileKeep, 'Keep me intact across delta merges!')
     $expectedHashA = (Get-FileHash -LiteralPath $mrkFileA -Algorithm SHA256).Hash
     $expectedHashB = (Get-FileHash -LiteralPath $mrkFileB -Algorithm SHA256).Hash
 
     $goodMrk = Join-Path $work 'good.mrk'
+    $deltaMrk = Join-Path $work 'good.delta.mrk'
     $encRes = Run-Cli @('encrypt', $srcDir, '-o', $goodMrk, '-p', $mrkPass, '--compress', '-m', '16', '-t', '1')
     if ($encRes.rc -ne 0) { throw "Failed to create good.mrk ($($encRes.rc)): $($encRes.out)" }
+    $origMrkHash = (Get-FileHash -LiteralPath $goodMrk -Algorithm SHA256).Hash
 
-    $pMrk = Start-Myrkr @($goodMrk)
-    Unlock-Prompt $pMrk $mrkPass
-    $mainMrk = Wait-Win $pMrk 'myrkr_window'
-    $mntBtnMrk = [CfMountGui]::Child($mainMrk, 176)
-    if (-not [CfMountGui]::IsWindowEnabled($mntBtnMrk)) {
+    $pMrk0 = Start-Myrkr @($goodMrk)
+    Unlock-Prompt $pMrk0 $mrkPass
+    $mainMrk0 = Wait-Win $pMrk0 'myrkr_window'
+    $mntBtnMrk0 = [CfMountGui]::Child($mainMrk0, 176)
+    if (-not [CfMountGui]::IsWindowEnabled($mntBtnMrk0)) {
         throw "Mount drive button (176) should be enabled when browsing .mrk container"
     }
-    # .mrk does NOT auto-mount on open; mount explicitly via ID_MOUNTDRV (176)
-    $statusMrk = [CfMountGui]::Child($mainMrk, 196)
-    if ([CfMountGui]::Title($statusMrk) -match '[D-Z]:\\') {
-        throw ".mrk container unexpectedly auto-mounted before clicking button 176"
+    $mnt0 = Wait-DriveStatus $mainMrk0
+    if ($mnt0.Status -notmatch '\(Read/Write\)') {
+        throw "Expected default Read/Write status for native .mrk archive, got '$($mnt0.Status)'"
     }
-    [void][CfMountGui]::SendMessageW($mainMrk, 0x0111, [IntPtr]176, [IntPtr]::Zero)
-    $stMrkMnt = [CfMountGui]::Title($statusMrk)
-    if ($stMrkMnt -notmatch '([D-Z]):\\') {
-        throw "Clicking button 176 on .mrk container did not mount a drive (status='$stMrkMnt')"
+    $mrkDrv0 = $mnt0.Root
+    $mountedA0 = Join-Path $mrkDrv0 'mrk_src\payload.txt'
+    $mountedB0 = Join-Path $mrkDrv0 'mrk_src\nested\small.bin'
+    if (([IO.File]::GetAttributes($mountedA0) -band [IO.FileAttributes]::ReadOnly) -ne 0) {
+        throw "R/W mounted placeholder $mountedA0 must NOT have ReadOnly attribute"
     }
-    $mrkDrv = "$($Matches[1]):\"
-    $mountedA = Join-Path $mrkDrv 'mrk_src\payload.txt'
-    $mountedB = Join-Path $mrkDrv 'mrk_src\nested\small.bin'
-    if ((Get-FileHash -LiteralPath $mountedA -Algorithm SHA256).Hash -ne $expectedHashA) {
+    if ((Get-FileHash -LiteralPath $mountedA0 -Algorithm SHA256).Hash -ne $expectedHashA) {
         throw "Mounted .mrk payload.txt SHA-256 mismatch"
     }
-    if ((Get-FileHash -LiteralPath $mountedB -Algorithm SHA256).Hash -ne $expectedHashB) {
+    if ((Get-FileHash -LiteralPath $mountedB0 -Algorithm SHA256).Hash -ne $expectedHashB) {
         throw "Mounted .mrk nested/small.bin SHA-256 mismatch"
     }
-    [void][CfMountGui]::PostMessageW($mainMrk, 0x0111, [IntPtr]107, [IntPtr]::Zero)
-    if (-not $pMrk.WaitForExit(5000)) { throw ".mrk Myrkr window did not exit cleanly" }
-    if (Test-Path -LiteralPath $mrkDrv) {
-        throw ".mrk mounted drive $mrkDrv remained after window exit"
+    if (Test-Path -LiteralPath $deltaMrk) {
+        throw "Read-only inspection of R/W drive must NOT create $deltaMrk"
     }
-    'PASS: Native .mrk container mounts on demand, serves compressed entries, and unmounts on exit'
+    [void][CfMountGui]::PostMessageW($mainMrk0, 0x0111, [IntPtr]107, [IntPtr]::Zero)
+    if (-not $pMrk0.WaitForExit(8000)) { throw "Zero-edit .mrk Myrkr window did not exit cleanly" }
+    if (Test-Path -LiteralPath $mrkDrv0) { throw "Mounted drive $mrkDrv0 remained after exit" }
+    if (Test-Path -LiteralPath $deltaMrk) { throw "Zero-edit dismount must NOT leave $deltaMrk" }
+    if ((Get-FileHash -LiteralPath $goodMrk -Algorithm SHA256).Hash -ne $origMrkHash) {
+        throw "Zero-edit dismount modified original good.mrk!"
+    }
+    'PASS: Native .mrk archive auto-mounts Read/Write by default and leaves container byte-identical on zero-edit close'
 
-    # Tampered .mrk entry test: create stored archive folder so payload sits
-    # cleanly between header+tar (offset ~1136) and trailing index, flip 1 byte in
-    # entry ciphertext, mount, and verify ReadAllBytes throws an I/O error with
-    # zero unauthenticated plaintext leaked!
+    # -------------------------------------------------------------------------
+    # 4. Live R/W edits -> lazy v9 .delta.mrk sidecar + independent verification
+    #    + salvage mount + simulated crash + recovery prompt (Cancel then OK)
+    # -------------------------------------------------------------------------
+    $pMrk1 = Start-Myrkr @($goodMrk)
+    Unlock-Prompt $pMrk1 $mrkPass
+    $mainMrk1 = Wait-Win $pMrk1 'myrkr_window'
+    $mnt1 = Wait-DriveStatus $mainMrk1
+    $mrkDrv1 = $mnt1.Root
+
+    # Perform all mutation classes from an external process against Z:\:
+    #   - Create root file & nested directory + file
+    #   - Partial in-place overwrite of compressed base placeholder (exercises CfHydratePlaceholder)
+    #   - Rename unhydrated base placeholder (exercises zero-hydration g_cf_esctx stream + del: tombstone)
+    $mutScript = @"
+`$ErrorActionPreference = 'Stop'
+[IO.File]::WriteAllText('${mrkDrv1}fresh_root.txt', 'Created on R/W Cloud Files drive!')
+[void](New-Item -ItemType Directory -Path '${mrkDrv1}new_folder' -Force)
+[IO.File]::WriteAllText('${mrkDrv1}new_folder\inside.txt', 'Nested created file!')
+`$fs = [IO.File]::Open('${mrkDrv1}mrk_src\payload.txt', [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+try {
+    `$patch = [Text.Encoding]::UTF8.GetBytes('<<PATCHED-IN-PLACE>>')
+    `$fs.Position = 16
+    `$fs.Write(`$patch, 0, `$patch.Length)
+} finally {
+    `$fs.Dispose()
+}
+Rename-Item -LiteralPath '${mrkDrv1}mrk_src\nested\small.bin' -NewName 'renamed_small.bin'
+Write-Output 'MUT_OK'
+"@
+    $encMut = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($mutScript))
+    $mutOut = (& $psExe -NoProfile -EncodedCommand $encMut 2>&1 | Out-String).Trim()
+    if ($LASTEXITCODE -ne 0 -or $mutOut -notmatch 'MUT_OK') {
+        throw "External R/W mutation script failed: $mutOut"
+    }
+
+    # Wait for background watcher (1s debounce) to write good.delta.mrk & update UI status
+    $statusCtl1 = [CfMountGui]::Child($mainMrk1, 196)
+    $deltaReady = $false
+    for ($i = 0; $i -lt 80; $i++) {
+        if ((Test-Path -LiteralPath $deltaMrk) -and ([CfMountGui]::Title($statusCtl1) -match 'unsaved')) {
+            $deltaReady = $true
+            break
+        }
+        Start-Sleep -Milliseconds 100
+    }
+    if (-not $deltaReady) {
+        throw "Background watcher did not produce $deltaMrk / update status (exists=$(Test-Path $deltaMrk), status='$([CfMountGui]::Title($statusCtl1))')"
+    }
+
+    # Base container MUST remain untouched on disk while mounted!
+    if ((Get-FileHash -LiteralPath $goodMrk -Algorithm SHA256).Hash -ne $origMrkHash) {
+        throw "Base container good.mrk was mutated while mounted!"
+    }
+    $deltaAttr = [IO.File]::GetAttributes($deltaMrk)
+    if (($deltaAttr -band [IO.FileAttributes]::Hidden) -ne 0 -or ($deltaAttr -band [IO.FileAttributes]::Encrypted) -ne 0) {
+        throw "good.delta.mrk must remain visible and non-EFS ($deltaAttr)"
+    }
+
+    # Verify good.delta.mrk via myrkr.exe verify AND independent Python v9 decryptor!
+    $verDelta = Run-Cli @('verify', $deltaMrk, '-p', $mrkPass)
+    if ($verDelta.rc -ne 0) {
+        throw "myrkr verify failed on good.delta.mrk ($($verDelta.rc)): $($verDelta.out)"
+    }
+
+    $salvageDelta = Join-Path $work 'salvage.delta.mrk'
+    Copy-Item -LiteralPath $deltaMrk -Destination $salvageDelta -Force
+
+    $pyCheckDelta = @"
+import sys, struct
+sys.path.insert(0, r'$($PSScriptRoot)')
+import indepdecrypttest as idt
+
+base_hdr = open(r'$goodMrk', 'rb').read(80)
+base_setid_hex = base_hdr[52:64].hex()
+
+res = idt.decrypt(r'$salvageDelta', r'$mrkPass')
+assert res['version'] == 9, f"Expected v9 delta container, got {res['version']}"
+assert res['comp'] == 0, f"Expected uncompressed delta container, got {res['comp']}"
+by_name = {n: (f, b) for n, f, b, _ in res['files']}
+assert '.myrkr-delta' in by_name, 'Missing .myrkr-delta manifest entry'
+mf = by_name['.myrkr-delta'][1].decode('utf-8').splitlines()
+assert mf[0] == 'myrkr-delta-v1', f'Bad manifest header: {mf}'
+assert mf[1] == f'base-id: {base_setid_hex}', f'Manifest base-id mismatch: {mf[1]} vs {base_setid_hex}'
+assert 'del: mrk_src/nested/small.bin' in mf, f'Missing rename tombstone in {mf}'
+assert by_name['fresh_root.txt'][1] == b'Created on R/W Cloud Files drive!'
+assert by_name['new_folder'][0] & 1, 'Expected explicit directory entry for new_folder'
+assert by_name['new_folder/inside.txt'][1] == b'Nested created file!'
+assert by_name['mrk_src/nested/renamed_small.bin'][1] == bytes(range(256)), 'Renamed unhydrated placeholder payload mismatch'
+orig_payload = bytearray(b'Authenticated native Myrkr Cloud Files stream line! ' * 2500)
+orig_payload[16:16+20] = b'<<PATCHED-IN-PLACE>>'
+assert by_name['mrk_src/payload.txt'][1] == bytes(orig_payload), 'Partially overwritten placeholder payload mismatch'
+assert 'mrk_src/untouched.txt' not in by_name, 'Unmodified base file should not be duplicated in .delta.mrk'
+print('DELTA_INDEP_OK')
+"@
+    $pyCheckDeltaPath = Join-Path $work 'check_delta.py'
+    [IO.File]::WriteAllText($pyCheckDeltaPath, $pyCheckDelta, [Text.UTF8Encoding]::new($false))
+    $indepDeltaOut = (& python $pyCheckDeltaPath 2>&1 | Out-String).Trim()
+    if ($LASTEXITCODE -ne 0 -or $indepDeltaOut -notmatch 'DELTA_INDEP_OK') {
+        throw "Independent v9 verification of good.delta.mrk failed: $indepDeltaOut"
+    }
+    'PASS: Live R/W edits lazily write a 100% compliant v9 .delta.mrk verified independently while base .mrk stays untouched'
+
+    # Simulate hard crash (Kill process without controlled dismount)
+    $pMrk1.Kill()
+    $pMrk1.WaitForExit()
+    if ((Get-FileHash -LiteralPath $goodMrk -Algorithm SHA256).Hash -ne $origMrkHash) {
+        throw "Hard crash corrupted/altered base good.mrk!"
+    }
+    if (-not (Test-Path -LiteralPath $deltaMrk)) {
+        throw "good.delta.mrk did not survive simulated crash!"
+    }
+
+    # Test direct salvage: opening salvage.delta.mrk mounts Read-Only and never creates .delta.delta.mrk
+    $pSalv = Start-Myrkr @($salvageDelta)
+    Unlock-Prompt $pSalv $mrkPass
+    $mainSalv = Wait-Win $pSalv 'myrkr_window'
+    $mntSalv = Wait-DriveStatus $mainSalv
+    if ($mntSalv.Status -notmatch '\(Read-Only\)') {
+        throw "Opening .delta.mrk directly must mount Read-Only, got '$($mntSalv.Status)'"
+    }
+    if ([IO.File]::ReadAllText("$($mntSalv.Root)fresh_root.txt") -ne 'Created on R/W Cloud Files drive!') {
+        throw "Salvage mount failed to serve fresh_root.txt from salvage.delta.mrk"
+    }
+    if (([IO.File]::GetAttributes("$($mntSalv.Root)fresh_root.txt") -band [IO.FileAttributes]::ReadOnly) -eq 0) {
+        throw "Salvage mount placeholder must carry ReadOnly attribute"
+    }
+    if (Test-Path -LiteralPath "$salvageDelta.delta.mrk") {
+        throw "Opening .delta.mrk must never create nested .delta.mrk"
+    }
+    [void][CfMountGui]::PostMessageW($mainSalv, 0x0111, [IntPtr]107, [IntPtr]::Zero)
+    if (-not $pSalv.WaitForExit(5000)) { throw "Salvage window did not exit cleanly" }
+    'PASS: Opening .delta.mrk directly mounts Read-Only for post-crash salvage'
+
+    # Re-open good.mrk after crash -> first decline merge (Cancel = 107) -> mounts Read-Only, preserves good.delta.mrk
+    $pRecCancel = Start-Myrkr @($goodMrk)
+    Unlock-Prompt $pRecCancel $mrkPass
+    $recBox1 = Wait-Win $pRecCancel 'myrkr_mbox'
+    if ([CfMountGui]::Title($recBox1) -ne 'Myrkr - unsaved volume changes') {
+        throw "Expected crash-recovery mbox, got '$([CfMountGui]::Title($recBox1))'"
+    }
+    [void][CfMountGui]::PostMessageW($recBox1, 0x0111, [IntPtr]107, [IntPtr]::Zero) # Cancel
+    $mainRecCancel = Wait-Win $pRecCancel 'myrkr_window'
+    $mntRecCancel = Wait-DriveStatus $mainRecCancel
+    if ($mntRecCancel.Status -notmatch '\(Read-Only\)') {
+        throw "Declining crash recovery must mount base container Read-Only, got '$($mntRecCancel.Status)'"
+    }
+    if (-not (Test-Path -LiteralPath $deltaMrk)) {
+        throw "Declining crash recovery must keep good.delta.mrk untouched"
+    }
+    [void][CfMountGui]::PostMessageW($mainRecCancel, 0x0111, [IntPtr]107, [IntPtr]::Zero)
+    if (-not $pRecCancel.WaitForExit(5000)) { throw "Cancel-recovery window did not exit cleanly" }
+    if ((Get-FileHash -LiteralPath $goodMrk -Algorithm SHA256).Hash -ne $origMrkHash) {
+        throw "Declining crash recovery altered good.mrk!"
+    }
+
+    # Re-open good.mrk again -> accept merge (OK = 104) -> merges atomically, deletes .delta.mrk, mounts R/W
+    $pRecOk = Start-Myrkr @($goodMrk)
+    Unlock-Prompt $pRecOk $mrkPass
+    $recBox2 = Wait-Win $pRecOk 'myrkr_mbox'
+    [void][CfMountGui]::PostMessageW($recBox2, 0x0111, [IntPtr]104, [IntPtr]::Zero) # OK
+    $mainRecOk = Wait-Win $pRecOk 'myrkr_window'
+    $mntRecOk = Wait-DriveStatus $mainRecOk
+    if ($mntRecOk.Status -notmatch '\(Read/Write\)') {
+        throw "Accepting crash recovery must mount merged container Read/Write, got '$($mntRecOk.Status)'"
+    }
+    if (Test-Path -LiteralPath $deltaMrk) {
+        throw "good.delta.mrk was not removed after successful crash-recovery merge"
+    }
+    $recRoot = $mntRecOk.Root
+    if ([IO.File]::ReadAllText("${recRoot}fresh_root.txt") -ne 'Created on R/W Cloud Files drive!') {
+        throw "Merged volume missing fresh_root.txt"
+    }
+    if ([IO.File]::ReadAllText("${recRoot}new_folder\inside.txt") -ne 'Nested created file!') {
+        throw "Merged volume missing new_folder\inside.txt"
+    }
+    if ([IO.File]::ReadAllText("${recRoot}mrk_src\untouched.txt") -ne 'Keep me intact across delta merges!') {
+        throw "Merged volume corrupted untouched base file"
+    }
+    if (Test-Path -LiteralPath "${recRoot}mrk_src\nested\small.bin") {
+        throw "Deleted/renamed base entry small.bin reappeared after merge!"
+    }
+    if (([IO.File]::ReadAllBytes("${recRoot}mrk_src\nested\renamed_small.bin")).Length -ne 256) {
+        throw "Renamed entry renamed_small.bin missing or wrong size after merge"
+    }
+
+    # -------------------------------------------------------------------------
+    # 5. Immediate controlled dirty dismount (write + WM_CLOSE before 1s debounce)
+    # -------------------------------------------------------------------------
+    $fastMutScript = @"
+`$ErrorActionPreference = 'Stop'
+[IO.File]::WriteAllText('${recRoot}closing_fast.txt', 'Written immediately before WM_CLOSE!')
+Remove-Item -LiteralPath '${recRoot}fresh_root.txt' -Force
+Write-Output 'FAST_OK'
+"@
+    $encFast = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($fastMutScript))
+    $fastOut = (& $psExe -NoProfile -EncodedCommand $encFast 2>&1 | Out-String).Trim()
+    if ($LASTEXITCODE -ne 0 -or $fastOut -notmatch 'FAST_OK') {
+        throw "Immediate pre-close write failed: $fastOut"
+    }
+    # Immediately send WM_CLOSE (0x0010) before the 1000ms background debounce fires!
+    [void][CfMountGui]::PostMessageW($mainRecOk, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero)
+    if (-not $pRecOk.WaitForExit(15000)) {
+        throw "Controlled dirty dismount did not complete within 15s"
+    }
+    if (Test-Path -LiteralPath $recRoot) {
+        throw "Drive $recRoot remained mapped after controlled dirty dismount"
+    }
+    if (Test-Path -LiteralPath $deltaMrk) {
+        throw "good.delta.mrk remained after controlled dirty dismount merge"
+    }
+
+    $verMerged = Run-Cli @('verify', $goodMrk, '-p', $mrkPass)
+    if ($verMerged.rc -ne 0) {
+        throw "myrkr verify failed on merged good.mrk ($($verMerged.rc)): $($verMerged.out)"
+    }
+    $pyCheckMerged = @"
+import sys
+sys.path.insert(0, r'$($PSScriptRoot)')
+import indepdecrypttest as idt
+
+res = idt.decrypt(r'$goodMrk', r'$mrkPass')
+assert res['version'] == 9
+assert res['comp'] == 1, 'Merged container should preserve base compression flag'
+by_name = {n: (f, b) for n, f, b, _ in res['files']}
+assert '.myrkr-delta' not in by_name, '.myrkr-delta manifest must never leak into merged container'
+assert 'fresh_root.txt' not in by_name, 'Deleted file fresh_root.txt survived immediate-close merge'
+assert 'mrk_src/nested/small.bin' not in by_name, 'Renamed-away small.bin survived merge'
+assert by_name['closing_fast.txt'][1] == b'Written immediately before WM_CLOSE!'
+assert by_name['new_folder/inside.txt'][1] == b'Nested created file!'
+assert by_name['mrk_src/untouched.txt'][1] == b'Keep me intact across delta merges!'
+assert by_name['mrk_src/nested/renamed_small.bin'][1] == bytes(range(256))
+orig_payload = bytearray(b'Authenticated native Myrkr Cloud Files stream line! ' * 2500)
+orig_payload[16:16+20] = b'<<PATCHED-IN-PLACE>>'
+assert by_name['mrk_src/payload.txt'][1] == bytes(orig_payload)
+print('MERGED_INDEP_OK')
+"@
+    $pyCheckMergedPath = Join-Path $work 'check_merged.py'
+    [IO.File]::WriteAllText($pyCheckMergedPath, $pyCheckMerged, [Text.UTF8Encoding]::new($false))
+    $indepMergedOut = (& python $pyCheckMergedPath 2>&1 | Out-String).Trim()
+    if ($LASTEXITCODE -ne 0 -or $indepMergedOut -notmatch 'MERGED_INDEP_OK') {
+        throw "Independent v9 verification of merged good.mrk failed: $indepMergedOut"
+    }
+    'PASS: Crash recovery and immediate pre-debounce WM_CLOSE both merge atomically into valid v9 .mrk'
+
+    # -------------------------------------------------------------------------
+    # 6. Tampered .mrk entry fail-closed check
+    # -------------------------------------------------------------------------
     $tamperDir = Join-Path $work 'tamper_dir'
     [void](New-Item -ItemType Directory -Path $tamperDir -Force)
     $tamperSrc = Join-Path $tamperDir 'tamper_payload.bin'
@@ -394,12 +644,8 @@ Write-Output `$h
     $pBad = Start-Myrkr @($tamperMrk)
     Unlock-Prompt $pBad $mrkPass
     $mainBad = Wait-Win $pBad 'myrkr_window'
-    [void][CfMountGui]::SendMessageW($mainBad, 0x0111, [IntPtr]176, [IntPtr]::Zero)
-    $stBad = [CfMountGui]::Title([CfMountGui]::Child($mainBad, 196))
-    if ($stBad -notmatch '([D-Z]):\\') {
-        throw "Failed to mount tampered.mrk index (status='$stBad')"
-    }
-    $badDrv = "$($Matches[1]):\"
+    $mntBad = Wait-DriveStatus $mainBad
+    $badDrv = $mntBad.Root
     $tamperedReadFailed = $false
     try {
         $leaked = [IO.File]::ReadAllBytes((Join-Path $badDrv 'tamper_dir\tamper_payload.bin'))

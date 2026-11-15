@@ -52,8 +52,8 @@ Or run `myrkr.exe` directly as a standalone app with nothing else to install.
 ### Encrypt, browse, and unpack
 
 1. **Encrypt**: Open Myrkr and drop files or folders onto the window (or click **Add files** / **Add folder**), enter a strong password, and press **Encrypt**.
-2. **Open, mount & unpack**: Double-click any `.mrk` file (or `.tc` / `.hc` TrueCrypt/VeraCrypt volume, or click the **Open TrueCrypt/VeraCrypt container** drive button on the command bar) to view its contents. Browse them as a read-only Windows drive letter in File Explorer (automatic for `.tc`/`.hc`, or one click on the **Mount as read-only drive** command-bar button for `.mrk`), press **Extract all** / **Extract selected**, or **drag individual files straight out**.
-3. **Edit safely**: Adding or removing files inside an open `.mrk` container writes a freshly encrypted replacement container so backups and edited copies stay cryptographically independent.
+2. **Open, mount & unpack**: Double-click any `.mrk` file (or `.tc` / `.hc` TrueCrypt/VeraCrypt volume, or click the **Open TrueCrypt/VeraCrypt container** drive button on the command bar) to view its contents and mount it automatically as a Windows drive letter in File Explorer—**Read/Write** for `.mrk` folder archives and **Read-Only** for `.tc`/`.hc` volumes (or press **Extract all** / **Extract selected**, or **drag individual files straight out**).
+3. **Edit safely**: Changes made on a mounted `.mrk` drive stage lazily into an encrypted `<name>.delta.mrk` sidecar while leaving your original `.mrk` untouched, then merge atomically into a freshly encrypted container when you close or unmount (and offer one-click recovery if a session ever ends unexpectedly). Adding or removing files inside the Myrkr window likewise writes a freshly keyed replacement container so backups and edited copies stay cryptographically independent.
 4. **Use directly from Windows Explorer**: Select any number of files or folders and **right-click** (places output beside the original) or **right-drag** onto a destination folder or drive:
    - **Myrkr encrypt** for files and folders
    - **Myrkr decrypt** when `.mrk` containers are selected
