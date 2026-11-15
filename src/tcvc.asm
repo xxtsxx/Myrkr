@@ -1241,12 +1241,15 @@ ttm_ver_range:
     jnz     ttm_unsup
 
 ttm_sec_chk:
-    ; SectorSize: v5+ at +64, else 512; must be power-of-two in 512..4096
+    ; SectorSize: v5+ at +64 (0 defaults to 512), else 512; power-of-two in 512..4096
     mov     eax, 512
     cmp     esi, 5
     jb      ttm_sec_val
     mov     eax, dword ptr [r15 + 64]
     bswap   eax
+    test    eax, eax
+    jnz     ttm_sec_val
+    mov     eax, 512
 ttm_sec_val:
     cmp     eax, 512
     jb      ttm_corrupt
@@ -1265,16 +1268,35 @@ ttm_sec_val:
     bswap   rax
     mov     rdx, qword ptr [r15 + 44]       ; EncryptedAreaStart
     bswap   rdx
-    test    rax, rax
-    jnz     ttm_chk_align
     test    rdx, rdx
-    jnz     ttm_corrupt
-    ; Legacy V1 layout fallback: start=512, size=hostSize-512
+    jnz     ttm_chk_align
+
+    ; EncryptedAreaStart == 0: check Legacy V1 layout (VolumeDataSize == 0, hdrVer < 4,
+    ; or RequiredProgramVersion < 0x010B [VERA] / < 0x0600 [TRUE])
+    test    rax, rax
+    jz      ttm_v1_layout
+    cmp     esi, 4
+    jb      ttm_v1_layout
+    movzx   edi, word ptr [r15 + 6]         ; RequiredProgramVersion (BE16)
+    rol     di,  8
+    cmp     dword ptr [rbp+48], 0
+    je      ttm_v1_tc
+    cmp     edi, 010Bh
+    jb      ttm_v1_layout
+    jmp     ttm_corrupt
+ttm_v1_tc:
+    cmp     edi, 0600h
+    jae     ttm_corrupt
+
+ttm_v1_layout:
     cmp     rcx, 1024
     jb      ttm_corrupt
     mov     edx, 512
+    test    rax, rax
+    jnz     ttm_chk_align
     mov     rax, rcx
     sub     rax, 512
+    and     rax, -512
 ttm_chk_align:
     cmp     rdx, 512
     jb      ttm_corrupt
@@ -1433,6 +1455,9 @@ tcvc_commit_header proc frame
     jb      tch_sec_ok
     mov     eax, dword ptr [rsi + 64]
     bswap   eax
+    test    eax, eax
+    jnz     tch_sec_ok
+    mov     eax, 512
 tch_sec_ok:
     mov     dword ptr [g_tcvc_sec_size], eax
 
@@ -1443,13 +1468,17 @@ tch_sec_ok:
     mov     r8,  qword ptr [rsi + 52]       ; EncryptedAreaLength
     bswap   r8
 
-    test    rax, rax
-    jnz     tch_v2
     test    rdx, rdx
-    jnz     tch_corrupt
+    jnz     tch_v2
     mov     edx, 512
+    test    rax, rax
+    jnz     tch_v1_len
     mov     rax, qword ptr [g_tcvc_host_size]
     sub     rax, 512
+    and     rax, -512
+tch_v1_len:
+    test    r8, r8
+    jnz     tch_v2
     mov     r8,  rax
 tch_v2:
     cmp     r8, rax
@@ -1477,9 +1506,6 @@ tch_v2:
 
 tch_unsup:
     mov     eax, EXIT_UNSUPPORTED
-    jmp     tch_out
-tch_corrupt:
-    mov     eax, EXIT_CORRUPT
 tch_out:
     mov     rbx, qword ptr [rbp-16]
     mov     rsi, qword ptr [rbp-24]
@@ -1962,8 +1988,6 @@ tcvc_open proc frame
     mov     rax, qword ptr [rbp-56]
     cmp     rax, 1024
     jb      tco_fail_corrupt
-    test    eax, 511
-    jnz     tco_fail_corrupt
     mov     qword ptr [g_tcvc_host_size], rax
 
     ; Apply keyfiles (if any) + password into g_tcvc_sec + TCVC_OFF_PW
@@ -1992,19 +2016,24 @@ tcvc_open proc frame
     test    eax, eax
     jz      tco_unlocked
 
-    ; Automatic backup header fallback at hostSize - 131072 if primary failed
+    ; Automatic backup header fallback at hostSize - 131072 on EXIT_AUTH or EXIT_CORRUPT
+    mov     r13d, eax                       ; save primary error
     cmp     eax, EXIT_AUTH
+    je      tco_try_backup
+    cmp     eax, EXIT_CORRUPT
     jne     tco_fail_code
+
+tco_try_backup:
     mov     rcx, qword ptr [g_tcvc_host_size]
     cmp     rcx, 262144
-    jb      tco_fail_auth
+    jb      tco_fail_pri
 
     sub     rcx, 131072
     lea     rdx, [rsp+48]
     mov     r8d, 512
     call    tcvc_raw_read
     test    eax, eax
-    jnz     tco_fail_auth
+    jnz     tco_fail_pri
 
     lea     rcx, [rsp+48]
     lea     rdx, [g_tcvc_sec + TCVC_OFF_PW]
@@ -2012,7 +2041,14 @@ tcvc_open proc frame
     xor     r9d, r9d
     call    tcvc_unlock_header_buf
     test    eax, eax
-    jnz     tco_fail_code
+    jz      tco_unlocked
+    cmp     eax, EXIT_AUTH
+    je      tco_fail_pri
+    jmp     tco_fail_code
+
+tco_fail_pri:
+    mov     ebx, r13d
+    jmp     tco_cleanup
 
 tco_unlocked:
     ; Wipe mixed password & stack header copy now that volume XTS_CTX is active
@@ -2037,9 +2073,6 @@ tco_unlocked:
 
 tco_fail_oom:
     mov     ebx, EXIT_OOM
-    jmp     tco_cleanup
-tco_fail_auth:
-    mov     ebx, EXIT_AUTH
     jmp     tco_cleanup
 tco_fail_corrupt:
     mov     ebx, EXIT_CORRUPT
@@ -2077,7 +2110,7 @@ tcvc_open endp
 ; =============================================================================
 public tcvc_open_mem
 tcvc_open_mem proc frame
-    FRAME_PROLOG 80
+    FRAME_PROLOG 96
     mov     qword ptr [rbp-16], r12
     mov     qword ptr [rbp-24], r13
     mov     qword ptr [rbp-32], r14
@@ -2096,8 +2129,6 @@ tcvc_open_mem proc frame
     jz      tcom_corrupt
     cmp     r13, 1024
     jb      tcom_corrupt
-    test    r13d, 511
-    jnz     tcom_corrupt
 
     mov     qword ptr [g_tcvc_hfile], -1
     mov     qword ptr [g_tcvc_mem_ptr], r12
@@ -2112,10 +2143,15 @@ tcvc_open_mem proc frame
     test    eax, eax
     jz      tcom_unlocked
 
+    mov     dword ptr [rbp-56], eax         ; save primary error
     cmp     eax, EXIT_AUTH
+    je      tcom_try_backup
+    cmp     eax, EXIT_CORRUPT
     jne     tcom_fail_code
+
+tcom_try_backup:
     cmp     r13, 262144
-    jb      tcom_fail_code
+    jb      tcom_fail_pri
 
     ; Backup header at memPtr + memSize - 131072
     lea     rcx, [r12 + r13 - 131072]
@@ -2124,7 +2160,14 @@ tcvc_open_mem proc frame
     mov     r9d, ebx
     call    tcvc_unlock_header_buf
     test    eax, eax
-    jnz     tcom_fail_code
+    jz      tcom_unlocked
+    cmp     eax, EXIT_AUTH
+    je      tcom_fail_pri
+    jmp     tcom_fail_code
+
+tcom_fail_pri:
+    mov     ebx, dword ptr [rbp-56]
+    jmp     tcom_clean
 
 tcom_unlocked:
     mov     ecx, TCVC_CACHE_BYTES

@@ -24,14 +24,13 @@ externdef g_tcvc_data_size:qword
 
 FAT_CP_OEM              equ 1
 FAT_CP_UTF8             equ 65001
-FAT_WC_ERR_INVALID      equ 80h
 
 FAT_ATTR_VOLUME_ID      equ 08h
 FAT_ATTR_DIRECTORY      equ 10h
 FAT_ATTR_LFN            equ 0Fh
 
 FAT_MAX_DEPTH           equ 64
-FAT_MAX_DIRS            equ 16384
+FAT_MAX_DIRS            equ 262144
 FAT_MAX_DIR_ENTRIES     equ 262144      ; cap 8 MiB per directory
 
 .data?
@@ -52,7 +51,7 @@ g_fat_vis_cnt           dd ?
 g_fat_lfn_max           dd ?
 
 align 4
-g_fat_vis_clus          dd FAT_MAX_DIRS dup (?)
+g_fat_anc_clus          dd (FAT_MAX_DEPTH + 2) dup (?)
 
 align 2
 g_fat_lfn_w             dw 272 dup (?)
@@ -160,12 +159,18 @@ fat_probe proc frame
     cmp     r9d, 4
     ja      fp_maybe_corrupt
 
-    ; Media (+21, u8): 0xF0 or >= 0xF8
+    ; Media (+21, u8): 0xF0 or >= 0xF8 (or non-zero when explicit "FAT1"/"FAT3" sig present)
     movzx   eax, byte ptr [rsi+21]
     cmp     al, 0F0h
     je      fp_media_ok
     cmp     al, 0F8h
-    jb      fp_maybe_corrupt
+    jae     fp_media_ok
+    test    al, al
+    jz      fp_maybe_corrupt
+    cmp     dword ptr [rsi+54], 031544146h  ; "FAT1"
+    je      fp_media_ok
+    cmp     dword ptr [rsi+82], 033544146h  ; "FAT3"
+    jne     fp_maybe_corrupt
 fp_media_ok:
 
     ; RootEntCnt (+17, u16) and FATSz16 (+22, u16)
@@ -272,41 +277,89 @@ fp_fatsz_done:
     imul    rcx, rbx                        ; FirstDataSector * bps
     mov     qword ptr [g_fat_data_off], rcx
 
-    ; Classify FAT12 / FAT16 / FAT32
+    ; Classify FAT12 / FAT16 / FAT32 and clamp cluster count to FAT table capacity
+    ; (matching Windows fastfat.sys & VeraCrypt Common/Fat.c boundary behavior)
     cmp     word ptr [rsi+22], 0
     je      fp_is_fat32
 
+    ; Honour explicit "FAT16" / "FAT12" BS_FilSysType at +54 when present (e.g. VeraCrypt
+    ; Common/Fat.c selects 16-bit FAT before subtracting FAT sectors around 4085 clusters)
+    cmp     dword ptr [rsi+54], 031544146h  ; "FAT1"
+    jne     fp_cls_by_cnt
+    cmp     byte ptr [rsi+58], '6'
+    je      fp_is_fat16
+    cmp     byte ptr [rsi+58], '2'
+    je      fp_is_fat12
+
+fp_cls_by_cnt:
     mov     eax, dword ptr [g_fat_nclus]
     cmp     eax, 4085
     jb      fp_is_fat12
+
+fp_is_fat16:
     mov     dword ptr [g_fat_type], TCVC_FS_FAT16
     mov     dword ptr [g_fat_root_clus], 0
-    ; Verify FAT16 table fits (maxclus + 1) * 2 <= FATSz * bps
-    mov     eax, dword ptr [g_fat_maxclus]
-    inc     eax
-    shl     rax, 1
-    add     rax, qword ptr [g_fat_fat_off]
-    cmp     rax, qword ptr [g_fat_fat_end]
-    ja      fp_corrupt
+    mov     rax, qword ptr [g_fat_fat_end]
+    sub     rax, qword ptr [g_fat_fat_off]
+    shr     rax, 1                          ; maxFatEntries = fatBytes / 2
+    cmp     rax, 3
+    jb      fp_corrupt
+    dec     rax                             ; maxPossibleClus
+    mov     ecx, dword ptr [g_fat_maxclus]
+    cmp     rax, rcx
+    jae     fp_f16_ok
+    mov     dword ptr [g_fat_maxclus], eax
+    dec     eax
+    mov     dword ptr [g_fat_nclus], eax
+    mov     ecx, dword ptr [g_fat_cbytes]
+    imul    rax, rcx
+    mov     qword ptr [g_fat_max_fsize], rax
+fp_f16_ok:
     mov     eax, TCVC_FS_FAT16
     jmp     fp_out
 
 fp_is_fat12:
     mov     dword ptr [g_fat_type], TCVC_FS_FAT12
     mov     dword ptr [g_fat_root_clus], 0
-    ; Verify FAT12 table fits ((maxclus * 3) / 2 + 2) <= FATSz * bps
-    mov     eax, dword ptr [g_fat_maxclus]
-    mov     ecx, eax
-    shr     ecx, 1
-    add     eax, ecx
-    add     eax, 2
-    add     rax, qword ptr [g_fat_fat_off]
-    cmp     rax, qword ptr [g_fat_fat_end]
-    ja      fp_corrupt
+    mov     rax, qword ptr [g_fat_fat_end]
+    sub     rax, qword ptr [g_fat_fat_off]
+    shl     rax, 1
+    xor     edx, edx
+    mov     ecx, 3
+    div     rcx                             ; maxFatEntries = (fatBytes * 2) / 3
+    cmp     rax, 3
+    jb      fp_corrupt
+    dec     rax                             ; maxPossibleClus
+    mov     ecx, dword ptr [g_fat_maxclus]
+    cmp     rax, rcx
+    jae     fp_f12_ok
+    mov     dword ptr [g_fat_maxclus], eax
+    dec     eax
+    mov     dword ptr [g_fat_nclus], eax
+    mov     ecx, dword ptr [g_fat_cbytes]
+    imul    rax, rcx
+    mov     qword ptr [g_fat_max_fsize], rax
+fp_f12_ok:
     mov     eax, TCVC_FS_FAT12
     jmp     fp_out
 
 fp_is_fat32:
+    mov     rax, qword ptr [g_fat_fat_end]
+    sub     rax, qword ptr [g_fat_fat_off]
+    shr     rax, 2                          ; maxFatEntries = fatBytes / 4
+    cmp     rax, 3
+    jb      fp_corrupt
+    dec     rax                             ; maxPossibleClus
+    mov     ecx, dword ptr [g_fat_maxclus]
+    cmp     rax, rcx
+    jae     fp_f32_cap_ok
+    mov     dword ptr [g_fat_maxclus], eax
+    dec     eax
+    mov     dword ptr [g_fat_nclus], eax
+    mov     ecx, dword ptr [g_fat_cbytes]
+    imul    rax, rcx
+    mov     qword ptr [g_fat_max_fsize], rax
+fp_f32_cap_ok:
     mov     eax, dword ptr [rsi+44]         ; BPB_RootClus
     and     eax, 0FFFFFFFh
     cmp     eax, 2
@@ -315,13 +368,6 @@ fp_is_fat32:
     ja      fp_corrupt
     mov     dword ptr [g_fat_root_clus], eax
     mov     dword ptr [g_fat_type], TCVC_FS_FAT32
-    ; Verify FAT32 table fits (maxclus + 1) * 4 <= FATSz * bps
-    mov     eax, dword ptr [g_fat_maxclus]
-    inc     eax
-    shl     rax, 2
-    add     rax, qword ptr [g_fat_fat_off]
-    cmp     rax, qword ptr [g_fat_fat_end]
-    ja      fp_corrupt
     mov     eax, TCVC_FS_FAT32
     jmp     fp_out
 
@@ -597,29 +643,35 @@ fds_out:
 fat_decode_sfn endp
 
 ; =============================================================================
-; fat_mark_dir_visited(ecx = cluster) -> eax = 0 ok, 1 already visited / full
+; fat_mark_dir_visited(ecx = cluster, edx = depth) -> eax = EXIT_*
+; Checks active ancestor stack [0..depth-1] for directory cycles, records
+; cluster at g_fat_anc_clus[depth], and bounds total directories visited.
 ; =============================================================================
 fat_mark_dir_visited proc
-    mov     edx, dword ptr [g_fat_vis_cnt]
-    lea     r8,  [g_fat_vis_clus]
+    lea     r8,  [g_fat_anc_clus]
     xor     eax, eax
 fmdv_lp:
     cmp     eax, edx
-    jae     fmdv_add
+    jae     fmdv_anc_ok
     cmp     dword ptr [r8 + rax*4], ecx
-    je      fmdv_dup
+    je      fmdv_cycle
     inc     eax
     jmp     fmdv_lp
-fmdv_add:
-    cmp     edx, FAT_MAX_DIRS
-    jae     fmdv_dup
-    mov     dword ptr [r8 + rdx*4], ecx
-    inc     edx
-    mov     dword ptr [g_fat_vis_cnt], edx
+fmdv_anc_ok:
+    mov     eax, dword ptr [g_fat_vis_cnt]
+    cmp     eax, FAT_MAX_DIRS
+    jae     fmdv_oom
+    inc     eax
+    mov     dword ptr [g_fat_vis_cnt], eax
+    mov     eax, edx
+    mov     dword ptr [r8 + rax*4], ecx
     xor     eax, eax
     ret
-fmdv_dup:
-    mov     eax, 1
+fmdv_cycle:
+    mov     eax, EXIT_CORRUPT
+    ret
+fmdv_oom:
+    mov     eax, EXIT_OOM
     ret
 fat_mark_dir_visited endp
 
@@ -660,17 +712,21 @@ fat_walk_dir proc frame
     xor     r14d, r14d                      ; totalEntriesSeen
 
     test    edx, edx
-    jnz     fwd_loop
+    jz      fwd_clus_dir
+    mov     dword ptr [g_fat_anc_clus], 0
+    jmp     fwd_loop
 
+fwd_clus_dir:
     ; Cluster-backed dir: validate and mark startCluster visited
     cmp     r12d, 2
     jb      fwd_corrupt
     cmp     r12d, dword ptr [g_fat_maxclus]
     ja      fwd_corrupt
     mov     ecx, r12d
+    mov     edx, dword ptr [rbp-76]
     call    fat_mark_dir_visited
     test    eax, eax
-    jnz     fwd_corrupt
+    jnz     fwd_ret
 
 fwd_loop:
     inc     r14d
@@ -851,9 +907,9 @@ fwd_lfn_len:
 fwd_lfn_conv:
     test    r9d, r9d
     jz      fwd_use_sfn
-    WINCALL WideCharToMultiByte, FAT_CP_UTF8, FAT_WC_ERR_INVALID, addr g_fat_lfn_w, r9d, addr g_fat_comp8, 1020, 0, 0
+    WINCALL WideCharToMultiByte, FAT_CP_UTF8, 0, addr g_fat_lfn_w, r9d, addr g_fat_comp8, 1020, 0, 0
     test    eax, eax
-    jz      fwd_corrupt
+    jz      fwd_use_sfn
     mov     ebx, eax                        ; compLen
     jmp     fwd_have_name
 
@@ -861,7 +917,7 @@ fwd_use_sfn:
     mov     rcx, rsi
     call    fat_decode_sfn
     test    eax, eax
-    jz      fwd_corrupt
+    jz      fwd_loop
     mov     ebx, eax                        ; compLen
 
 fwd_have_name:
@@ -946,6 +1002,10 @@ fwd_is_dir:
     call    tcvc_idx_add
     test    eax, eax
     jnz     fwd_ret
+
+    ; Empty subdirectory with FstClus == 0 has no cluster chain to walk
+    cmp     dword ptr [rbp-96], 0
+    je      fwd_loop
 
     ; Append '/' and recurse
     lea     eax, [r15d + 1]

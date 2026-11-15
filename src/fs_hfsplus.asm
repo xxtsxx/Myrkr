@@ -28,7 +28,6 @@ extern WideCharToMultiByte:proc
 externdef g_tcvc_data_size:qword
 
 HFS_CP_UTF8             equ 65001
-HFS_WC_ERR_INVALID      equ 80h
 HFS_MAP_PRECOMPOSED     equ 20h
 
 HFS_SIG_BD              equ 4244h       ; "BD" classic HFS wrapper
@@ -52,8 +51,8 @@ HFS_S_IFREG             equ 08000h
 HFS_FDTYPE_SLNK         equ 736C6E6Bh   ; 'slnk'
 
 HFS_MAX_DEPTH           equ 64
-HFS_MAX_BTREE_DEPTH     equ 8
-HFS_MAX_DIRS            equ 16384
+HFS_MAX_BTREE_DEPTH     equ 32
+HFS_MAX_DIRS            equ 262144
 
 .data?
 align 8
@@ -76,7 +75,7 @@ g_hfs_ext_depth         dd ?
 g_hfs_vis_cnt           dd ?
 
 align 4
-g_hfs_vis_cnid          dd HFS_MAX_DIRS dup (?)
+g_hfs_anc_cnid          dd (HFS_MAX_DEPTH + 2) dup (?)
 g_hfs_cat_exts          dd 16 dup (?)   ; 8 x { startBlock, blockCount } host LE
 g_hfs_ext_exts          dd 16 dup (?)   ; 8 x { startBlock, blockCount } host LE
 
@@ -787,12 +786,12 @@ hp_chk_v5:
     jne     hp_corrupt
 
 hp_vh_geom:
-    ; blockSize (+40, BE32): power of two in 512..65536
+    ; blockSize (+40, BE32): power of two in 512..1048576
     mov     ebx, dword ptr [rsi + 40]
     bswap   ebx
     cmp     ebx, 512
     jb      hp_corrupt
-    cmp     ebx, 65536
+    cmp     ebx, 100000h
     ja      hp_corrupt
     lea     eax, [ebx - 1]
     test    ebx, eax
@@ -1068,7 +1067,7 @@ hdn_use_raw:
     lea     rsi, [g_hfs_name_w1]
 
 hdn_to_utf8:
-    WINCALL WideCharToMultiByte, HFS_CP_UTF8, HFS_WC_ERR_INVALID, rsi, ebx, addr g_hfs_comp8, 1020, 0, 0
+    WINCALL WideCharToMultiByte, HFS_CP_UTF8, 0, rsi, ebx, addr g_hfs_comp8, 1020, 0, 0
     test    eax, eax
     jz      hdn_bad
 
@@ -1100,29 +1099,35 @@ hdn_out:
 hfs_decode_name endp
 
 ; =============================================================================
-; hfs_mark_dir_visited(ecx = cnid) -> eax = 0 ok, 1 dup / full
+; hfs_mark_dir_visited(ecx = cnid, edx = depth) -> eax = EXIT_*
+; Checks active ancestor stack [0..depth-1] for folder cycles, records cnid at
+; g_hfs_anc_cnid[depth], and bounds total folders visited.
 ; =============================================================================
 hfs_mark_dir_visited proc
-    mov     edx, dword ptr [g_hfs_vis_cnt]
-    lea     r8,  [g_hfs_vis_cnid]
+    lea     r8,  [g_hfs_anc_cnid]
     xor     eax, eax
 hmdv_lp:
     cmp     eax, edx
-    jae     hmdv_add
+    jae     hmdv_anc_ok
     cmp     dword ptr [r8 + rax*4], ecx
-    je      hmdv_dup
+    je      hmdv_cycle
     inc     eax
     jmp     hmdv_lp
-hmdv_add:
-    cmp     edx, HFS_MAX_DIRS
-    jae     hmdv_dup
-    mov     dword ptr [r8 + rdx*4], ecx
-    inc     edx
-    mov     dword ptr [g_hfs_vis_cnt], edx
+hmdv_anc_ok:
+    mov     eax, dword ptr [g_hfs_vis_cnt]
+    cmp     eax, HFS_MAX_DIRS
+    jae     hmdv_oom
+    inc     eax
+    mov     dword ptr [g_hfs_vis_cnt], eax
+    mov     eax, edx
+    mov     dword ptr [r8 + rax*4], ecx
     xor     eax, eax
     ret
-hmdv_dup:
-    mov     eax, 1
+hmdv_cycle:
+    mov     eax, EXIT_CORRUPT
+    ret
+hmdv_oom:
+    mov     eax, EXIT_OOM
     ret
 hfs_mark_dir_visited endp
 
@@ -1155,9 +1160,10 @@ hfs_walk_dir proc frame
     mov     dword ptr [rbp-76], edx         ; prefixLen
     mov     dword ptr [rbp-88], r8d         ; depth
 
+    mov     edx, r8d
     call    hfs_mark_dir_visited
     test    eax, eax
-    jnz     hwd_corrupt
+    jnz     hwd_cleanup
 
     mov     ebx, dword ptr [g_hfs_cat_root]
     test    ebx, ebx

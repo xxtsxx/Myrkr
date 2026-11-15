@@ -23,6 +23,7 @@ __pycache__/
 
 # Encrypted/plaintext working data — never commit user data
 *.mrk
+Containers/
 # ...except the frozen format fixtures.  These are containers written by an
 # older writer, kept so a version bump cannot silently stop opening them; they
 # hold nothing but generated test text and one seeded random blob.  See

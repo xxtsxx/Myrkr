@@ -27,7 +27,6 @@ extern WideCharToMultiByte:proc
 externdef g_tcvc_data_size:qword
 
 NTF_CP_UTF8             equ 65001
-NTF_WC_ERR_INVALID      equ 80h
 
 NTF_MAGIC_FILE          equ 454C4946h   ; "FILE"
 NTF_MAGIC_INDX          equ 58444E49h   ; "INDX"
@@ -54,20 +53,22 @@ NTF_IE_END              equ 02h
 
 NTF_MAX_DEPTH           equ 64
 NTF_MAX_BTREE_DEPTH     equ 32
-NTF_MAX_DIRS            equ 16384
-NTF_MAX_MFT_RUNS        equ 1024
+NTF_MAX_DIRS            equ 262144
+NTF_MAX_MFT_RUNS        equ 4096
 NTF_MAX_DATA_RUNS       equ 4096
 NTF_MAX_EXT_RECS        equ 128
+NTF_MAX_FSIZE           equ 00007FFFFFFFFFFFh
+NTF_MAX_RUN_CLUSTERS    equ 000000FFFFFFFFFFh
 
 ; Each run entry is 16 bytes: { dq vcn_len, dq lcn (-1 = sparse) }
 NTF_RUN_STRIDE          equ 16
+NTF_IA_HEAP_BYTES       equ (NTF_MAX_DATA_RUNS * NTF_RUN_STRIDE)
 
 .data?
 align 8
 g_ntf_bps               dq ?
 g_ntf_cbytes            dq ?
 g_ntf_tot_clus          dq ?
-g_ntf_max_fsize         dq ?
 g_ntf_mft_bytes         dq ?
 g_ntf_idx_bytes         dq ?
 
@@ -75,7 +76,7 @@ g_ntf_mft_runcnt        dd ?
 g_ntf_vis_cnt           dd ?
 
 align 8
-g_ntf_vis_mft           dq NTF_MAX_DIRS dup (?)
+g_ntf_anc_mft           dq (NTF_MAX_DEPTH + 2) dup (?)
 g_ntf_mft_runs          dq (NTF_MAX_MFT_RUNS * 2) dup (?)
 g_ntf_data_runs         dq (NTF_MAX_DATA_RUNS * 2) dup (?)
 
@@ -83,7 +84,7 @@ align 16
 g_ntf_rec_main          db 4096 dup (?)
 g_ntf_rec_child         db 4096 dup (?)
 g_ntf_rec_ext           db 4096 dup (?)
-g_ntf_alist_buf         db 65536 dup (?)
+g_ntf_alist_buf         db 262144 dup (?)
 g_ntf_path              db 4096 dup (?)
 g_ntf_comp8             db 1024 dup (?)
 g_ntf_iobuf             db 65536 dup (?)
@@ -209,7 +210,8 @@ ndr_len_lp:
 
     test    r8, r8
     jz      ndr_bad
-    cmp     r8, qword ptr [g_ntf_tot_clus]
+    mov     r9, NTF_MAX_RUN_CLUSTERS
+    cmp     r8, r9
     ja      ndr_bad
 
     test    eax, eax
@@ -479,14 +481,17 @@ ntfs_attr_is_i30 endp
 ; =============================================================================
 public ntfs_probe
 ntfs_probe proc frame
-    FRAME_PROLOG 624
-    ; [rbp-16..48]  saved rbx, rsi, rdi, r12, r13
-    ; [rsp+48..559] 512-byte $Boot buffer
+    FRAME_PROLOG 1200
+    ; [rbp-16..64]   saved rbx, rsi, rdi, r12, r13, r14, r15
+    ; [rbp-72]       saved attr off/len (dd at -72, dd at -68)
+    ; [rsp+48..559]  512-byte $Boot buffer (reused as extRecNums[128] at [rsp+48..1071])
     mov     qword ptr [rbp-16], rbx
     mov     qword ptr [rbp-24], rsi
     mov     qword ptr [rbp-32], rdi
     mov     qword ptr [rbp-40], r12
     mov     qword ptr [rbp-48], r13
+    mov     qword ptr [rbp-56], r14
+    mov     qword ptr [rbp-64], r15
 
     cmp     qword ptr [g_tcvc_data_size], 8192
     jb      np_not_ntfs
@@ -545,7 +550,9 @@ np_spc_ok:
     ja      np_corrupt
     mov     qword ptr [g_ntf_cbytes], rax
 
-    ; TotalSectors (+40, u64)
+    ; TotalSectors (+40, u64): Windows formats TotalSectors = PartitionSectors - 1,
+    ; so validate TotalSectors * bps <= g_tcvc_data_size, then derive g_ntf_tot_clus
+    ; from g_tcvc_data_size / g_ntf_cbytes so runs in the last cluster are accepted.
     mov     rax, qword ptr [rsi + 40]
     test    rax, rax
     jz      np_corrupt
@@ -554,8 +561,8 @@ np_spc_ok:
     jnz     np_corrupt
     cmp     rax, qword ptr [g_tcvc_data_size]
     ja      np_corrupt
-    mov     qword ptr [g_ntf_max_fsize], rax
 
+    mov     rax, qword ptr [g_tcvc_data_size]
     xor     edx, edx
     div     qword ptr [g_ntf_cbytes]
     cmp     rax, 2
@@ -641,7 +648,8 @@ np_idx_chk:
     test    eax, eax
     jnz     np_corrupt
 
-    ; Find unnamed non-resident $DATA (0x80) in $MFT record 0
+    ; Collect all unnamed non-resident $DATA (0x80) extents in $MFT record 0
+    mov     dword ptr [g_ntf_mft_runcnt], 0
     lea     rsi, [g_ntf_rec_main]
     movzx   ecx, word ptr [rsi + 20]        ; attrs_offset
     mov     edx, dword ptr [rsi + 24]       ; bytes_in_use
@@ -653,11 +661,11 @@ np_idx_chk:
 
 np_mft_attr:
     cmp     ecx, r13d
-    jae     np_corrupt
+    jae     np_mft_ext
     lea     rdi, [rsi + rcx]
     mov     eax, dword ptr [rdi]
     cmp     eax, NTF_AT_END
-    je      np_corrupt
+    je      np_mft_ext
     mov     edx, dword ptr [rdi + 4]
     cmp     edx, 24
     jb      np_corrupt
@@ -677,21 +685,112 @@ np_mft_attr:
     cmp     eax, edx
     jae     np_corrupt
 
+    mov     r10d, dword ptr [g_ntf_mft_runcnt]
+    cmp     r10d, NTF_MAX_MFT_RUNS
+    jae     np_corrupt
+    lea     r8,  [g_ntf_mft_runs]
+    mov     r9d, r10d
+    shl     r9d, 4
+    add     r8,  r9
+    mov     r9d, NTF_MAX_MFT_RUNS
+    sub     r9d, r10d
+    mov     dword ptr [rbp-72], ecx
+    mov     dword ptr [rbp-68], edx
     lea     rcx, [rdi + rax]
     sub     edx, eax
-    lea     r8,  [g_ntf_mft_runs]
-    mov     r9d, NTF_MAX_MFT_RUNS
     call    ntfs_decode_runs
+    mov     ecx, dword ptr [rbp-72]
+    mov     edx, dword ptr [rbp-68]
     cmp     eax, 0
     jle     np_corrupt
-    mov     dword ptr [g_ntf_mft_runcnt], eax
-
-    mov     eax, TCVC_FS_NTFS
-    jmp     np_out
+    add     dword ptr [g_ntf_mft_runcnt], eax
 
 np_mft_next:
     add     ecx, edx
     jmp     np_mft_attr
+
+np_mft_ext:
+    cmp     dword ptr [g_ntf_mft_runcnt], 0
+    je      np_corrupt
+
+    ; Also append unnamed $DATA extents from $ATTRIBUTE_LIST extension records of $MFT
+    lea     rcx, [g_ntf_rec_main]
+    lea     rdx, [rsp+48]
+    mov     r8d, NTF_MAX_EXT_RECS
+    mov     r9d, NTF_AT_DATA
+    mov     qword ptr [rsp+32], 0           ; baseRecNum = 0 ($MFT)
+    call    ntfs_collect_ext_recs
+    cmp     eax, 0
+    jl      np_corrupt
+    jz      np_mft_done
+
+    mov     r15d, eax
+    xor     r14d, r14d
+np_ext_lp:
+    cmp     r14d, r15d
+    jae     np_mft_done
+    mov     rcx, qword ptr [rsp+48 + r14*8]
+    lea     rdx, [g_ntf_rec_ext]
+    call    ntfs_read_mft_rec
+    test    eax, eax
+    jnz     np_corrupt
+    lea     rsi, [g_ntf_rec_ext]
+    movzx   ecx, word ptr [rsi + 20]
+    mov     ebx, dword ptr [rsi + 24]
+np_ext_attr:
+    cmp     ecx, ebx
+    jae     np_ext_next
+    lea     rdi, [rsi + rcx]
+    mov     eax, dword ptr [rdi]
+    cmp     eax, NTF_AT_END
+    je      np_ext_next
+    mov     edx, dword ptr [rdi + 4]
+    cmp     edx, 24
+    jb      np_corrupt
+    lea     r8d, [ecx + edx]
+    cmp     r8d, ebx
+    ja      np_corrupt
+    cmp     eax, NTF_AT_DATA
+    jne     np_ext_adv
+    cmp     byte ptr [rdi + 9], 0
+    jne     np_ext_adv
+    cmp     byte ptr [rdi + 8], 1
+    jne     np_corrupt
+    cmp     edx, 64
+    jb      np_corrupt
+    movzx   eax, word ptr [rdi + 32]
+    cmp     eax, edx
+    jae     np_corrupt
+
+    mov     r10d, dword ptr [g_ntf_mft_runcnt]
+    cmp     r10d, NTF_MAX_MFT_RUNS
+    jae     np_corrupt
+    lea     r8,  [g_ntf_mft_runs]
+    mov     r9d, r10d
+    shl     r9d, 4
+    add     r8,  r9
+    mov     r9d, NTF_MAX_MFT_RUNS
+    sub     r9d, r10d
+    mov     dword ptr [rbp-72], ecx
+    mov     dword ptr [rbp-68], edx
+    lea     rcx, [rdi + rax]
+    sub     edx, eax
+    call    ntfs_decode_runs
+    mov     ecx, dword ptr [rbp-72]
+    mov     edx, dword ptr [rbp-68]
+    cmp     eax, 0
+    jle     np_corrupt
+    add     dword ptr [g_ntf_mft_runcnt], eax
+np_ext_adv:
+    add     ecx, edx
+    jmp     np_ext_attr
+np_ext_next:
+    inc     r14d
+    jmp     np_ext_lp
+
+np_mft_done:
+    mov     eax, TCVC_FS_NTFS
+    jmp     np_out
 
 np_not_ntfs:
     xor     eax, eax
@@ -706,6 +805,8 @@ np_out:
     mov     rdi, qword ptr [rbp-32]
     mov     r12, qword ptr [rbp-40]
     mov     r13, qword ptr [rbp-48]
+    mov     r14, qword ptr [rbp-56]
+    mov     r15, qword ptr [rbp-64]
     FRAME_EPILOG
     ret
 ntfs_probe endp
@@ -770,7 +871,7 @@ ncer_al_nonres:
     cmp     edx, 64
     jb      ncer_bad
     mov     r15, qword ptr [r10 + 48]       ; data_size
-    cmp     r15, 65536
+    cmp     r15, 262144
     ja      ncer_bad
     movzx   eax, word ptr [r10 + 32]
     cmp     eax, edx
@@ -807,8 +908,11 @@ ncer_al_lp:
     cmp     r8d, r15d
     ja      ncer_bad
 
+    test    r13d, r13d
+    jz      ncer_type_ok
     cmp     eax, r13d
     jne     ncer_al_next
+ncer_type_ok:
 
     mov     rax, qword ptr [rsi + rcx + 16]
     mov     r9,  0000FFFFFFFFFFFFh
@@ -979,7 +1083,8 @@ nic_data_nonres:
     cmp     qword ptr [rdi + 16], 0         ; lowest_vcn == 0 holds DataSize
     jne     nic_attr_next
     mov     rax, qword ptr [rdi + 48]
-    cmp     rax, qword ptr [g_ntf_max_fsize]
+    mov     r10, NTF_MAX_FSIZE
+    cmp     rax, r10
     ja      nic_corrupt
     mov     qword ptr [rbp-104], rax
     mov     dword ptr [rbp-96], 1
@@ -989,16 +1094,11 @@ nic_attr_next:
     jmp     nic_attr_lp
 
 nic_chk_ext:
-    ; If regular file and unnamed $DATA wasn't in base record, check $ATTRIBUTE_LIST
-    cmp     dword ptr [rbp-84], 0
-    jne     nic_finish
-    cmp     dword ptr [rbp-96], 0
-    jne     nic_finish
-
+    ; Scan $ATTRIBUTE_LIST extension records (for $FILE_NAME, $REPARSE_POINT, and $DATA)
     lea     rcx, [g_ntf_rec_child]
     lea     rdx, [rsp+48]
     mov     r8d, NTF_MAX_EXT_RECS
-    mov     r9d, NTF_AT_DATA
+    xor     r9d, r9d                        ; wantAttrType = 0 (all attributes)
     mov     rax, qword ptr [rbp-72]
     mov     qword ptr [rsp+32], rax
     call    ntfs_collect_ext_recs
@@ -1033,29 +1133,61 @@ nic_ext_attr:
     lea     r8d, [ecx + edx]
     cmp     r8d, ebx
     ja      nic_corrupt
+
+    cmp     eax, NTF_AT_REPARSE
+    je      nic_mark_skip
+    cmp     eax, NTF_AT_FILE_NAME
+    je      nic_ext_fn
     cmp     eax, NTF_AT_DATA
+    je      nic_ext_data
+    jmp     nic_ext_adv
+
+nic_ext_fn:
+    cmp     byte ptr [rdi + 8], 0
     jne     nic_ext_adv
+    mov     r8d, dword ptr [rdi + 16]
+    cmp     r8d, 66
+    jb      nic_ext_adv
+    movzx   r9d, word ptr [rdi + 20]
+    lea     eax, [r9d + r8d]
+    cmp     eax, edx
+    ja      nic_corrupt
+    test    dword ptr [rdi + r9 + 56], NTF_DUP_REPARSE
+    jnz     nic_mark_skip
+    mov     rax, qword ptr [rdi + r9]
+    mov     r10, 0000FFFFFFFFFFFFh
+    and     rax, r10
+    cmp     rax, qword ptr [rbp-80]
+    jne     nic_ext_adv
+    cmp     byte ptr [rdi + r9 + 65], NTF_FN_NS_DOS
+    je      nic_ext_adv
+    mov     dword ptr [rbp-88], 1
+    jmp     nic_ext_adv
+
+nic_ext_data:
     cmp     byte ptr [rdi + 9], 0
     jne     nic_ext_adv
     test    word ptr [rdi + 12], NTF_AF_ENCRYPTED
     jnz     nic_unsup
+    cmp     dword ptr [rbp-96], 0
+    jne     nic_ext_adv
     cmp     byte ptr [rdi + 8], 0
     jne     nic_ext_nr
     mov     eax, dword ptr [rdi + 16]
     mov     qword ptr [rbp-104], rax
     mov     dword ptr [rbp-96], 1
-    jmp     nic_finish
+    jmp     nic_ext_adv
 nic_ext_nr:
     cmp     edx, 64
     jb      nic_corrupt
     cmp     qword ptr [rdi + 16], 0
     jne     nic_ext_adv
     mov     rax, qword ptr [rdi + 48]
-    cmp     rax, qword ptr [g_ntf_max_fsize]
+    mov     r10, NTF_MAX_FSIZE
+    cmp     rax, r10
     ja      nic_corrupt
     mov     qword ptr [rbp-104], rax
     mov     dword ptr [rbp-96], 1
-    jmp     nic_finish
 nic_ext_adv:
     add     ecx, edx
     jmp     nic_ext_attr
@@ -1107,29 +1239,35 @@ nic_out:
 ntfs_inspect_child endp
 
 ; =============================================================================
-; ntfs_mark_dir_visited(rcx = mftRecNum) -> eax = 0 ok, 1 dup / full
+; ntfs_mark_dir_visited(rcx = mftRecNum, edx = dirDepth) -> eax = EXIT_*
+; Checks active ancestor stack [0..dirDepth-1] for directory cycles, records
+; mftRecNum at g_ntf_anc_mft[dirDepth], and bounds total directories visited.
 ; =============================================================================
 ntfs_mark_dir_visited proc
-    mov     edx, dword ptr [g_ntf_vis_cnt]
-    lea     r8,  [g_ntf_vis_mft]
+    lea     r8,  [g_ntf_anc_mft]
     xor     eax, eax
 nmdv_lp:
     cmp     eax, edx
-    jae     nmdv_add
+    jae     nmdv_anc_ok
     cmp     qword ptr [r8 + rax*8], rcx
-    je      nmdv_dup
+    je      nmdv_cycle
     inc     eax
     jmp     nmdv_lp
-nmdv_add:
-    cmp     edx, NTF_MAX_DIRS
-    jae     nmdv_dup
-    mov     qword ptr [r8 + rdx*8], rcx
-    inc     edx
-    mov     dword ptr [g_ntf_vis_cnt], edx
+nmdv_anc_ok:
+    mov     eax, dword ptr [g_ntf_vis_cnt]
+    cmp     eax, NTF_MAX_DIRS
+    jae     nmdv_oom
+    inc     eax
+    mov     dword ptr [g_ntf_vis_cnt], eax
+    mov     eax, edx
+    mov     qword ptr [r8 + rax*8], rcx
     xor     eax, eax
     ret
-nmdv_dup:
-    mov     eax, 1
+nmdv_cycle:
+    mov     eax, EXIT_CORRUPT
+    ret
+nmdv_oom:
+    mov     eax, EXIT_OOM
     ret
 ntfs_mark_dir_visited endp
 
@@ -1315,7 +1453,7 @@ nwie_insp:
 nwie_conv_name:
     ; Convert UTF-16LE name at [rsi + 82], length r14d, to UTF-8 in g_ntf_comp8
     lea     r8, [rsi + 82]
-    WINCALL WideCharToMultiByte, NTF_CP_UTF8, NTF_WC_ERR_INVALID, r8, r14d, addr g_ntf_comp8, 1020, 0, 0
+    WINCALL WideCharToMultiByte, NTF_CP_UTF8, 0, r8, r14d, addr g_ntf_comp8, 1020, 0, 0
     test    eax, eax
     jz      nwie_corrupt
     mov     r15d, eax                       ; compLen
@@ -1470,12 +1608,13 @@ ntfs_walk_dir proc frame
     mov     dword ptr [rbp-96 + 12], r8d    ; dirDepth
     mov     qword ptr [rbp-96 + 0],  rcx
 
+    mov     edx, r8d
     call    ntfs_mark_dir_visited
     test    eax, eax
-    jnz     nwd_corrupt
+    jnz     nwd_cleanup_err
 
-    ; Allocate per-directory iaRuns buffer (256 runs * 16 = 4096B) + rootCopy (4096B)
-    mov     ecx, 4096
+    ; Allocate per-directory iaRuns buffer (4096 runs * 16 = 65536B) + rootCopy (4096B)
+    mov     ecx, NTF_IA_HEAP_BYTES
     call    mem_alloc
     test    rax, rax
     jz      nwd_oom
@@ -1582,13 +1721,13 @@ nwd_got_ia:
     cmp     eax, edx
     jae     nwd_corrupt
     mov     r14d, dword ptr [rbp-116]       ; cur iaRunCnt
-    cmp     r14d, 256
+    cmp     r14d, NTF_MAX_DATA_RUNS
     jae     nwd_corrupt
     mov     r8, qword ptr [rbp-104]
     mov     r9d, r14d
     shl     r9d, 4
     add     r8, r9
-    mov     r9d, 256
+    mov     r9d, NTF_MAX_DATA_RUNS
     sub     r9d, r14d
     mov     dword ptr [rbp-128], ecx
     mov     dword ptr [rbp-132], edx
@@ -1606,11 +1745,11 @@ nwd_base_next:
     jmp     nwd_base_lp
 
 nwd_chk_ext_ia:
-    ; Also check $ATTRIBUTE_LIST for extension $INDEX_ROOT / $INDEX_ALLOCATION
+    ; Also check $ATTRIBUTE_LIST for extension $INDEX_ROOT and $INDEX_ALLOCATION
     lea     rcx, [g_ntf_rec_main]
     lea     rdx, [rsp+48]
     mov     r8d, NTF_MAX_EXT_RECS
-    mov     r9d, NTF_AT_INDEX_ALLOC
+    xor     r9d, r9d                        ; wantAttrType = 0 (both 0x90 and 0xA0)
     mov     qword ptr [rsp+32], r12
     call    ntfs_collect_ext_recs
     cmp     eax, 0
@@ -1643,8 +1782,58 @@ nwd_ext_ia_attr:
     lea     r8d, [ecx + edx]
     cmp     r8d, ebx
     ja      nwd_corrupt
+    cmp     eax, NTF_AT_INDEX_ROOT
+    je      nwd_ext_ir
     cmp     eax, NTF_AT_INDEX_ALLOC
+    je      nwd_ext_ia
+    jmp     nwd_ext_ia_adv
+
+nwd_ext_ir:
+    cmp     dword ptr [rbp-120], 0
     jne     nwd_ext_ia_adv
+    mov     dword ptr [rbp-128], ecx
+    mov     dword ptr [rbp-132], edx
+    mov     rcx, rdi
+    call    ntfs_attr_is_i30
+    mov     ecx, dword ptr [rbp-128]
+    mov     edx, dword ptr [rbp-132]
+    test    eax, eax
+    jz      nwd_ext_ia_adv
+    cmp     byte ptr [rdi + 8], 0
+    jne     nwd_corrupt
+    mov     r8d, dword ptr [rdi + 16]
+    movzx   r9d, word ptr [rdi + 20]
+    cmp     r8d, 32
+    jb      nwd_corrupt
+    lea     eax, [r9d + r8d]
+    cmp     eax, edx
+    ja      nwd_corrupt
+    lea     r10, [rdi + r9]
+    mov     eax, dword ptr [r10 + 16]
+    mov     r11d, dword ptr [r10 + 20]
+    cmp     eax, 16
+    jb      nwd_corrupt
+    cmp     r11d, eax
+    jb      nwd_corrupt
+    lea     r9d, [r11d + 16]
+    cmp     r9d, r8d
+    ja      nwd_corrupt
+    sub     r11d, eax
+    cmp     r11d, 4096
+    ja      nwd_corrupt
+    mov     dword ptr [rbp-120], r11d
+    mov     r8, qword ptr [rbp-112]
+    lea     r10, [r10 + 16 + rax]
+    xor     r9d, r9d
+nwd_cp_ext_ir:
+    cmp     r9d, r11d
+    jae     nwd_ext_ia_adv
+    mov     al, byte ptr [r10 + r9]
+    mov     byte ptr [r8 + r9], al
+    inc     r9d
+    jmp     nwd_cp_ext_ir
+
+nwd_ext_ia:
     mov     dword ptr [rbp-128], ecx
     mov     dword ptr [rbp-132], edx
     mov     rcx, rdi
@@ -1655,17 +1844,19 @@ nwd_ext_ia_attr:
     jz      nwd_ext_ia_adv
     cmp     byte ptr [rdi + 8], 1
     jne     nwd_corrupt
+    cmp     edx, 64
+    jb      nwd_corrupt
     movzx   eax, word ptr [rdi + 32]
     cmp     eax, edx
     jae     nwd_corrupt
     mov     r10d, dword ptr [rbp-116]
-    cmp     r10d, 256
+    cmp     r10d, NTF_MAX_DATA_RUNS
     jae     nwd_corrupt
     mov     r8, qword ptr [rbp-104]
     mov     r9d, r10d
     shl     r9d, 4
     add     r8, r9
-    mov     r9d, 256
+    mov     r9d, NTF_MAX_DATA_RUNS
     sub     r9d, r10d
     mov     dword ptr [rbp-128], ecx
     mov     dword ptr [rbp-132], edx
@@ -1716,7 +1907,7 @@ nwd_f1:
     mov     rcx, qword ptr [rbp-104]
     test    rcx, rcx
     jz      nwd_f2
-    mov     edx, 4096
+    mov     edx, NTF_IA_HEAP_BYTES
     call    mem_free
 nwd_f2:
     mov     eax, ebx

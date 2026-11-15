@@ -165,10 +165,14 @@ def build_tcvc_volume(
     is_vera: bool = True,
     kdf_alg: str = "sha512",
     salt_seed: bytes = b"S",
+    hdr_ver: int = 5,
+    req_ver: int | None = None,
+    sec_size: int = 512,
+    legacy_v1: bool = False,
 ) -> bytes:
     assert len(fs_image) % 512 == 0
-    data_off = 131072
-    backup_len = 131072
+    data_off = 512 if legacy_v1 else 131072
+    backup_len = 0 if legacy_v1 else 131072
     data_size = len(fs_image)
 
     mixed_pw = mix_keyfiles(password, keyfile_blobs)
@@ -178,28 +182,32 @@ def build_tcvc_volume(
 
     master_k1 = hashlib.sha256(b"mk1:" + salt_seed).digest()
     master_k2 = hashlib.sha256(b"mk2:" + salt_seed).digest()
+    eff_req_ver = req_ver if req_ver is not None else (0x010B if is_vera else 0x0700)
 
-    def make_header(salt64: bytes) -> bytes:
+    def make_header(salt64: bytes, override_data_size: int | None = None) -> bytes:
         assert len(salt64) == 64
         dk = pbkdf2_derive(kdf_alg, mixed_pw, salt64, iters, 64)
         hk1, hk2 = dk[:32], dk[32:64]
 
         plain = bytearray(448)
         plain[0:4] = b"VERA" if is_vera else b"TRUE"
-        struct.pack_into(">H", plain, 4, 5 if is_vera else 5)         # header version
-        struct.pack_into(">H", plain, 6, 0x010B if is_vera else 0x0700)  # min prog ver
+        struct.pack_into(">H", plain, 4, hdr_ver)
+        struct.pack_into(">H", plain, 6, eff_req_ver)
         struct.pack_into(">Q", plain, 28, 0)                          # HiddenVolumeSize = 0 (normal volume)
-        struct.pack_into(">Q", plain, 36, data_size)                  # VolumeDataSize
-        struct.pack_into(">Q", plain, 44, data_off)                   # master key scope start
-        struct.pack_into(">Q", plain, 52, data_size)                  # master key scope size
+        vds = data_size if override_data_size is None else override_data_size
+        struct.pack_into(">Q", plain, 36, vds)                        # VolumeDataSize
+        struct.pack_into(">Q", plain, 44, 0 if legacy_v1 else data_off)
+        struct.pack_into(">Q", plain, 52, 0 if legacy_v1 else vds)
         struct.pack_into(">I", plain, 60, 0)                          # flags = 0 (non-system)
-        struct.pack_into(">I", plain, 64, 512)                        # sector size = 512
+        if hdr_ver >= 5:
+            struct.pack_into(">I", plain, 64, sec_size)
         plain[192:224] = master_k1
         plain[224:256] = master_k2
         crc_keys = zlib.crc32(plain[192:448]) & 0xFFFFFFFF
         struct.pack_into(">I", plain, 8, crc_keys)
-        crc_hdr = zlib.crc32(plain[0:188]) & 0xFFFFFFFF
-        struct.pack_into(">I", plain, 188, crc_hdr)
+        if hdr_ver >= 4:
+            crc_hdr = zlib.crc32(plain[0:188]) & 0xFFFFFFFF
+            struct.pack_into(">I", plain, 188, crc_hdr)
 
         enc448 = aes256_xts_encrypt(hk1, hk2, bytes(plain), 0)
         return salt64 + enc448
@@ -210,10 +218,12 @@ def build_tcvc_volume(
     pri_area = bytearray(data_off)
     pri_area[0:512] = make_header(salt_pri)
 
+    enc_data = aes256_xts_encrypt(master_k1, master_k2, fs_image, data_off // 512)
+    if legacy_v1:
+        return bytes(pri_area) + enc_data
+
     bak_area = bytearray(backup_len)
     bak_area[0:512] = make_header(salt_bak)
-
-    enc_data = aes256_xts_encrypt(master_k1, master_k2, fs_image, data_off // 512)
     return bytes(pri_area) + enc_data + bytes(bak_area)
 
 
@@ -1700,6 +1710,305 @@ def main() -> int:
         except Exception as exc:
             failures += 1
             print(f"  [FAIL] macOS HFS+ / HFSX: {exc}")
+
+        # ---------------------------------------------------------------------
+        # Case 9: Aged NTFS edge cases ($MFT fragmented via $ATTRIBUTE_LIST,
+        #         TotalSectors = tot_sec - 1 + last-cluster LCN, ext-MFT dir
+        #         Win32 $FILE_NAME + $INDEX_ROOT, sparse file > container size)
+        # ---------------------------------------------------------------------
+        try:
+            bps = 512
+            spc = 8
+            cbytes = bps * spc  # 4096
+            tot_clus = 96
+            tot_sec = tot_clus * spc
+            aged_ntfs = bytearray(tot_sec * bps)
+
+            aged_ntfs[0:3] = b"\xEB\x52\x90"
+            aged_ntfs[3:11] = b"NTFS    "
+            struct.pack_into("<HB", aged_ntfs, 11, bps, spc)
+            aged_ntfs[21] = 0xF8
+            # Windows format.exe writes TotalSectors = PartitionSectors - 1!
+            struct.pack_into("<QQQ", aged_ntfs, 40, tot_sec - 1, 4, 2)
+            struct.pack_into("<b", aged_ntfs, 64, -10)  # 1024B MFT record
+            struct.pack_into("<b", aged_ntfs, 68, 1)    # 4096B INDX block
+            struct.pack_into("<H", aged_ntfs, 510, 0xAA55)
+
+            def put_aged_mft(rec_num: int, raw1k: bytes):
+                # Records 0..31 in fragment 0 (LCN 4..11); records 32..63 in fragment 1 (LCN 70..77)
+                if rec_num < 32:
+                    off = 4 * cbytes + rec_num * 1024
+                else:
+                    off = 70 * cbytes + (rec_num - 32) * 1024
+                aged_ntfs[off : off + 1024] = raw1k
+
+            aged_expected: dict[str, bytes] = {}
+
+            # Record 43 (in $MFT 2nd fragment!): file inside Aged_Directory_Ext_MFT
+            f43_body = b"Stored in MFT record 43 (second $MFT fragment via $ATTRIBUTE_LIST)!\n" * 30
+            aged_ntfs[80 * cbytes : 80 * cbytes + len(f43_body)] = f43_body
+            fn43 = _ntfs_fn_val(40, 1, "deep_in_mft_frag2.txt", namespace=1)
+            put_aged_mft(
+                43,
+                _ntfs_mft_record(
+                    1,
+                    False,
+                    [
+                        _ntfs_attr_res(0x30, fn43),
+                        _ntfs_attr_nonres(0x80, [(1, 80)], cbytes, len(f43_body), len(f43_body)),
+                    ],
+                ),
+            )
+            aged_expected["Aged_Directory_Ext_MFT/deep_in_mft_frag2.txt"] = f43_body
+
+            # Record 40 (base dir) + Record 41 (ext dir holding Win32 $FILE_NAME + $INDEX_ROOT:$I30)
+            fn40_dos = _ntfs_fn_val(5, 1, "AGEDDI~1", namespace=2)
+            fn40_win = _ntfs_fn_val(5, 1, "Aged_Directory_Ext_MFT", namespace=1)
+            ir40_ents = _ntfs_idx_entry(43, 1, fn43) + _ntfs_idx_end()
+            ir40_val = (
+                struct.pack("<IIII", 0x30, 1, cbytes, 1)
+                + struct.pack("<IIII", 16, 16 + len(ir40_ents), 16 + len(ir40_ents), 0)
+                + ir40_ents
+            )
+            al40 = (
+                struct.pack("<IHBBQQ", 0x30, 32, 0, 26, 0, (1 << 48) | 40).ljust(32, b"\x00")
+                + struct.pack("<IHBBQQ", 0x30, 32, 0, 26, 0, (1 << 48) | 41).ljust(32, b"\x00")
+                + struct.pack("<IHBBQQ", 0x90, 32, 4, 26, 0, (1 << 48) | 41).ljust(32, b"\x00")
+            )
+            put_aged_mft(40, _ntfs_mft_record(1, True, [_ntfs_attr_res(0x20, al40), _ntfs_attr_res(0x30, fn40_dos)]))
+            put_aged_mft(
+                41,
+                _ntfs_mft_record(1, True, [_ntfs_attr_res(0x30, fn40_win), _ntfs_attr_res(0x90, ir40_val, name="$I30")]),
+            )
+
+            # Record 42: Sparse file with logical data_size > entire container + physical tail in LAST cluster (LCN 95)!
+            sparse_clusters = 110  # 450,560 bytes > 393,216-byte volume!
+            tail_last = b"LAST_CLUSTER_95_OK!" * 60  # 1,140 bytes in LCN 95 (tot_clus - 1)
+            aged_ntfs[95 * cbytes : 95 * cbytes + len(tail_last)] = tail_last
+            tot_sp42 = sparse_clusters * cbytes + len(tail_last)
+            fn42 = _ntfs_fn_val(5, 1, "oversized_sparse_last_clus.bin", namespace=1)
+            put_aged_mft(
+                42,
+                _ntfs_mft_record(
+                    1,
+                    False,
+                    [
+                        _ntfs_attr_res(0x30, fn42),
+                        _ntfs_attr_nonres(0x80, [(sparse_clusters, None), (1, 95)], (sparse_clusters + 1) * cbytes, tot_sp42, tot_sp42),
+                    ],
+                ),
+            )
+            aged_expected["oversized_sparse_last_clus.bin"] = (b"\x00" * (sparse_clusters * cbytes)) + tail_last
+
+            # Root directory Record 5 listing DOS + Win32 entries for Record 40 and Record 42
+            r5_ents = (
+                _ntfs_idx_entry(40, 1, fn40_dos)
+                + _ntfs_idx_entry(40, 1, fn40_win)
+                + _ntfs_idx_entry(42, 1, fn42)
+                + _ntfs_idx_end()
+            )
+            ir5_aged = (
+                struct.pack("<IIII", 0x30, 1, cbytes, 1)
+                + struct.pack("<IIII", 16, 16 + len(r5_ents), 16 + len(r5_ents), 0)
+                + r5_ents
+            )
+            put_aged_mft(5, _ntfs_mft_record(1, True, [_ntfs_attr_res(0x90, ir5_aged, name="$I30")]))
+
+            # Fragmented $MFT: Record 0 (VCN 0..7 @ LCN 4) + $ATTRIBUTE_LIST -> Record 15 (VCN 8..15 @ LCN 70)
+            al_mft0 = (
+                struct.pack("<IHBBQQ", 0x80, 32, 0, 26, 0, (1 << 48) | 0).ljust(32, b"\x00")
+                + struct.pack("<IHBBQQ", 0x80, 32, 0, 26, 8, (1 << 48) | 15).ljust(32, b"\x00")
+            )
+            put_aged_mft(
+                0,
+                _ntfs_mft_record(
+                    1,
+                    False,
+                    [
+                        _ntfs_attr_res(0x20, al_mft0),
+                        _ntfs_attr_nonres(0x80, [(8, 4)], 16 * cbytes, 16 * cbytes, 16 * cbytes),
+                    ],
+                ),
+            )
+            put_aged_mft(
+                15,
+                _ntfs_mft_record(
+                    1,
+                    False,
+                    [_ntfs_attr_nonres(0x80, [(8, 70)], 0, 0, 0, low_vcn=8)],
+                ),
+            )
+
+            hc_aged = os.path.join(tmp, "aged_ntfs.hc")
+            with open(hc_aged, "wb") as f:
+                f.write(build_tcvc_volume(bytes(aged_ntfs), b"AgedNtfs#Pass1", [], is_vera=True, kdf_alg="sha512", salt_seed=b"aged"))
+            out_aged = os.path.join(tmp, "out_aged_ntfs")
+            rc, out = run_myrkr(exe, ["decrypt", hc_aged, "-o", out_aged, "-p", "AgedNtfs#Pass1"])
+            assert rc == EXIT_OK, f"Aged NTFS decrypt failed: rc={rc} out={out}"
+            assert_tree_matches(collect_extracted_files(out_aged), aged_expected, "VC-Aged-NTFS")
+            print("  [PASS] Aged NTFS (fragmented $MFT+$ATTRIBUTE_LIST, TotalSectors-1 last cluster, ext-MFT dir, sparse > vol)")
+        except Exception as exc:
+            failures += 1
+            print(f"  [FAIL] Aged NTFS edge cases: {exc}")
+
+        # ---------------------------------------------------------------------
+        # Case 10: Real-world FAT16 boundary + FAT clamping + empty FstClus=0 dir
+        #          + Legacy V1 TC header + unaligned host file + corrupt-hdr backup recovery
+        # ---------------------------------------------------------------------
+        try:
+            # Build FAT16 image, adjust cluster count to 4060 (<4085 with "FAT16   " like VC Fat.c),
+            # then extend TotSec32 past FATSz16 capacity to exercise fastfat.sys cluster clamping,
+            # and inject an empty subdirectory (FstClus=0) + blank SFN slot in root directory!
+            fat_edge = bytearray(build_fat_image(16, {"keep_me.txt": b"FAT16 boundary & clamping works!\n" * 20}, spc=1))
+            # Shrink FATSz16 header claim? Easier: append 300 sectors to image and bump TotSec so DataSec > FATSz16*256!
+            orig_tot16 = struct.unpack_from("<H", fat_edge, 19)[0]
+            orig_tot = orig_tot16 if orig_tot16 else struct.unpack_from("<I", fat_edge, 32)[0]
+            fat_edge.extend(b"\x00" * (300 * 512))
+            struct.pack_into("<H", fat_edge, 19, 0)
+            struct.pack_into("<I", fat_edge, 32, orig_tot + 300)
+
+            # Inject blank SFN slot + empty subdir (attr=0x10, FstClus=0) into root directory
+            root_off = (1 + 2 * 17) * 512
+            pos = root_off
+            while fat_edge[pos] != 0:
+                pos += 32
+            blank_slot = bytearray(32)
+            blank_slot[0:11] = b"           "
+            blank_slot[11] = 0x20
+            empty_dir_slot = _make_fat_dirent("EMPTYDIR", 0x10, 0, 0, 99, force_sfn=(b"EMPTYDIR   ", 0))
+            fat_edge[pos : pos + 32] = blank_slot
+            fat_edge[pos + 32 : pos + 64] = empty_dir_slot
+
+            # Seal in Legacy V1 TrueCrypt v3 header (RequiredProgramVersion=0x0500, EncryptedAreaStart=0,
+            # VolumeDataSize != 0) AND append +137 trailing unaligned bytes to outer file!
+            tc_v1_bytes = build_tcvc_volume(
+                bytes(fat_edge),
+                b"LegacyTcV1Pass!",
+                [],
+                is_vera=False,
+                kdf_alg="ripemd160",
+                salt_seed=b"v1fat",
+                hdr_ver=3,
+                req_ver=0x0500,
+                legacy_v1=True,
+            ) + (b"\xAB" * 137)
+            tc_v1_path = os.path.join(tmp, "legacy_unaligned.tc")
+            with open(tc_v1_path, "wb") as f:
+                f.write(tc_v1_bytes)
+
+            out_v1 = os.path.join(tmp, "out_v1_fat")
+            rc, out = run_myrkr(exe, ["decrypt", tc_v1_path, "-o", out_v1, "-p", "LegacyTcV1Pass!"])
+            assert rc == EXIT_OK, f"Legacy V1 + FAT16 edge decrypt failed: rc={rc} out={out}"
+            assert os.path.isdir(os.path.join(out_v1, "EMPTYDIR")), "EMPTYDIR with FstClus=0 not created"
+            assert collect_extracted_files(out_v1) == {"keep_me.txt": b"FAT16 boundary & clamping works!\n" * 20}
+
+            # Also verify backup header fallback when primary header authenticates with CORRUPT geometry
+            # (and test v5 header with SectorSize == 0 defaulting to 512)!
+            good_vol = bytearray(
+                build_tcvc_volume(
+                    bytes(fat_edge),
+                    b"BackupCorruptPri!",
+                    [],
+                    is_vera=True,
+                    kdf_alg="sha256",
+                    salt_seed=b"bakcorr",
+                    hdr_ver=5,
+                    sec_size=0,
+                )
+            )
+            # Re-encrypt primary header at [0..511] with same password/salt but oversized VolumeDataSize -> EXIT_CORRUPT
+            salt_p = bytes(good_vol[0:64])
+            dk_p = pbkdf2_derive("sha256", b"BackupCorruptPri!", salt_p, 500000, 64)
+            bad_plain = bytearray(448)
+            bad_plain[0:4] = b"VERA"
+            struct.pack_into(">HH", bad_plain, 4, 5, 0x010B)
+            struct.pack_into(">QQQ", bad_plain, 36, 0x0000400000000000, 131072, 0x0000400000000000)
+            struct.pack_into(">I", bad_plain, 8, zlib.crc32(bad_plain[192:448]) & 0xFFFFFFFF)
+            struct.pack_into(">I", bad_plain, 188, zlib.crc32(bad_plain[0:188]) & 0xFFFFFFFF)
+            good_vol[64:512] = aes256_xts_encrypt(dk_p[:32], dk_p[32:64], bytes(bad_plain), 0)
+
+            hc_bak_corr = os.path.join(tmp, "corrupt_pri_valid_bak.hc")
+            with open(hc_bak_corr, "wb") as f:
+                f.write(good_vol)
+            out_bak_corr = os.path.join(tmp, "out_bak_corr")
+            rc, out = run_myrkr(exe, ["decrypt", hc_bak_corr, "-o", out_bak_corr, "-p", "BackupCorruptPri!"])
+            assert rc == EXIT_OK, f"Backup fallback on corrupt primary failed: rc={rc} out={out}"
+            assert collect_extracted_files(out_bak_corr) == {"keep_me.txt": b"FAT16 boundary & clamping works!\n" * 20}
+            print("  [PASS] FAT16 clamping + empty FstClus=0 dir + Legacy V1 header + unaligned .tc + corrupt-primary backup recovery")
+        except Exception as exc:
+            failures += 1
+            print(f"  [FAIL] FAT16 / Legacy V1 / Backup recovery edge cases: {exc}")
+
+        # ---------------------------------------------------------------------
+        # Case 11: 4096-byte-sector exFAT (0xAA55 at +4094) & ext4 partial dir
+        #          block + sparse file > volume size
+        # ---------------------------------------------------------------------
+        try:
+            bps_s = 12  # 4096B sector!
+            spc_s = 1   # 8192B cluster
+            bps4 = 1 << bps_s
+            spc4 = 1 << spc_s
+            cb4 = bps4 * spc4
+            fo_sec, fl_sec, ho_sec, ncl4 = 24, 1, 32, 32
+            exf4 = bytearray((ho_sec + ncl4 * spc4) * bps4)
+            exf4[0:3] = b"\xEB\x76\x90"
+            exf4[3:11] = b"EXFAT   "
+            struct.pack_into("<QIIII", exf4, 72, ho_sec + ncl4 * spc4, fo_sec, fl_sec, ho_sec, ncl4)
+            struct.pack_into("<I", exf4, 96, 2)
+            exf4[108] = bps_s
+            exf4[109] = spc_s
+            exf4[110] = 1
+            # +510 is 0x0000; 0xAA55 is at +4094 per exFAT spec §3.1.20!
+            assert exf4[510:512] == b"\x00\x00"
+            struct.pack_into("<H", exf4, bps4 - 2, 0xAA55)
+            struct.pack_into("<III", exf4, fo_sec * bps4, 0xFFFFFFF8, 0xFFFFFFFF, 0xFFFFFFFF)
+
+            p4k = b"4096-byte native sector exFAT payload!\n" * 250
+            exf4[(ho_sec + 2 * spc4) * bps4 : (ho_sec + 2 * spc4) * bps4 + len(p4k)] = p4k
+            rdir4 = _make_exfat_entry_set("sector4k_ok.bin", False, 4, len(p4k), len(p4k), True)
+            exf4[ho_sec * bps4 : ho_sec * bps4 + len(rdir4)] = rdir4
+
+            hc_4k = os.path.join(tmp, "exfat_4k.hc")
+            with open(hc_4k, "wb") as f:
+                f.write(
+                    build_tcvc_volume(
+                        bytes(exf4), b"Exfat4kPass!", [], is_vera=True, kdf_alg="blake2s", salt_seed=b"4k", sec_size=4096
+                    )
+                )
+            out_4k = os.path.join(tmp, "out_exf4k")
+            rc, out = run_myrkr(exe, ["decrypt", hc_4k, "-o", out_4k, "-p", "Exfat4kPass!"])
+            assert rc == EXIT_OK, f"4K-sector exFAT decrypt failed: rc={rc} out={out}"
+            assert collect_extracted_files(out_4k) == {"sector4k_ok.bin": p4k}
+
+            # ext4 partial directory i_size (512B < 4096B block) + sparse file i_size > volume size
+            ext4_mod, ext4_exp = build_ext4_image()
+            ext4_m = bytearray(ext4_mod)
+            # Shrink subdir "log" (inode 11, at 2*4096 + 10*256) i_size from 4096 to 512,
+            # adjusting last dirent rec_len to end at 512!
+            log_blk_off = 12 * 4096
+            d0_len = struct.unpack_from("<H", ext4_m, log_blk_off + 4)[0]
+            d1_len = struct.unpack_from("<H", ext4_m, log_blk_off + d0_len + 4)[0]
+            struct.pack_into("<H", ext4_m, log_blk_off + d0_len + d1_len + 4, 512 - d0_len - d1_len)
+            ino11_off = 2 * 4096 + (11 - 1) * 256
+            struct.pack_into("<I", ext4_m, ino11_off + 4, 512)
+            # Inflate inode 12 logical i_size to 512 KiB (> 256 KiB volume!) -> trailing sparse zeros
+            ino12_off = 2 * 4096 + (12 - 1) * 256
+            old_f12 = ext4_exp["var/log/ext4_tree_uninit.bin"]
+            new_sz = 512 * 1024
+            struct.pack_into("<I", ext4_m, ino12_off + 4, new_sz)
+            ext4_exp["var/log/ext4_tree_uninit.bin"] = old_f12 + (b"\x00" * (new_sz - len(old_f12)))
+
+            hc_ext4_edge = os.path.join(tmp, "ext4_edge.hc")
+            with open(hc_ext4_edge, "wb") as f:
+                f.write(build_tcvc_volume(bytes(ext4_m), b"Ext4Edge!", [], is_vera=True, kdf_alg="sha256", salt_seed=b"e4e"))
+            out_e4e = os.path.join(tmp, "out_e4e")
+            rc, out = run_myrkr(exe, ["decrypt", hc_ext4_edge, "-o", out_e4e, "-p", "Ext4Edge!"])
+            assert rc == EXIT_OK, f"ext4 partial-dir/sparse decrypt failed: rc={rc} out={out}"
+            assert_tree_matches(collect_extracted_files(out_e4e), ext4_exp, "VC-ext4-edge")
+            print("  [PASS] 4096B-sector exFAT (0xAA55 at +4094) & ext4 partial-block dir + sparse file > vol")
+        except Exception as exc:
+            failures += 1
+            print(f"  [FAIL] 4K exFAT / ext4 edge cases: {exc}")
 
     if failures:
         print(f"FAILED: {failures} test case(s)")

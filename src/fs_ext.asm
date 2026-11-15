@@ -42,8 +42,9 @@ EXT_FL_EXTENTS          equ 00080000h
 EXT_FL_INLINE_DATA      equ 10000000h
 
 EXT_MAX_DEPTH           equ 64
-EXT_MAX_DIRS            equ 16384
+EXT_MAX_DIRS            equ 262144
 EXT_MAX_DIR_BYTES       equ 04000000h   ; 64 MiB directory cap
+EXT_MAX_FSIZE           equ 00007FFFFFFFFFFFh
 
 .data?
 align 8
@@ -63,7 +64,7 @@ g_ext_is64              dd ?
 g_ext_vis_cnt           dd ?
 
 align 4
-g_ext_vis_ino           dd EXT_MAX_DIRS dup (?)
+g_ext_anc_ino           dd (EXT_MAX_DEPTH + 2) dup (?)
 
 align 16
 g_ext_inode_dir         db 1024 dup (?)
@@ -757,29 +758,35 @@ edn_out:
 ext_decode_name endp
 
 ; =============================================================================
-; ext_mark_dir_visited(ecx = ino) -> eax = 0 ok, 1 dup / full
+; ext_mark_dir_visited(ecx = ino, edx = depth) -> eax = EXIT_*
+; Checks active ancestor stack [0..depth-1] for directory cycles, records ino
+; at g_ext_anc_ino[depth], and bounds total directories visited.
 ; =============================================================================
 ext_mark_dir_visited proc
-    mov     edx, dword ptr [g_ext_vis_cnt]
-    lea     r8,  [g_ext_vis_ino]
+    lea     r8,  [g_ext_anc_ino]
     xor     eax, eax
 emdv_lp:
     cmp     eax, edx
-    jae     emdv_add
+    jae     emdv_anc_ok
     cmp     dword ptr [r8 + rax*4], ecx
-    je      emdv_dup
+    je      emdv_cycle
     inc     eax
     jmp     emdv_lp
-emdv_add:
-    cmp     edx, EXT_MAX_DIRS
-    jae     emdv_dup
-    mov     dword ptr [r8 + rdx*4], ecx
-    inc     edx
-    mov     dword ptr [g_ext_vis_cnt], edx
+emdv_anc_ok:
+    mov     eax, dword ptr [g_ext_vis_cnt]
+    cmp     eax, EXT_MAX_DIRS
+    jae     emdv_oom
+    inc     eax
+    mov     dword ptr [g_ext_vis_cnt], eax
+    mov     eax, edx
+    mov     dword ptr [r8 + rax*4], ecx
     xor     eax, eax
     ret
-emdv_dup:
-    mov     eax, 1
+emdv_cycle:
+    mov     eax, EXIT_CORRUPT
+    ret
+emdv_oom:
+    mov     eax, EXIT_OOM
     ret
 ext_mark_dir_visited endp
 
@@ -813,9 +820,10 @@ ext_walk_dir proc frame
     mov     dword ptr [rbp-96], edx         ; prefixLen
     mov     dword ptr [rbp-92], r8d         ; depth
 
+    mov     edx, r8d
     call    ext_mark_dir_visited
     test    eax, eax
-    jnz     ewd_corrupt
+    jnz     ewd_out
 
     mov     ecx, dword ptr [rbp-104]
     lea     rdx, [g_ext_inode_dir]
@@ -834,7 +842,9 @@ ext_walk_dir proc frame
     ja      ewd_corrupt
     mov     qword ptr [rbp-72], rax
 
-    ; numDirBlks = dirSize / blockBytes
+    ; numDirBlks = (dirSize + blockBytes - 1) >> bshift
+    mov     rdx, qword ptr [g_ext_bsize]
+    lea     rax, [rax + rdx - 1]
     mov     ecx, dword ptr [g_ext_bshift]
     shr     rax, cl
     mov     qword ptr [rbp-112], rax
@@ -880,7 +890,15 @@ ewd_blk_lp:
 
     mov     rsi, qword ptr [rbp-80]         ; block base
     xor     r12d, r12d                      ; off within block
-    mov     r13d, dword ptr [g_ext_bsize]   ; blockBytes
+    mov     rax, qword ptr [rbp-120]
+    mov     ecx, dword ptr [g_ext_bshift]
+    shl     rax, cl
+    mov     rdx, qword ptr [rbp-72]         ; dirSize
+    sub     rdx, rax
+    mov     r13, qword ptr [g_ext_bsize]
+    cmp     rdx, r13
+    jae     ewd_ent_lp
+    mov     r13d, edx
 
 ewd_ent_lp:
     cmp     r12d, r13d
@@ -967,10 +985,11 @@ ewd_cp_p:
     cmp     edi, EXT_S_IFDIR
     je      ewd_is_dir
 
-    ; Regular file
+    ; Regular file (including sparse files where logical i_size > volume size)
     lea     rcx, [g_ext_inode_tmp]
     call    ext_inode_size
-    cmp     rax, qword ptr [g_ext_max_fsize]
+    mov     rcx, EXT_MAX_FSIZE
+    cmp     rax, rcx
     ja      ewd_corrupt
 
     mov     r8, rax                         ; size

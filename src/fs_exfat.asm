@@ -22,14 +22,13 @@ extern WideCharToMultiByte:proc
 externdef g_tcvc_data_size:qword
 
 EXF_CP_UTF8             equ 65001
-EXF_WC_ERR_INVALID      equ 80h
 
 EXF_ATTR_DIRECTORY      equ 10h
 EXF_FLAG_ALLOC_POSS     equ 01h
 EXF_FLAG_NO_FAT_CHAIN   equ 02h
 
 EXF_MAX_DEPTH           equ 64
-EXF_MAX_DIRS            equ 16384
+EXF_MAX_DIRS            equ 262144
 EXF_MAX_DIR_BYTES       equ 04000000h   ; 64 MiB directory stream cap
 
 ; Stream cursor layout (32 bytes on stack):
@@ -53,7 +52,7 @@ g_exf_root_clus         dd ?
 g_exf_vis_cnt           dd ?
 
 align 4
-g_exf_vis_clus          dd EXF_MAX_DIRS dup (?)
+g_exf_anc_clus          dd (EXF_MAX_DEPTH + 2) dup (?)
 
 align 2
 g_exf_name_w            dw 272 dup (?)
@@ -71,9 +70,8 @@ g_exf_iobuf             db 65536 dup (?)
 ; =============================================================================
 public exfat_probe
 exfat_probe proc frame
-    FRAME_PROLOG 608
-    ; [rbp-16..40]  saved rbx, rsi, rdi, r12
-    ; [rsp+32..543] 512-byte boot sector
+    FRAME_PROLOG 64
+    ; [rbp-16..40] saved rbx, rsi, rdi, r12
     mov     qword ptr [rbp-16], rbx
     mov     qword ptr [rbp-24], rsi
     mov     qword ptr [rbp-32], rdi
@@ -83,23 +81,19 @@ exfat_probe proc frame
     jb      ep_not_exf
 
     xor     ecx, ecx
-    lea     rdx, [rsp+32]
+    lea     rdx, [g_exf_iobuf]
     mov     r8d, 512
     call    tcvc_read_bytes
     test    eax, eax
     jnz     ep_not_exf
 
-    lea     rsi, [rsp+32]
+    lea     rsi, [g_exf_iobuf]
 
     ; Check FileSystemName == "EXFAT   " at +3..10
     mov     rax, qword ptr [rsi+3]
     mov     rdx, 02020205441465845h
     cmp     rax, rdx
     jne     ep_not_exf
-
-    ; Once "EXFAT   " matched, any structural violation is EXIT_CORRUPT (-1)
-    cmp     word ptr [rsi+510], 0AA55h
-    jne     ep_corrupt
 
     ; MustBeZero (+11..63, 53 bytes) must all be 0
     mov     ecx, 11
@@ -116,6 +110,24 @@ ep_mbz:
     jb      ep_corrupt
     cmp     ebx, 12
     ja      ep_corrupt
+
+    ; Per Microsoft exFAT spec §3.1.20, BootSignature 0xAA55 sits at BytesPerSector - 2
+    mov     ecx, ebx
+    mov     r8d, 1
+    shl     r8d, cl                         ; sectorBytes (512..4096)
+    cmp     ebx, 9
+    je      ep_chk_bootsig
+    xor     ecx, ecx
+    mov     rdx, rsi
+    call    tcvc_read_bytes
+    test    eax, eax
+    jnz     ep_corrupt
+    mov     ecx, ebx
+    mov     r8d, 1
+    shl     r8d, cl
+ep_chk_bootsig:
+    cmp     word ptr [rsi + r8 - 2], 0AA55h
+    jne     ep_corrupt
 
     ; SectorsPerClusterShift (+109): ebx + edi <= 25 (<= 32 MiB per cluster)
     movzx   edi, byte ptr [rsi+109]
@@ -183,13 +195,9 @@ ep_mbz:
 
     mov     ecx, ebx
     mov     rdx, r10
-    shl     rdx, cl                         ; FatByteLen
-    ; Verify FAT covers (maxclus + 1) * 4 bytes
-    mov     eax, dword ptr [g_exf_maxclus]
-    inc     rax
-    shl     rax, 2
-    cmp     rax, rdx
-    ja      ep_corrupt
+    shl     rdx, cl                         ; FatByteLen (exf_next_cluster enforces fat_end)
+    cmp     rdx, 12
+    jb      ep_corrupt
 
     mov     rax, qword ptr [g_exf_fat_off]
     add     rax, rdx
@@ -277,29 +285,35 @@ enc_out:
 exf_next_cluster endp
 
 ; =============================================================================
-; exf_mark_dir_visited(ecx = cluster) -> eax = 0 ok, 1 duplicate/full
+; exf_mark_dir_visited(ecx = cluster, edx = depth) -> eax = EXIT_*
+; Checks active ancestor stack [0..depth-1] for directory cycles, records
+; cluster at g_exf_anc_clus[depth], and bounds total directories visited.
 ; =============================================================================
 exf_mark_dir_visited proc
-    mov     edx, dword ptr [g_exf_vis_cnt]
-    lea     r8,  [g_exf_vis_clus]
+    lea     r8,  [g_exf_anc_clus]
     xor     eax, eax
 emdv_lp:
     cmp     eax, edx
-    jae     emdv_add
+    jae     emdv_anc_ok
     cmp     dword ptr [r8 + rax*4], ecx
-    je      emdv_dup
+    je      emdv_cycle
     inc     eax
     jmp     emdv_lp
-emdv_add:
-    cmp     edx, EXF_MAX_DIRS
-    jae     emdv_dup
-    mov     dword ptr [r8 + rdx*4], ecx
-    inc     edx
-    mov     dword ptr [g_exf_vis_cnt], edx
+emdv_anc_ok:
+    mov     eax, dword ptr [g_exf_vis_cnt]
+    cmp     eax, EXF_MAX_DIRS
+    jae     emdv_oom
+    inc     eax
+    mov     dword ptr [g_exf_vis_cnt], eax
+    mov     eax, edx
+    mov     dword ptr [r8 + rax*4], ecx
     xor     eax, eax
     ret
-emdv_dup:
-    mov     eax, 1
+emdv_cycle:
+    mov     eax, EXIT_CORRUPT
+    ret
+emdv_oom:
+    mov     eax, EXIT_OOM
     ret
 exf_mark_dir_visited endp
 
@@ -463,9 +477,10 @@ ewd_dir_cap:
     mov     dword ptr [rbp-136 + EXFS_steps], 0
     mov     dword ptr [rbp-136 + EXFS_noFatChain], r8d
 
+    mov     edx, dword ptr [rbp-72]
     call    exf_mark_dir_visited
     test    eax, eax
-    jnz     ewd_corrupt
+    jnz     ewd_ret
 
 ewd_loop:
     lea     rcx, [rbp-136]
@@ -595,7 +610,7 @@ ewd_fn_next_ent:
     jmp     ewd_fn_ent
 
 ewd_fn_done:
-    WINCALL WideCharToMultiByte, EXF_CP_UTF8, EXF_WC_ERR_INVALID, addr g_exf_name_w, r13d, addr g_exf_comp8, 1020, 0, 0
+    WINCALL WideCharToMultiByte, EXF_CP_UTF8, 0, addr g_exf_name_w, r13d, addr g_exf_comp8, 1020, 0, 0
     test    eax, eax
     jz      ewd_corrupt
     mov     r14d, eax                       ; compLen
