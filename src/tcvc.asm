@@ -71,7 +71,11 @@ extern pick_has:proc
 extern progress_begin:proc
 extern progress_add:proc
 extern progress_done:proc
+extern rlog_current:proc
 extern rlog_extracted:proc
+extern drag_tcvc_tick:proc
+externdef g_prog_abort:dword
+externdef g_drag_prog:dword
 extern print_a:proc
 extern print_err:proc
 extern print_u64:proc
@@ -90,6 +94,10 @@ extern ext_extract_entry:proc
 extern hfsplus_probe:proc
 extern hfsplus_enum:proc
 extern hfsplus_extract_entry:proc
+extern cfmount_lock:proc
+extern cfmount_unlock:proc
+extern cfmount_letter:proc
+extern cfmount_unmount_if_tcvc:proc
 
 externdef g_idxptr:qword
 externdef g_idxlen:qword
@@ -161,6 +169,7 @@ TCVC_MEM_COMMIT_RES     equ 3000h
 TCVC_MEM_RELEASE        equ 8000h
 TCVC_PAGE_RW            equ 04h
 TCVC_INFINITE           equ 0FFFFFFFFh
+TCVC_SINK_STOP          equ 99          ; windowed range-read reached requested end
 
 ; Per-worker slot in transient VirtualAlloc unlock arena (6 workers * 26624 = 159744)
 ;   [0     .. 25551]  worker XTS_CTX (25552 bytes, 16-aligned)
@@ -284,6 +293,24 @@ tcvc_kdf_names label qword
 tcvc_fs_names label qword
     dq ws_tc_unk, ws_tc_f1, ws_tc_f2, ws_tc_f3, ws_tc_f4, ws_tc_f5, ws_tc_f6, ws_tc_f7
 
+; Volume-root OS metadata folders and system files excluded from enumeration
+tcvc_sys_roots label byte
+    db 12, "$recycle.bin"
+    db  8, "recycler"
+    db  8, "recycled"
+    db 25, "system volume information"
+    db 12, "pagefile.sys"
+    db 12, "hiberfil.sys"
+    db 12, "swapfile.sys"
+    db 13, "dumpstack.log"
+    db 17, "dumpstack.log.tmp"
+    db 15, ".spotlight-v100"
+    db 10, ".fseventsd"
+    db  8, ".trashes"
+    db 15, ".temporaryitems"
+    db 16, ".volumeicon.icns"
+    db  0
+
 .data?
 align 16
 public g_tcvc_sec
@@ -313,6 +340,10 @@ g_tcvc_mem          dq ?
 g_tcvc_memcap       dq ?
 g_tcvc_memlen       dq ?
 g_tcvc_fcount       dq ?
+g_tcvc_win_off      dq ?
+g_tcvc_win_len      dq ?
+g_tcvc_win_pos      dq ?
+g_tcvc_win_got      dq ?
 
 g_kf_count          dd ?
 g_tcvc_fs_id        dd ?
@@ -326,6 +357,7 @@ g_tcvc_pw_len       dd ?
 g_tcvc_tables_ready dd ?
 g_tcvc_abort        dd ?
 g_tcvc_win_slot     dd ?
+g_tcvc_win_active   dd ?
 
 align 8
 g_tcvc_wfd          db 600 dup (?)          ; WIN32_FIND_DATAW (592 bytes)
@@ -1894,6 +1926,7 @@ tcvc_raw_read endp
 public tcvc_close
 tcvc_close proc frame
     FRAME_PROLOG 32
+    call    cfmount_unmount_if_tcvc
     mov     rcx, qword ptr [g_tcvc_cache_ptr]
     test    rcx, rcx
     jz      tcc_nocache
@@ -2529,6 +2562,54 @@ tipa_out:
 tcvc_idx_parents endp
 
 ; =============================================================================
+; tcvc_is_sys_root(rcx = nameUtf8, edx = nameLen) -> eax = 1 if OS system root
+; Case-insensitively matches standard OS volume metadata at the volume root.
+; Leaf proc; clobbers only volatile rax, r8, r9, r10, r11.
+; =============================================================================
+public tcvc_is_sys_root
+tcvc_is_sys_root proc
+    test    rcx, rcx
+    jz      tisr_no
+    test    edx, edx
+    jz      tisr_no
+
+    lea     r8, [tcvc_sys_roots]
+tisr_entry:
+    movzx   r9d, byte ptr [r8]
+    test    r9d, r9d
+    jz      tisr_no
+    inc     r8
+    cmp     edx, r9d
+    jne     tisr_next
+
+    xor     r10d, r10d
+tisr_cmp:
+    movzx   eax, byte ptr [rcx + r10]
+    cmp     al, 'A'
+    jb      tisr_lc
+    cmp     al, 'Z'
+    ja      tisr_lc
+    add     al, 20h
+tisr_lc:
+    cmp     al, byte ptr [r8 + r10]
+    jne     tisr_next
+    inc     r10d
+    cmp     r10d, r9d
+    jb      tisr_cmp
+
+    mov     eax, 1
+    ret
+
+tisr_next:
+    add     r8, r9
+    jmp     tisr_entry
+
+tisr_no:
+    xor     eax, eax
+    ret
+tcvc_is_sys_root endp
+
+; =============================================================================
 ; tcvc_idx_add(rcx = nameUtf8, edx = nameLen, r8 = size, r9d = flags,
 ;              [rbp+48] = meta0, [rbp+56] = meta1, [rbp+64] = meta2) -> eax = EXIT_*
 ; =============================================================================
@@ -2581,6 +2662,24 @@ tia_trimmed:
     mov     r13d, eax                       ; normLen
     mov     byte ptr [rdi + rax], 0
 
+    ; Filter OS volume-root metadata ($RECYCLE.BIN, System Volume Information, etc.)
+    xor     edx, edx
+tia_root_seg:
+    cmp     edx, r13d
+    jae     tia_chk_sys
+    cmp     byte ptr [rdi + rdx], '/'
+    je      tia_chk_sys
+    inc     edx
+    jmp     tia_root_seg
+tia_chk_sys:
+    mov     rcx, rdi
+    call    tcvc_is_sys_root
+    test    eax, eax
+    jz      tia_parents
+    xor     eax, eax
+    jmp     tia_out
+
+tia_parents:
     ; Synthesize missing parent directories
     lea     rcx, [g_tcvc_idxname]
     mov     edx, r13d
@@ -2632,6 +2731,55 @@ tcvc_sink_write proc frame
     mov     rsi, rcx
     mov     ebx, edx
 
+    cmp     dword ptr [g_tcvc_win_active], 0
+    je      tsw_chk_mem
+
+    ; Windowed range-read sink (used by cfmount FetchData via tcvc_read_range)
+    mov     r8,  qword ptr [g_tcvc_win_pos] ; curStart
+    mov     r9,  r8
+    add     r9,  rbx                        ; curEnd
+    jc      tsw_corrupt
+    mov     qword ptr [g_tcvc_win_pos], r9
+    mov     r10, qword ptr [g_tcvc_win_off] ; winStart
+    mov     r11, r10
+    add     r11, qword ptr [g_tcvc_win_len] ; winEnd
+
+    cmp     r9,  r10
+    jbe     tsw_ok                          ; entire chunk precedes window
+    cmp     r8,  r11
+    jae     tsw_stop                        ; already past window
+
+    mov     rax, r8                         ; ovStart = max(curStart, winStart)
+    cmp     rax, r10
+    jae     @F
+    mov     rax, r10
+@@:
+    mov     rcx, r9                         ; ovEnd = min(curEnd, winEnd)
+    cmp     rcx, r11
+    jbe     @F
+    mov     rcx, r11
+@@:
+    sub     rcx, rax                        ; copyLen = ovEnd - ovStart
+    jz      tsw_win_chk
+
+    mov     rdx, rax
+    sub     rdx, r8                         ; skipBytes = ovStart - curStart
+    add     rsi, rdx
+    mov     rdi, qword ptr [g_tcvc_mem]
+    add     rdi, qword ptr [g_tcvc_win_got]
+    add     qword ptr [g_tcvc_win_got], rcx
+    rep     movsb
+
+tsw_win_chk:
+    cmp     r9,  r11
+    jae     tsw_stop
+    jmp     tsw_ok
+
+tsw_stop:
+    mov     eax, TCVC_SINK_STOP
+    jmp     tsw_out
+
+tsw_chk_mem:
     mov     rdi, qword ptr [g_tcvc_mem]
     test    rdi, rdi
     jz      tsw_disk
@@ -2646,6 +2794,11 @@ tcvc_sink_write proc frame
     mov     ecx, ebx
     rep     movsb
     mov     qword ptr [g_tcvc_memlen], rax
+    cmp     dword ptr [g_drag_prog], 0
+    je      tsw_ok
+    mov     ecx, ebx
+    call    progress_add
+    call    drag_tcvc_tick
     jmp     tsw_ok
 
 tsw_disk:
@@ -2822,11 +2975,14 @@ tcvc_extract_entry proc frame
     mov     qword ptr [rbp-24], rbx
 
     mov     r12, rcx                        ; idxEntPtr
+    call    cfmount_lock
+    mov     dword ptr [g_tcvc_win_active], 0
     mov     qword ptr [g_tcvc_mem], 0
     mov     qword ptr [g_tcvc_memcap], 0
     mov     qword ptr [g_tcvc_memlen], 0
     mov     qword ptr [g_tcvc_hout], -1
 
+    mov     rcx, r12
     call    entry_path
     test    eax, eax
     jz      tee_path_ok
@@ -2847,6 +3003,9 @@ tee_path_ok:
     jmp     tee_out
 
 tee_file:
+    lea     rcx, [r12 + IDXE_name]
+    mov     edx, dword ptr [r12 + IDXE_namelen]
+    call    rlog_current
     lea     rcx, [g_extw]
     call    extract_guard
     test    eax, eax
@@ -2940,6 +3099,9 @@ tee_io:
     mov     eax, EXIT_IO
 
 tee_out:
+    mov     dword ptr [rbp-32], eax
+    call    cfmount_unlock
+    mov     eax, dword ptr [rbp-32]
     mov     r12, qword ptr [rbp-16]
     mov     rbx, qword ptr [rbp-24]
     FRAME_EPILOG
@@ -3058,6 +3220,11 @@ tea_norm_out:
 tea_loop:
     test    r13, r13
     jz      tea_done
+    cmp     dword ptr [g_prog_abort], 0
+    je      @F
+    mov     eax, EXIT_CANCELLED
+    jmp     tea_out
+@@:
 
     mov     rax, r12
     add     rax, IDXE_FIXED
@@ -3350,7 +3517,7 @@ tcvc_wcat endp
 ; =============================================================================
 public tcvc_format_status
 tcvc_format_status proc frame
-    FRAME_PROLOG 64
+    FRAME_PROLOG 80
     mov     qword ptr [rbp-16], rbx
     mov     qword ptr [rbp-24], r12
     mov     qword ptr [rbp-32], r13
@@ -3447,6 +3614,29 @@ tfs_fs:
     call    tcvc_wcat
     mov     r13d, eax
 
+    ; 4b. Optional mounted drive letter (e.g. "Z:\ · ")
+    call    cfmount_letter
+    test    eax, eax
+    jz      tfs_ro
+    mov     word ptr [rbp-48], ax
+    mov     word ptr [rbp-46], ':'
+    mov     word ptr [rbp-44], '\'
+    mov     word ptr [rbp-42], 0
+    mov     rcx, rbx
+    mov     edx, r13d
+    mov     r8d, r12d
+    lea     r9, [rbp-48]
+    call    tcvc_wcat
+    mov     r13d, eax
+
+    mov     rcx, rbx
+    mov     edx, r13d
+    mov     r8d, r12d
+    lea     r9, [ws_tc_sep]
+    call    tcvc_wcat
+    mov     r13d, eax
+
+tfs_ro:
     ; 5. Read-Only (XTS) notice
     mov     rcx, rbx
     mov     edx, r13d
@@ -3468,7 +3658,7 @@ tcvc_format_status endp
 ; =============================================================================
 public tcvc_entry_to_mem
 tcvc_entry_to_mem proc frame
-    FRAME_PROLOG 80
+    FRAME_PROLOG 96
     mov     qword ptr [rbp-16], rbx
     mov     qword ptr [rbp-24], r12
     mov     qword ptr [rbp-32], r13
@@ -3491,12 +3681,18 @@ tcvc_entry_to_mem proc frame
     cmp     r14, 20000000h                  ; 512 MiB cap for in-RAM drag stream
     ja      tem_oom
 
+    lea     rcx, [r12 + IDXE_name]
+    mov     edx, dword ptr [r12 + IDXE_namelen]
+    call    rlog_current
+
     mov     rcx, r14
     call    mem_alloc
     test    rax, rax
     jz      tem_oom
     mov     rbx, rax                        ; allocated buffer
 
+    call    cfmount_lock
+    mov     dword ptr [g_tcvc_win_active], 0
     mov     qword ptr [g_tcvc_mem], rbx
     mov     qword ptr [g_tcvc_memcap], r14
     mov     qword ptr [g_tcvc_memlen], 0
@@ -3536,6 +3732,9 @@ tem_hfs:
 tem_done_fs:
     mov     qword ptr [g_tcvc_mem], 0
     mov     qword ptr [g_tcvc_memcap], 0
+    mov     dword ptr [rbp-48], eax
+    call    cfmount_unlock
+    mov     eax, dword ptr [rbp-48]
     test    eax, eax
     jnz     tem_err_free
 
@@ -3551,6 +3750,7 @@ tem_done_fs:
 tem_unsup_free:
     mov     qword ptr [g_tcvc_mem], 0
     mov     qword ptr [g_tcvc_memcap], 0
+    call    cfmount_unlock
     mov     eax, EXIT_UNSUPPORTED
     jmp     tem_err_free
 tem_corrupt_free:
@@ -3580,6 +3780,113 @@ tem_out:
     FRAME_EPILOG
     ret
 tcvc_entry_to_mem endp
+
+; =============================================================================
+; tcvc_read_range(rcx = idxEntFixed40Ptr, rdx = reqOff, r8 = dstBuf, r9 = reqLen)
+;   -> rax = bytesRead (>= 0), or -1 on error.
+; Caller MUST hold cfmount_lock.
+; =============================================================================
+public tcvc_read_range
+tcvc_read_range proc frame
+    FRAME_PROLOG 64
+    mov     qword ptr [rbp-16], rbx
+    mov     qword ptr [rbp-24], r12
+
+    cmp     dword ptr [g_tcvc_open_flag], 0
+    je      trr_err
+    test    rcx, rcx
+    jz      trr_err
+    test    r8, r8
+    jz      trr_err
+    test    dword ptr [rcx + IDXE_flags], IDXEF_DIR
+    jnz     trr_zero
+    test    r9, r9
+    jz      trr_zero
+
+    mov     rax, qword ptr [rcx + IDXE_size]
+    cmp     rdx, rax
+    jae     trr_zero
+    sub     rax, rdx                        ; avail = fileSize - reqOff
+    cmp     r9, rax
+    jbe     @F
+    mov     r9, rax                         ; wantLen = min(reqLen, avail)
+@@:
+    mov     rbx, r9                         ; wantLen
+    mov     r12, rcx                        ; idxEntFixed40Ptr
+
+    mov     qword ptr [g_tcvc_mem], r8
+    mov     qword ptr [g_tcvc_memcap], rbx
+    mov     qword ptr [g_tcvc_memlen], 0
+    mov     qword ptr [g_tcvc_hout], -1
+    mov     qword ptr [g_tcvc_win_off], rdx
+    mov     qword ptr [g_tcvc_win_len], rbx
+    mov     qword ptr [g_tcvc_win_pos], 0
+    mov     qword ptr [g_tcvc_win_got], 0
+    mov     dword ptr [g_tcvc_win_active], 1
+
+    mov     rcx, r12
+    mov     eax, dword ptr [g_tcvc_fs_id]
+    cmp     eax, TCVC_FS_EXFAT
+    je      trr_exfat
+    cmp     eax, TCVC_FS_NTFS
+    je      trr_ntfs
+    cmp     eax, TCVC_FS_EXT
+    je      trr_ext
+    cmp     eax, TCVC_FS_HFSPLUS
+    je      trr_hfs
+    cmp     eax, TCVC_FS_FAT12
+    jb      trr_unsup
+    cmp     eax, TCVC_FS_FAT32
+    jbe     trr_fat
+    jmp     trr_unsup
+
+trr_fat:
+    call    fat_extract_entry
+    jmp     trr_done
+trr_exfat:
+    call    exfat_extract_entry
+    jmp     trr_done
+trr_ntfs:
+    call    ntfs_extract_entry
+    jmp     trr_done
+trr_ext:
+    call    ext_extract_entry
+    jmp     trr_done
+trr_hfs:
+    call    hfsplus_extract_entry
+    jmp     trr_done
+trr_unsup:
+    mov     eax, EXIT_UNSUPPORTED
+
+trr_done:
+    mov     dword ptr [g_tcvc_win_active], 0
+    mov     qword ptr [g_tcvc_mem], 0
+    mov     qword ptr [g_tcvc_memcap], 0
+
+    test    eax, eax
+    jz      trr_chk_got
+    cmp     eax, TCVC_SINK_STOP
+    jne     trr_err
+
+trr_chk_got:
+    cmp     qword ptr [g_tcvc_win_got], rbx
+    jne     trr_err
+    mov     rax, rbx
+    jmp     trr_out
+
+trr_zero:
+    xor     eax, eax
+    jmp     trr_out
+
+trr_err:
+    mov     rax, -1
+
+trr_out:
+    mov     rbx, qword ptr [rbp-16]
+    mov     r12, qword ptr [rbp-24]
+    FRAME_EPILOG
+    ret
+tcvc_read_range endp
 
 ; =============================================================================
 ; do_tcvc_gui_extract() -> eax = EXIT_*

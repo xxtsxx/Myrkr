@@ -17,6 +17,7 @@ include macros.inc
 
 extern tcvc_read_bytes:proc
 extern tcvc_idx_add:proc
+extern tcvc_is_sys_root:proc
 extern tcvc_sink_write:proc
 extern secure_zero:proc
 extern mem_alloc:proc
@@ -965,6 +966,14 @@ ewd_dec_nm:
     jne     ewd_ent_adv                     ; skip symlinks, sockets, FIFOs, devices!
 
 ewd_build_p:
+    cmp     dword ptr [rbp-96], 0
+    jne     ewd_not_sys
+    lea     rcx, [g_ext_comp8]
+    mov     edx, r14d
+    call    tcvc_is_sys_root
+    test    eax, eax
+    jnz     ewd_ent_adv
+ewd_not_sys:
     mov     ecx, dword ptr [rbp-96]         ; prefixLen
     lea     eax, [ecx + r14d]
     cmp     eax, ENTRY_NAME_MAX

@@ -237,6 +237,12 @@ extern do_create:proc
 extern do_add_tree:proc
 extern es_drag:proc
 extern es_key_live:proc
+extern cfmount_sweep_stale:proc
+extern cfmount_mount:proc
+extern cfmount_unmount:proc
+extern cfmount_is_mounted:proc
+extern cfmount_letter:proc
+extern cfmount_open_explorer:proc
 DO_count            equ 16                   ; mirrors estream.asm
 DRAGNAME_BYTES      equ 4096
 externdef g_idxlen:qword
@@ -313,6 +319,7 @@ extern DrawTextW:proc
 extern GetTextExtentPoint32W:proc
 extern FillRect:proc
 extern FrameRect:proc
+extern BitBlt:proc
 extern TextOutW:proc
 extern LoadImageW:proc
 extern DrawIconEx:proc
@@ -339,6 +346,7 @@ externdef g_cfg_m:dword                     ; Argon2 memory, KiB (main.asm)
 WS_POPUP            equ 080000000h
 WS_CLIPCHILDREN     equ 002000000h          ; keep the parent out of child rects
 WS_CLIPSIBLINGS     equ 004000000h          ; keep a child out of its siblings' rects
+WS_EX_TOPMOST       equ 000000008h          ; stay above normal windows
 WS_EX_TOOLWINDOW    equ 000000080h          ; no taskbar / alt-tab entry
 WS_EX_LAYERED       equ 000080000h          ; translucent (alpha) window
 LWA_ALPHA           equ 000000002h
@@ -451,6 +459,7 @@ ST_CRUMB            equ WS_CHILD or WS_VISIBLE or WS_CLIPSIBLINGS or SS_OWNERDRA
 ; is shown (toggle_menu), so the only sibling that can ever be above it is the
 ; flyout it is meant to yield to.
 ST_MENUHOST         equ WS_CHILD or WS_CLIPSIBLINGS
+ST_BUSYHIDE         equ WS_CHILD or WS_CLIPSIBLINGS or SS_OWNERDRAW
 ; flat owner-drawn progress bars (strength meter + operation bar): solid fill,
 ; no border.  ST_BARHIDE starts hidden (shown by ShowWindow while running).
 ST_BARHIDE          equ WS_CHILD or SS_OWNERDRAW
@@ -685,7 +694,7 @@ LAY_BTN_GAP         equ 8                    ; gap between Exit and the action
 ; of the caption code the rest of the body reports.  Kept clear of every control
 ; (the sidebar starts at LAY_MARGIN, the list ends LAY_MARGIN from the right).
 LAY_EDGE            equ 6                    ; resize gripper thickness
-LAY_MIN_W           equ 460                  ; below this the button row collides
+LAY_MIN_W           equ 496                  ; below this the command-bar buttons collide
 ; +STAT_BAND: the statistics row grew the band below the list, and without this
 ; the floor that used to leave three rows leaves two.  The minimum is about how
 ; much LIST survives, so it has to move with everything that is not the list.
@@ -810,6 +819,11 @@ ID_OPENTC           equ 171                  ; Open TrueCrypt/VeraCrypt containe
 ID_SDKFFILE         equ 172                  ; TC/VC prompt: + File keyfile picker
 ID_SDKFDIR          equ 173                  ; TC/VC prompt: + Folder keyfile picker
 ID_SDKFCLR          equ 174                  ; TC/VC prompt: Clear keyfiles
+ID_BUSY_BODY        equ 175                  ; open-ended spinner + sweep card
+ID_MOUNTDRV         equ 176                  ; Mount/unmount container as read-only drive
+BUSY_W              equ 360
+BUSY_H              equ 108
+SRCCOPY             equ 00CC0020h
 TCVC_MAX_KF         equ 64
 TCVC_MAX_PASS       equ 128
 ID_LOGLVL           equ 144                  ; log-level cycler button
@@ -978,10 +992,12 @@ GLYPH_REMOVE        equ 0E738h               ; minus      (Fluent "Remove")
 GLYPH_CLEAR         equ 0E894h               ; clear      (Fluent "Clear")
 GLYPH_CLOSE         equ 0E711h               ; x          (Fluent "Cancel")
 GLYPH_HARDDRIVE     equ 0EDA2h               ; volume     (Fluent "HardDrive")
+GLYPH_MAPDRIVE      equ 0E88Eh               ; drive      (Fluent "MapDrive")
 ; A glyph button with this flag draws its window text beside the glyph instead
 ; of centring the glyph alone - the command bar reads as labelled commands, the
 ; sidebar as bare icons.
 GLYPH_LABEL_BIT     equ 1
+GLYPH_ACTIVE_BIT    equ 2                    ; active/mounted emerald glyph ink
 ; ---- command bar ------------------------------------------------------------
 ; A horizontal strip of labelled commands above the list, in the manner of
 ; Outlook's.  It holds commands that act on the LIST; the sidebar holds the ones
@@ -1304,6 +1320,9 @@ WSTR s_tip_extract, <Copy entries out of the archive. The archive is unchanged.>
 WSTR s_tip_clear,     <Remove every item from the list>
 WSTR s_tip_settings,  <Settings>
 WSTR s_open_tcvc,     <Open TrueCrypt/VeraCrypt container>
+WSTR s_tip_mountdrv,  <Mount container as read-only drive>
+WSTR s_tip_unmount_pfx, <Unmount drive (>
+WSTR m_mount_fail,    <Could not mount the container as a drive letter. Windows Cloud Files may be unavailable on this edition, or no drive letters (D:-Z:) are free.>
 WSTR t_pick_kf,       <Select keyfile(s)>
 WSTR t_pick_kfdir,    <Select keyfile folder>
 WSTR s_kf_none,       <Keyfiles: none>
@@ -1702,6 +1721,15 @@ WSTR s_pg_of,      < of >
 WSTR s_rate_gap,   <  >
 WSTR s_rate_unit,  < MB/s  ETA >
 WSTR s_pg_items,   < items>       ; files AND folders - see draw_progwin
+WSTR wc_busy,      <myrkr_busy>
+WSTR s_busy_mount, <Opening container...>
+WSTR s_busy_vol,   <Mounting volume...>
+WSTR s_busy_kdf,   <Deriving keys and unlocking header...>
+WSTR s_busy_fs,    <Reading volume filesystem...>
+WSTR s_busy_drv,   <Preparing read-only drive for File Explorer...>
+WSTR s_busy_ext,   <Extracting files...>
+WSTR s_busy_prep,  <Preparing output files...>
+WSTR s_rate_mbs,   < MB/s>
 WSTR wc_logbox,    <myrkr_logbox>
 WSTR t_log,        <What happened>
 WSTR s_lb_copy,    <Copy>
@@ -2174,12 +2202,29 @@ g_sd_fmty    dd ?                            ; y of the format row, from the hei
 g_sd_done    dd ?                            ; 1 once the window is gone
 g_sd_reg     dd ?                            ; 1 once the class is registered
 g_hopentc    dq ?                            ; command bar: Open TC/VC container glyph
+g_hmountdrv  dq ?                            ; command bar: Mount/Unmount drive glyph
 g_sd_hkffile dq ?                            ; prompt: + File keyfile button
 g_sd_hkfdir  dq ?                            ; prompt: + Folder keyfile button
 g_sd_hkfclr  dq ?                            ; prompt: Clear keyfiles button
 g_sd_kftxt   dw 32 dup (?)                   ; prompt: "Keyfiles: N" scratch
 g_tcvc_statw dw STATUSW_CHARS dup (?)        ; status line for open TC/VC volume
+g_mrk_statw  dw STATUSW_CHARS dup (?)        ; status line for mounted .mrk container
+g_mount_tipw dw 48 dup (?)                   ; dynamic "Unmount drive (Z:)" tooltip
+g_remount_after_edit dd ?                    ; 1 = re-mount .mrk after add/remove finishes
 g_gui_kfslots dw (TCVC_MAX_KF*SLOT_CHARS) dup (?) ; wide keyfile path storage
+ALIGN 8
+g_hbusy_ctl   dq ?                           ; in-window child card over g_hlist
+g_busy_hwnd   dq ?                           ; popup card during container mount
+g_busy_body   dq ?                           ; SS_OWNERDRAW child of g_busy_hwnd
+g_drag_tickms dq ?                           ; 50ms throttle for drag_tcvc_tick
+g_prog_indet  dd ?                           ; 1 = open-ended animated progress
+g_busy_mode   dd ?                           ; 0 = mounting, 1 = extracting
+g_busy_phase  dd ?                           ; 0 = header KDF, 1 = FS enum, 2 = drive mount
+g_busy_reg    dd ?                           ; 1 once wc_busy is registered
+g_tcvc_mnt_rc dd ?                           ; EXIT_* from tcvc_mount_thread
+g_cfm_is_tcvc dd ?                           ; isTcvc input for cfmount_thread
+g_cfm_letter  dd ?                           ; drive letter output from cfmount_thread
+g_busy_rc     dd 4 dup (?)                   ; scratch RECT for busy card paint
 
 .code
 
@@ -2277,6 +2322,27 @@ gph_done:
     pop     rbp
     ret
 gui_protect_hwnd endp
+
+; =============================================================================
+; show_front_notopmost(rcx = hwnd) - show at top of Z-order above all normal
+; windows on creation without leaving the persistent WS_EX_TOPMOST flag set.
+; =============================================================================
+show_front_notopmost proc
+    push    rbp
+    mov     rbp, rsp
+    sub     rsp, 80
+    test    rcx, rcx
+    jz      sfn_done
+    mov     qword ptr [rbp-8], rcx
+    WINCALL SetWindowPos, qword ptr [rbp-8], -1, 0, 0, 0, 0, 0043h ; HWND_TOPMOST, SWP_NOSIZE|SWP_NOMOVE|SWP_SHOWWINDOW
+    WINCALL SetWindowPos, qword ptr [rbp-8], -2, 0, 0, 0, 0, 0043h ; HWND_NOTOPMOST, SWP_NOSIZE|SWP_NOMOVE|SWP_SHOWWINDOW
+    WINCALL SetForegroundWindow, qword ptr [rbp-8]
+    WINCALL UpdateWindow, qword ptr [rbp-8]
+sfn_done:
+    add     rsp, 80
+    pop     rbp
+    ret
+show_front_notopmost endp
 
 ; =============================================================================
 ; gui_hwnd_scrub(rcx = hwnd) - 3-step Win32 EDIT internal buffer & undo scrub.
@@ -3422,8 +3488,8 @@ mb_create:
     je      @F
     WINCALL EnableWindow, qword ptr [rbp-8], 0
 @@:
-    WINCALL ShowWindow, qword ptr [g_mb_hwnd], SW_SHOW
-    WINCALL UpdateWindow, qword ptr [g_mb_hwnd]
+    mov     rcx, qword ptr [g_mb_hwnd]
+    call    show_front_notopmost
 mb_loop:
     WINCALL GetMessageW, addr rbp-120, 0, 0, 0   ; MSG at [rbp-120..]
     test    eax, eax
@@ -3707,6 +3773,14 @@ sar_have:
     add     eax, '0'
     mov     word ptr [rcx], ax
     add     rcx, 2
+    cmp     qword ptr [g_prog_total], 0
+    jne     sar_with_eta
+    lea     rdx, [s_rate_mbs]
+    lea     r8, [rcx + 32*2]
+    call    wcopy
+    FRAME_EPILOG
+    ret
+sar_with_eta:
     lea     rdx, [s_rate_unit]
     lea     r8, [rcx + 32*2]
     call    wcopy
@@ -6602,6 +6676,7 @@ dl_hok:
     WINCALL SetWindowPos, qword ptr [g_haddfiles], 0, LV_X, CMDBAR_Y, CMD_ICON_W, CMDBAR_H-2, 014h
     WINCALL SetWindowPos, qword ptr [g_haddfolder], 0, LV_X + CMD_ICON_W, CMDBAR_Y, CMD_ICON_W, CMDBAR_H-2, 014h
     WINCALL SetWindowPos, qword ptr [g_hopentc], 0, LV_X + 2*CMD_ICON_W, CMDBAR_Y, CMD_ICON_W, CMDBAR_H-2, 014h
+    WINCALL SetWindowPos, qword ptr [g_hmountdrv], 0, LV_X + 3*CMD_ICON_W, CMDBAR_Y, CMD_ICON_W, CMDBAR_H-2, 014h
     ; The list commands are right-aligned, with CMD_SPACER of clear air between
     ; them and the gear so "acts on the list" and "opens settings" do not read
     ; as one run of buttons.  Everything below is measured back from the bar's
@@ -6753,6 +6828,29 @@ dl_sett_x:
     add     rax, SEP_GAP - 1
     mov     qword ptr [g_lay_t2], rax
     WINCALL SetWindowPos, qword ptr [g_hprog], 0, LV_X, qword ptr [g_lay_t2], qword ptr [g_lay_lvw], 3, 014h
+
+    ; ---- open-ended progress card, centred inside the list viewport ---------
+    cmp     qword ptr [g_hbusy_ctl], 0
+    je      dl_nobusy
+    mov     rax, qword ptr [g_lay_lvw]
+    sub     rax, BUSY_W
+    jge     @F
+    xor     eax, eax
+@@:
+    shr     rax, 1
+    add     rax, LV_X
+    mov     qword ptr [g_lay_t1], rax
+    mov     rax, qword ptr [g_lay_bot]
+    sub     rax, qword ptr [g_lay_sby]
+    sub     rax, BUSY_H
+    jge     @F
+    xor     eax, eax
+@@:
+    shr     rax, 1
+    add     rax, qword ptr [g_lay_sby]
+    mov     qword ptr [g_lay_t2], rax
+    WINCALL SetWindowPos, qword ptr [g_hbusy_ctl], 0, qword ptr [g_lay_t1], qword ptr [g_lay_t2], BUSY_W, BUSY_H, 014h
+dl_nobusy:
 
     ; ---- password row: field stretches, eye stays pinned to the right -------
     ; Everything from here down is offset by STAT_BAND: the statistics row was
@@ -6909,6 +7007,9 @@ create_controls_enc proc
     call    hide_pwrow                       ; secure desktop asks instead
     ; overall operation progress: a thin line in its own strip just below the list
     MKCTL   cls_static, s_ready, ST_BARHIDE, ID_PROG, LV_X, LV_Y+LV_H+SEP_GAP-1, LV_W, 3, g_hprog
+    MKCTL   cls_static, s_ready, ST_BUSYHIDE, ID_BUSY_BODY, LV_X, LV_Y, BUSY_W, BUSY_H, g_hbusy_ctl
+    WINCALL CreateRoundRectRgn, 0, 0, BUSY_W+1, BUSY_H+1, WIN_ROUND, WIN_ROUND
+    WINCALL SetWindowRgn, qword ptr [g_hbusy_ctl], rax, 1
     ; action (Encrypt) on the right, Exit just to its left
     MKCTL   cls_button, s_exit, ST_OWNERBTN, ID_CANCEL, 307, LV_Y+LV_H+60+STAT_BAND, 80, 32, g_hcancel
     MKCTL   cls_button, s_encrypt, ST_OWNERBTN, ID_ACTION, 395, LV_Y+LV_H+60+STAT_BAND, 120, 32, g_haction
@@ -6918,6 +7019,7 @@ create_controls_enc proc
     MKCTL   cls_button, s_ready, ST_OWNERBTN_NT, ID_ADDFILES,  LV_X, CMDBAR_Y, CMD_ICON_W, CMDBAR_H-2, g_haddfiles
     MKCTL   cls_button, s_ready, ST_OWNERBTN_NT, ID_ADDFOLDER, LV_X, CMDBAR_Y, CMD_ICON_W, CMDBAR_H-2, g_haddfolder
     MKCTL   cls_button, s_ready, ST_OWNERBTN_NT, ID_OPENTC,    LV_X, CMDBAR_Y, CMD_ICON_W, CMDBAR_H-2, g_hopentc
+    MKCTL   cls_button, s_ready, ST_OWNERBTN_NT, ID_MOUNTDRV,  LV_X, CMDBAR_Y, CMD_ICON_W, CMDBAR_H-2, g_hmountdrv
     MKCTL   cls_button, s_ready, ST_OWNERBTN_NT, ID_HAMBURGER, LV_X, CMDBAR_Y, CMD_ICON_W, CMDBAR_H-2, g_hburger
     ; Give each one its glyph and the hover subclass.  The window text set below
     ; stays the accessible name - the glyph itself is nothing to a screen reader.
@@ -6934,6 +7036,12 @@ create_controls_enc proc
     xor     r8d, r8d
     call    glyph_attach
     WINCALL SetWindowTextW, qword ptr [g_hopentc], addr s_open_tcvc
+    mov     rcx, qword ptr [g_hmountdrv]
+    mov     edx, GLYPH_MAPDRIVE
+    xor     r8d, r8d
+    call    glyph_attach
+    WINCALL SetWindowTextW, qword ptr [g_hmountdrv], addr s_tip_mountdrv
+    WINCALL EnableWindow, qword ptr [g_hmountdrv], 0
     mov     rcx, qword ptr [g_hburger]
     mov     edx, GLYPH_SETTINGS
     xor     r8d, r8d
@@ -6960,6 +7068,9 @@ create_controls_enc proc
     call    tip_add
     mov     rcx, qword ptr [g_hopentc]
     lea     rdx, [s_open_tcvc]
+    call    tip_add
+    mov     rcx, qword ptr [g_hmountdrv]
+    lea     rdx, [s_tip_mountdrv]
     call    tip_add
     mov     rcx, qword ptr [g_hburger]
     lea     rdx, [s_tip_settings]
@@ -7235,6 +7346,8 @@ create_controls endp
 ; =============================================================================
 switch_to_output proc frame
     FRAME_PROLOG 64
+    mov     dword ptr [g_remount_after_edit], 0
+    call    cfmount_unmount
     call    tcvc_close
     call    wipe_gui_keyfiles
     ; the file just written becomes the one input
@@ -7408,6 +7521,7 @@ adapt_for_encrypt proc frame
     call    hide_pwrow
 @@:
     call    do_layout
+    call    sync_mount_ui
     FRAME_EPILOG
     ret
 adapt_for_encrypt endp
@@ -7717,6 +7831,8 @@ otp_uninit:
     je      otp_ret                         ; cancelled: leave existing view untouched
 
     ; Tear down any prior container/session secrets cleanly before switching
+    mov     dword ptr [g_remount_after_edit], 0
+    call    cfmount_unmount
     call    tcvc_close
     call    wipe_gui_keyfiles
     lea     rcx, [g_key]
@@ -7783,6 +7899,186 @@ otp_ret:
     pop     rbp
     ret
 open_tcvc_via_picker endp
+
+; =============================================================================
+; sync_mount_ui - synchronise ID_MOUNTDRV enable/active glyph/tooltip and the
+; container status readout with the live Cloud Files mount state.
+; =============================================================================
+sync_mount_ui proc frame
+    FRAME_PROLOG 64
+    cmp     qword ptr [g_hmountdrv], 0
+    je      smu_ret
+
+    ; Enabled iff idle and browsing a .tc/.hc or .mrk container (never .zip)
+    xor     edx, edx
+    cmp     dword ptr [g_running], 0
+    jne     smu_en
+    cmp     dword ptr [g_container], 0
+    je      smu_en
+    cmp     dword ptr [g_is_zip], 0
+    jne     smu_en
+    mov     edx, 1
+smu_en:
+    WINCALL EnableWindow, qword ptr [g_hmountdrv], edx
+
+    call    cfmount_letter
+    mov     dword ptr [rbp-16], eax
+
+    WINCALL GetWindowLongPtrW, qword ptr [g_hmountdrv], GWLP_USERDATA
+    cmp     dword ptr [rbp-16], 0
+    je      smu_inact
+    or      eax, GLYPH_ACTIVE_BIT
+    jmp     smu_setud
+smu_inact:
+    and     eax, NOT GLYPH_ACTIVE_BIT
+smu_setud:
+    mov     edx, eax
+    WINCALL SetWindowLongPtrW, qword ptr [g_hmountdrv], GWLP_USERDATA, rdx
+    WINCALL InvalidateRect, qword ptr [g_hmountdrv], 0, 1
+
+    cmp     dword ptr [rbp-16], 0
+    je      smu_tip_idle
+    lea     rcx, [g_mount_tipw]
+    lea     rdx, [s_tip_unmount_pfx]
+    lea     r8, [g_mount_tipw + 47*2]
+    call    wcopy
+    mov     ecx, dword ptr [rbp-16]
+    mov     word ptr [rax+0], cx
+    mov     word ptr [rax+2], ':'
+    mov     word ptr [rax+4], ')'
+    mov     word ptr [rax+6], 0
+    WINCALL SetWindowTextW, qword ptr [g_hmountdrv], addr g_mount_tipw
+    mov     rcx, qword ptr [g_hmountdrv]
+    lea     rdx, [g_mount_tipw]
+    call    tip_add
+    jmp     smu_status
+
+smu_tip_idle:
+    WINCALL SetWindowTextW, qword ptr [g_hmountdrv], addr s_tip_mountdrv
+    mov     rcx, qword ptr [g_hmountdrv]
+    lea     rdx, [s_tip_mountdrv]
+    call    tip_add
+
+smu_status:
+    cmp     dword ptr [g_container], 0
+    je      smu_ret
+    cmp     dword ptr [g_running], 0
+    jne     smu_ret
+    cmp     qword ptr [g_hstatus], 0
+    je      smu_ret
+    cmp     dword ptr [g_is_tcvc], 0
+    je      smu_stat_mrk
+    lea     rcx, [g_tcvc_statw]
+    mov     edx, STATUSW_CHARS
+    call    tcvc_format_status
+    WINCALL SetWindowTextW, qword ptr [g_hstatus], addr g_tcvc_statw
+    jmp     smu_ret
+
+smu_stat_mrk:
+    cmp     dword ptr [g_is_zip], 0
+    jne     smu_ret
+    cmp     dword ptr [rbp-16], 0
+    jne     smu_stat_mrk_mnt
+    WINCALL SetWindowTextW, qword ptr [g_hstatus], addr s_edits_saved
+    jmp     smu_ret
+
+smu_stat_mrk_mnt:
+    lea     rcx, [g_mrk_statw]
+    lea     rdx, [s_edits_saved]
+    WBOUND  r8, g_mrk_statw, STATUSW_CHARS
+    call    wcopy
+    mov     word ptr [rax+0], ' '
+    mov     word ptr [rax+2], 00B7h
+    mov     word ptr [rax+4], ' '
+    mov     ecx, dword ptr [rbp-16]
+    mov     word ptr [rax+6], cx
+    mov     word ptr [rax+8], ':'
+    mov     word ptr [rax+10], '\'
+    mov     word ptr [rax+12], 0
+    WINCALL SetWindowTextW, qword ptr [g_hstatus], addr g_mrk_statw
+
+smu_ret:
+    FRAME_EPILOG
+    ret
+sync_mount_ui endp
+
+; =============================================================================
+; toggle_drive_mount - command-bar ID_MOUNTDRV click handler.
+; =============================================================================
+toggle_drive_mount proc frame
+    FRAME_PROLOG 64
+    cmp     dword ptr [g_running], 0
+    jne     tdm_ret
+    cmp     dword ptr [g_scanning], 0
+    jne     tdm_ret
+    cmp     dword ptr [g_container], 0
+    je      tdm_ret
+    cmp     dword ptr [g_is_zip], 0
+    jne     tdm_ret
+
+    call    cfmount_is_mounted
+    test    eax, eax
+    jz      tdm_do_mount
+
+    call    cfmount_unmount
+    call    sync_mount_ui
+    jmp     tdm_ret
+
+tdm_do_mount:
+    cmp     dword ptr [g_is_tcvc], 0
+    jne     tdm_call_mount
+
+    ; .mrk container: ensure g_key is live (od_restore wipes g_key + g_cfg_pass
+    ; after an Extract All while browsing).
+    call    es_key_live
+    test    eax, eax
+    jnz     tdm_call_mount
+    cmp     dword ptr [g_cfg_passlen], 0
+    jne     @F
+    mov     dword ptr [g_pw_ready], 0
+@@:
+    call    read_password
+    test    eax, eax
+    jnz     tdm_ret
+    mov     dword ptr [g_pw_ready], 1
+    lea     rax, [g_filepath_w]
+    mov     qword ptr [g_cfg_in], rax
+    mov     dword ptr [g_keep_key], 1
+    call    idx_read
+    mov     dword ptr [g_keep_key], 0
+    test    eax, eax
+    jz      tdm_call_mount
+    mov     dword ptr [g_pw_ready], 0
+    lea     rcx, [m_auth]
+    lea     rdx, [t_err]
+    mov     r8d, MB_OK or MB_ICONERROR
+    call    mbox
+    jmp     tdm_ret
+
+tdm_call_mount:
+    mov     ecx, dword ptr [g_is_tcvc]
+    call    busy_cfmount
+    mov     dword ptr [rbp-16], eax
+    call    sync_mount_ui
+    cmp     dword ptr [rbp-16], 0
+    je      tdm_mount_err
+ifdef DBG_TRACE
+    cmp     dword ptr [g_dbg_nodesk], 0
+    jne     tdm_ret
+endif
+    call    cfmount_open_explorer
+    jmp     tdm_ret
+
+tdm_mount_err:
+    lea     rcx, [m_mount_fail]
+    lea     rdx, [t_err]
+    mov     r8d, MB_OK or MB_ICONWARNING
+    call    mbox
+
+tdm_ret:
+    FRAME_EPILOG
+    ret
+toggle_drive_mount endp
 
 ; =============================================================================
 ; make_logo_ctl - create the owner-draw STATIC for the logo header band.
@@ -8193,9 +8489,14 @@ dgb_glyph:
     WINCALL SetBkMode, qword ptr [rbp-32], 1  ; TRANSPARENT
     mov     edx, GLYPH_INK
     cmp     dword ptr [rbp-120], 0
-    jne     @F
+    je      dgb_dis_ink
+    test    dword ptr [rbp-48], GLYPH_ACTIVE_BIT
+    jz      dgb_ink_ok
+    mov     edx, CLR_BAR_DGREEN
+    jmp     dgb_ink_ok
+dgb_dis_ink:
     mov     edx, CLR_HINT
-@@:
+dgb_ink_ok:
     WINCALL SetTextColor, qword ptr [rbp-32], edx
     mov     eax, dword ptr [rbp-92]
     cmp     eax, 0E000h                       ; PUA -> icon font, else symbol font
@@ -8521,6 +8822,8 @@ clear_inputs proc frame
     lea     rcx, [g_excluded]
     call    pset_clear
     call    pfx_reset                         ; ...and so do the staged folders
+    call    cfmount_unmount
+    call    sync_mount_ui
     call    refresh_inputs
     call    update_strength
 ci_done:
@@ -11579,6 +11882,10 @@ car_haveprefix:
     mov     qword ptr [g_poscount], rax
     jmp     car_ret
 car_confirmed:
+    call    cfmount_is_mounted
+    mov     dword ptr [g_remount_after_edit], eax
+    call    cfmount_unmount
+    call    sync_mount_ui
     lea     rax, [g_filepath_w]
     mov     qword ptr [g_cfg_in], rax
     ; g_poscount is NOT put back here - the worker is about to walk
@@ -11807,6 +12114,10 @@ container_remove_selected proc frame
 crs_marked:
     cmp     qword ptr [rbp-32], 0
     je      crs_wipekey                     ; nothing selected that is in there
+    call    cfmount_is_mounted
+    mov     dword ptr [g_remount_after_edit], eax
+    call    cfmount_unmount
+    call    sync_mount_ui
     ; Both size classes use the same fresh-key, cancellable rewrite.
     mov     dword ptr [g_wt_job], 2
     call    enter_running
@@ -11868,6 +12179,7 @@ container_remove_selected endp
 ; =============================================================================
 container_load proc frame
     FRAME_PROLOG 64
+    call    cfmount_unmount
     lea     rax, [g_filepath_w]
     mov     qword ptr [g_cfg_in], rax
     cmp     dword ptr [g_is_tcvc], 0
@@ -11927,23 +12239,7 @@ cl_tcvc:
     test    eax, eax
     jnz     cl_tcvc_cancel
     mov     dword ptr [g_pw_ready], 1
-    lea     rcx, [g_filepath_w]
-    lea     rdx, [g_cfg_pass]
-    mov     r8d, dword ptr [g_cfg_passlen]
-    lea     r9,  [g_kf_paths]
-    mov     eax, dword ptr [g_kf_count]
-    mov     qword ptr [rsp+32], rax
-    call    tcvc_open
-    mov     dword ptr [rbp-16], eax
-    ; Wipe password + keyfile paths immediately: XTS schedules live in locked secmem.
-    lea     rcx, [g_cfg_pass]
-    mov     rdx, MAX_PASSWORD_BYTES+1
-    call    secure_zero
-    mov     dword ptr [g_cfg_passlen], 0
-    call    wipe_gui_keyfiles
-    cmp     dword ptr [rbp-16], 0
-    jne     cl_tcvc_err
-    call    tcvc_to_index
+    call    busy_mount_tcvc
     mov     dword ptr [rbp-16], eax
     test    eax, eax
     jnz     cl_tcvc_err
@@ -12007,16 +12303,28 @@ cl_listed:
     call    fmt_summary
     WINCALL SetWindowTextW, qword ptr [g_hscan], addr g_summbuf
     call    container_update_action
-    lea     rdx, [s_edits_saved]
     cmp     dword ptr [g_is_tcvc], 0
-    je      @F
-    lea     rdx, [g_tcvc_statw]
-@@:
-    WINCALL SetWindowTextW, qword ptr [g_hstatus], rdx
+    jne     cl_mount_synced
+    cmp     dword ptr [g_is_zip], 0
+    jne     cl_mount_synced
+    cmp     dword ptr [g_remount_after_edit], 0
+    je      cl_mount_synced
+    mov     dword ptr [g_remount_after_edit], 0
+    xor     ecx, ecx
+    call    busy_cfmount
+cl_mount_synced:
+    mov     dword ptr [g_remount_after_edit], 0
+    call    sync_mount_ui
+    cmp     dword ptr [g_is_zip], 0
+    je      cl_ok_ret
+    WINCALL SetWindowTextW, qword ptr [g_hstatus], addr s_edits_saved
+cl_ok_ret:
     xor     eax, eax
     FRAME_EPILOG
     ret
 cl_fail:
+    mov     dword ptr [g_remount_after_edit], 0
+    call    sync_mount_ui
     mov     eax, 1
     FRAME_EPILOG
     ret
@@ -12487,6 +12795,7 @@ enter_running proc
     mov     dword ptr [g_unpack_partial], 0
     mov     dword ptr [g_unpack_link], 0
     mov     dword ptr [g_edit_reason], 0
+    mov     dword ptr [g_prog_indet], 0
     mov     qword ptr [g_prog_total], 0
     mov     qword ptr [g_prog_done], 0
     ; The action log covers ONE operation.  Started here, on the UI thread and
@@ -12501,6 +12810,10 @@ enter_running proc
     cmp     qword ptr [g_hopentc], 0
     je      @F
     WINCALL EnableWindow, qword ptr [g_hopentc], 0
+@@:
+    cmp     qword ptr [g_hmountdrv], 0
+    je      @F
+    WINCALL EnableWindow, qword ptr [g_hmountdrv], 0
 @@:
     cmp     qword ptr [g_hconfirm], 0
     je      @F
@@ -12533,8 +12846,29 @@ enter_running proc
     WINCALL ShowWindow, qword ptr [g_hprog], SW_HIDE
 @@:
     WINCALL SetWindowTextW, qword ptr [g_hstatus], addr s_working
+    cmp     dword ptr [g_is_tcvc], 0
+    je      er_std_timer
+    mov     dword ptr [g_prog_indet], 1
+    mov     dword ptr [g_busy_mode], 1
+    mov     dword ptr [g_rl_curlen], 0
+    WINCALL SetWindowTextW, qword ptr [g_hstatus], addr s_busy_ext
+    cmp     qword ptr [g_hbusy_ctl], 0
+    je      er_tcvc_tmr
+    cmp     qword ptr [g_hlist], 0
+    je      @F
+    WINCALL EnableWindow, qword ptr [g_hlist], 0
+@@:
+    WINCALL ShowWindow, qword ptr [g_hbusy_ctl], SW_SHOW
+    mov     rcx, qword ptr [g_hbusy_ctl]
+    call    raise_window
+    WINCALL InvalidateRect, qword ptr [g_hbusy_ctl], 0, 0
+er_tcvc_tmr:
+    WINCALL SetTimer, qword ptr [g_hwnd], 1, 50, 0
+    jmp     er_spawn
+er_std_timer:
     ; 100ms timer
     WINCALL SetTimer, qword ptr [g_hwnd], 1, 100, 0
+er_spawn:
     ; CreateThread(NULL, 0, worker_thread, NULL, 0, &tid)
     WINCALL CreateThread, 0, 0, addr worker_thread, 0, 0, addr g_tid
     test    rax, rax
@@ -12543,6 +12877,14 @@ enter_running proc
     jmp     er_done
 er_fail:
     mov     dword ptr [g_running], 0
+    mov     dword ptr [g_prog_indet], 0
+    cmp     qword ptr [g_hbusy_ctl], 0
+    je      @F
+    WINCALL ShowWindow, qword ptr [g_hbusy_ctl], SW_HIDE
+    cmp     qword ptr [g_hlist], 0
+    je      @F
+    WINCALL EnableWindow, qword ptr [g_hlist], 1
+@@:
     WINCALL SetWindowTextW, qword ptr [g_hcancel], addr s_exit
 er_done:
     add     rsp, 64
@@ -13062,9 +13404,25 @@ drag_prog_show proc
     sub     rsp, 48
     test    ecx, ecx
     jz      dps_hide
+    mov     dword ptr [g_prog_indet], 0
+    cmp     dword ptr [g_is_tcvc], 0
+    je      @F
+    mov     dword ptr [g_prog_indet], 1
+    mov     dword ptr [g_busy_mode], 1
+    mov     dword ptr [g_rl_curlen], 0
+    mov     qword ptr [g_drag_tickms], 0
+@@:
     WINCALL ShowWindow, qword ptr [g_hprog], SW_SHOW
     jmp     dps_ret
 dps_hide:
+    mov     dword ptr [g_prog_indet], 0
+    cmp     qword ptr [g_hbusy_ctl], 0
+    je      @F
+    WINCALL ShowWindow, qword ptr [g_hbusy_ctl], SW_HIDE
+    cmp     qword ptr [g_hlist], 0
+    je      @F
+    WINCALL InvalidateRect, qword ptr [g_hlist], 0, 0
+@@:
     WINCALL ShowWindow, qword ptr [g_hprog], SW_HIDE
     ; the tick below writes "Decrypting NN% ..." over the status line, and a
     ; drag that has ended is not decrypting anything
@@ -13082,6 +13440,49 @@ dps_ret:
     pop     rbp
     ret
 drag_prog_show endp
+
+; =============================================================================
+; drag_tcvc_tick - 50ms-throttled synchronous animation pump during DoDragDrop
+; extraction from a TrueCrypt/VeraCrypt (or ZIP) container.
+; =============================================================================
+public drag_tcvc_tick
+drag_tcvc_tick proc
+    push    rbp
+    mov     rbp, rsp
+    sub     rsp, 48
+    cmp     dword ptr [g_is_tcvc], 0
+    jne     dtt_indet
+    call    drag_prog_tick
+    jmp     dtt_ret
+dtt_indet:
+    WINCALL GetTickCount64
+    mov     qword ptr [rbp-8], rax
+    sub     rax, qword ptr [g_drag_tickms]
+    cmp     rax, 50
+    jb      dtt_ret
+    mov     rax, qword ptr [rbp-8]
+    mov     qword ptr [g_drag_tickms], rax
+    cmp     qword ptr [g_hbusy_ctl], 0
+    je      dtt_bar
+    WINCALL IsWindowVisible, qword ptr [g_hbusy_ctl]
+    test    eax, eax
+    jnz     @F
+    WINCALL ShowWindow, qword ptr [g_hbusy_ctl], SW_SHOW
+    mov     rcx, qword ptr [g_hbusy_ctl]
+    call    raise_window
+@@:
+    WINCALL InvalidateRect, qword ptr [g_hbusy_ctl], 0, 0
+    WINCALL UpdateWindow, qword ptr [g_hbusy_ctl]
+dtt_bar:
+    WINCALL InvalidateRect, qword ptr [g_hprog], 0, 0
+    WINCALL UpdateWindow, qword ptr [g_hprog]
+    call    set_status_indet
+    WINCALL UpdateWindow, qword ptr [g_hstatus]
+dtt_ret:
+    add     rsp, 48
+    pop     rbp
+    ret
+drag_tcvc_tick endp
 
 public drag_prog_tick
 drag_prog_tick proc
@@ -13155,6 +13556,16 @@ on_timer proc
     mov     rcx, rax
     call    lv_ensure_visible            ; not LVM_ENSUREVISIBLE - see that proc
 ot_nolist:
+    cmp     dword ptr [g_prog_indet], 0
+    je      ot_det
+    WINCALL InvalidateRect, qword ptr [g_hprog], 0, 0
+    cmp     qword ptr [g_hbusy_ctl], 0
+    je      @F
+    WINCALL InvalidateRect, qword ptr [g_hbusy_ctl], 0, 0
+@@:
+    call    set_status_indet
+    jmp     ot_done
+ot_det:
     mov     rax, qword ptr [g_prog_total]
     test    rax, rax
     jz      ot_done
@@ -13339,6 +13750,8 @@ od_norepaint:
     cmp     dword ptr [g_cancelled], 0
     jne     od_nofull
     cmp     dword ptr [g_op_result], 0
+    jne     od_nofull
+    cmp     dword ptr [g_prog_indet], 0
     jne     od_nofull
     mov     dword ptr [g_prog_pct], 100
     WINCALL InvalidateRect, qword ptr [g_hprog], 0, 0
@@ -13579,6 +13992,15 @@ od_c_reload:
     ret
 
 od_restore:
+    mov     dword ptr [g_prog_indet], 0
+    cmp     qword ptr [g_hbusy_ctl], 0
+    je      @F
+    WINCALL ShowWindow, qword ptr [g_hbusy_ctl], SW_HIDE
+    cmp     qword ptr [g_hlist], 0
+    je      @F
+    WINCALL EnableWindow, qword ptr [g_hlist], 1
+    WINCALL InvalidateRect, qword ptr [g_hlist], 0, 0
+@@:
     ; final repaint of the per-file bars (full on success, partial otherwise)
     cmp     dword ptr [g_op], 0
     jne     @F
@@ -13612,6 +14034,7 @@ od_restore:
     lea     rdx, [g_tcvc_statw]
 @@:
     WINCALL SetWindowTextW, qword ptr [g_hstatus], rdx
+    call    sync_mount_ui
     ; clear password fields + internal EDIT HLOCAL/undo buffers + globals
     mov     rcx, qword ptr [g_hpass]
     call    gui_hwnd_scrub
@@ -13803,6 +14226,16 @@ draw_bar proc
 @@:
     mov     dword ptr [rbp-44], eax
     mov     dword ptr [rbp-48], r8d
+    cmp     dword ptr [rbp-12], ID_PROG
+    jne     db_det
+    cmp     dword ptr [g_prog_indet], 0
+    je      db_det
+    mov     rcx, qword ptr [rbp-16]
+    lea     rdx, [rbp-40]
+    mov     r8,  qword ptr [g_hbr_accent]
+    call    draw_indet_bar
+    jmp     db_done
+db_det:
     ; track: solid light fill, no border
     WINCALL FillRect, qword ptr [rbp-16], addr rbp-40, qword ptr [g_hbr_track]
     ; fillw = (right-left) * pct / 100
@@ -15119,6 +15552,12 @@ dr_notglyph:
     mov     rax, 1
     jmp     wp_ret
 @@:
+    cmp     eax, ID_MOUNTDRV
+    jne     @F
+    call    draw_glyph_btn
+    mov     rax, 1
+    jmp     wp_ret
+@@:
     cmp     eax, ID_SHOWPW
     jne     @F
     call    draw_show_icon
@@ -15183,6 +15622,12 @@ wp_di_slider:
     cmp     eax, ID_CRUMB
     jne     @F
     call    draw_crumb
+    mov     rax, 1
+    jmp     wp_ret
+@@:
+    cmp     eax, ID_BUSY_BODY
+    jne     @F
+    call    draw_busy_card
     mov     rax, 1
     jmp     wp_ret
 @@:
@@ -15360,6 +15805,8 @@ wp_command:
     je      wp_addfolder
     cmp     eax, ID_OPENTC
     je      wp_opentc
+    cmp     eax, ID_MOUNTDRV
+    je      wp_mountdrv
     cmp     eax, ID_CMD_REMOVE
     je      wp_cmdremove
     cmp     eax, ID_CMD_CLEAR
@@ -15443,6 +15890,17 @@ wp_opentc:
     call    toggle_menu
 @@:
     call    open_tcvc_via_picker
+    jmp     wp_zero
+wp_mountdrv:
+    cmp     dword ptr [g_running], 0
+    jne     wp_zero
+    cmp     dword ptr [g_scanning], 0
+    jne     wp_zero
+    cmp     dword ptr [g_menu_open], 0
+    je      @F
+    call    toggle_menu
+@@:
+    call    toggle_drive_mount
     jmp     wp_zero
 wp_cmdremove:
     call    remove_selected
@@ -15593,6 +16051,7 @@ wp_destroy_noole:
     mov     dword ptr [g_ole_ok], 0
     WINCALL OleUninitialize
 wp_destroy_quit:
+    call    cfmount_unmount
     call    tcvc_close
     call    wipe_gui_keyfiles
     mov     rcx, qword ptr [g_hpass]
@@ -15930,6 +16389,7 @@ gm_zwc:
     ; accelerator table: ESC -> Exit
     WINCALL CreateAcceleratorTableW, addr g_accel, 1
     mov     qword ptr [g_haccel], rax
+    call    cfmount_sweep_stale
     ; ---- ask for the password BEFORE anything is shown -----------------------
     ; Launched from the context menu the intent is already stated - encrypt this,
     ; decrypt that - so a window whose only job is to collect a second
@@ -15984,8 +16444,8 @@ gm_notbadset:
     call    container_load
     test    eax, eax
     jnz     gm_cl_failed
-    WINCALL ShowWindow, qword ptr [g_hwnd], SW_SHOW
-    WINCALL UpdateWindow, qword ptr [g_hwnd]
+    mov     rcx, qword ptr [g_hwnd]
+    call    show_front_notopmost
     jmp     gm_loop
 gm_cl_failed:
     ; cancelled, or the password was wrong: nothing was started and nothing was
@@ -16033,13 +16493,13 @@ gm_pw:
     call    start_operation
     jmp     gm_loop
 gm_pw_mainwin:
-    WINCALL ShowWindow, qword ptr [g_hwnd], SW_SHOW
-    WINCALL UpdateWindow, qword ptr [g_hwnd]
+    mov     rcx, qword ptr [g_hwnd]
+    call    show_front_notopmost
     call    start_operation
     jmp     gm_loop
 gm_show:
-    WINCALL ShowWindow, qword ptr [g_hwnd], SW_SHOW
-    WINCALL UpdateWindow, qword ptr [g_hwnd]
+    mov     rcx, qword ptr [g_hwnd]
+    call    show_front_notopmost
     ; put keyboard focus on the password field so typing starts there at once
     mov     rcx, qword ptr [g_hpass]
     test    rcx, rcx
@@ -17285,9 +17745,8 @@ sdb_created:
     inc     r9d
     WINCALL CreateRoundRectRgn, 0, 0, r8d, r9d, WIN_ROUND, WIN_ROUND
     WINCALL SetWindowRgn, qword ptr [g_sd_hwnd], rax, 1
-    WINCALL ShowWindow, qword ptr [g_sd_hwnd], SW_SHOW
-    WINCALL UpdateWindow, qword ptr [g_sd_hwnd]
-    WINCALL SetForegroundWindow, qword ptr [g_sd_hwnd]
+    mov     rcx, qword ptr [g_sd_hwnd]
+    call    show_front_notopmost
 sdb_loop:
     WINCALL GetMessageW, addr rbp-160, 0, 0, 0
     test    eax, eax
@@ -17786,6 +18245,591 @@ pgc_kdf:
 pg_curfile endp
 
 ; =============================================================================
+; set_status_indet - open-ended status text = "Extracting files... [  NNN.N MB/s]"
+; =============================================================================
+set_status_indet proc
+    push    rbp
+    mov     rbp, rsp
+    sub     rsp, 64
+    lea     rcx, [g_statusw]
+    lea     rdx, [s_busy_ext]
+    WBOUND  r8, g_statusw, STATUSW_CHARS
+    call    wcopy
+    mov     qword ptr [rbp-8], rax
+    call    prog_speed_x10
+    test    rax, rax
+    jz      ssi_set
+    xor     edx, edx
+    mov     rcx, 10
+    div     rcx
+    mov     qword ptr [rbp-16], rax
+    mov     qword ptr [rbp-24], rdx
+    mov     rcx, qword ptr [rbp-8]
+    lea     rdx, [s_rate_gap]
+    WBOUND  r8, g_statusw, STATUSW_CHARS
+    call    wcopy
+    mov     rcx, rax
+    mov     rax, qword ptr [rbp-16]
+    call    u64_to_wide
+    mov     rcx, rax
+    mov     word ptr [rcx], '.'
+    add     rcx, 2
+    mov     rax, qword ptr [rbp-24]
+    add     eax, '0'
+    mov     word ptr [rcx], ax
+    add     rcx, 2
+    lea     rdx, [s_rate_mbs]
+    WBOUND  r8, g_statusw, STATUSW_CHARS
+    call    wcopy
+ssi_set:
+    WINCALL SetWindowTextW, qword ptr [g_hstatus], addr g_statusw
+    add     rsp, 64
+    pop     rbp
+    ret
+set_status_indet endp
+
+; =============================================================================
+; draw_indet_bar(rcx = hdc, rdx = rcPtr, r8 = hBrush) - open-ended comet sweep
+; =============================================================================
+draw_indet_bar proc
+    push    rbp
+    mov     rbp, rsp
+    sub     rsp, 96
+    mov     qword ptr [rbp-8], rcx      ; hdc
+    mov     qword ptr [rbp-16], rdx     ; rcPtr
+    mov     qword ptr [rbp-24], r8      ; hBrush
+    WINCALL FillRect, qword ptr [rbp-8], qword ptr [rbp-16], qword ptr [g_hbr_track]
+    mov     r10, qword ptr [rbp-16]
+    mov     eax, dword ptr [r10+8]
+    sub     eax, dword ptr [r10+0]      ; trackW = right - left
+    cmp     eax, 4
+    jle     dib_done
+    mov     dword ptr [rbp-28], eax
+    mov     ecx, eax
+    shr     ecx, 2                      ; segW = max(24, trackW / 4)
+    cmp     ecx, 24
+    jae     @F
+    mov     ecx, 24
+@@:
+    cmp     ecx, eax
+    jbe     @F
+    mov     ecx, eax
+@@:
+    mov     dword ptr [rbp-32], ecx
+    WINCALL GetTickCount64
+    xor     edx, edx
+    mov     rcx, 1100
+    div     rcx
+    mov     rax, rdx
+    mov     ecx, dword ptr [rbp-28]
+    add     ecx, dword ptr [rbp-32]
+    imul    rax, rcx
+    xor     edx, edx
+    mov     rcx, 1100
+    div     rcx
+    sub     eax, dword ptr [rbp-32]     ; pos: -segW .. trackW
+    mov     r10, qword ptr [rbp-16]
+    mov     ecx, dword ptr [r10+0]      ; left
+    mov     edx, dword ptr [r10+8]      ; right
+    mov     r8d, ecx
+    add     r8d, eax                    ; segL
+    mov     r9d, r8d
+    add     r9d, dword ptr [rbp-32]     ; segR
+    cmp     r8d, ecx
+    jge     @F
+    mov     r8d, ecx
+@@:
+    cmp     r9d, edx
+    jle     @F
+    mov     r9d, edx
+@@:
+    cmp     r8d, r9d
+    jge     dib_done
+    mov     dword ptr [rbp-48], r8d
+    mov     eax, dword ptr [r10+4]
+    mov     dword ptr [rbp-44], eax
+    mov     dword ptr [rbp-40], r9d
+    mov     eax, dword ptr [r10+12]
+    mov     dword ptr [rbp-36], eax
+    WINCALL FillRect, qword ptr [rbp-8], addr rbp-48, qword ptr [rbp-24]
+dib_done:
+    add     rsp, 96
+    pop     rbp
+    ret
+draw_indet_bar endp
+
+; =============================================================================
+; draw_busy_card(rcx = DRAWITEMSTRUCT*) - double-buffered open-ended busy card
+; =============================================================================
+draw_busy_card proc
+    push    rbp
+    mov     rbp, rsp
+    ; 192: BitBlt takes 9 arguments (72B outgoing), locals end at [rbp-68].
+    sub     rsp, 192
+    mov     rax, qword ptr [rcx+DI_HDC]
+    mov     qword ptr [rbp-8], rax      ; dstHdc
+    mov     eax, dword ptr [rcx+DI_RCITEM+0]
+    mov     dword ptr [rbp-52], eax     ; l
+    mov     edx, dword ptr [rcx+DI_RCITEM+8]
+    sub     edx, eax
+    cmp     edx, 1
+    jg      @F
+    mov     edx, BUSY_W
+@@:
+    mov     dword ptr [rbp-60], edx     ; w
+    mov     eax, dword ptr [rcx+DI_RCITEM+4]
+    mov     dword ptr [rbp-56], eax     ; t
+    mov     edx, dword ptr [rcx+DI_RCITEM+12]
+    sub     edx, eax
+    cmp     edx, 1
+    jg      @F
+    mov     edx, BUSY_H
+@@:
+    mov     dword ptr [rbp-64], edx     ; h
+    WINCALL CreateCompatibleDC, qword ptr [rbp-8]
+    test    rax, rax
+    jz      dbc_ret
+    mov     qword ptr [rbp-16], rax     ; memHdc
+    WINCALL CreateCompatibleBitmap, qword ptr [rbp-8], dword ptr [rbp-60], dword ptr [rbp-64]
+    test    rax, rax
+    jz      dbc_del_dc
+    mov     qword ptr [rbp-24], rax     ; memBmp
+    WINCALL SelectObject, qword ptr [rbp-16], qword ptr [rbp-24]
+    mov     qword ptr [rbp-32], rax     ; oldBmp
+    ; backdrop + left accent stripe + rounded hairline border
+    mov     dword ptr [g_busy_rc+0], 0
+    mov     dword ptr [g_busy_rc+4], 0
+    mov     eax, dword ptr [rbp-60]
+    mov     dword ptr [g_busy_rc+8], eax
+    mov     eax, dword ptr [rbp-64]
+    mov     dword ptr [g_busy_rc+12], eax
+    WINCALL FillRect, qword ptr [rbp-16], addr g_busy_rc, qword ptr [g_hbr_dark]
+    mov     dword ptr [g_busy_rc+8], MB_BAR_W
+    WINCALL FillRect, qword ptr [rbp-16], addr g_busy_rc, qword ptr [g_hbr_accent]
+    mov     eax, dword ptr [rbp-60]
+    mov     dword ptr [g_busy_rc+8], eax
+    mov     rcx, qword ptr [rbp-16]
+    lea     rdx, [g_busy_rc]
+    mov     r8d, WIN_ROUND
+    mov     r9d, CLR_ACCENT
+    call    hairline_rect
+    ; heading
+    WINCALL SetBkMode, qword ptr [rbp-16], BK_TRANSPARENT
+    WINCALL SelectObject, qword ptr [rbp-16], qword ptr [g_hfont_head]
+    mov     qword ptr [rbp-40], rax
+    WINCALL SetTextColor, qword ptr [rbp-16], CLR_ACCENT
+    lea     rax, [s_busy_mount]
+    cmp     dword ptr [g_busy_mode], 0
+    je      dbc_chk_head_vol
+    lea     rax, [s_busy_ext]
+    jmp     dbc_head_ok
+dbc_chk_head_vol:
+    cmp     dword ptr [g_busy_phase], 2
+    jne     dbc_head_ok
+    lea     rax, [s_busy_vol]
+dbc_head_ok:
+    mov     qword ptr [rbp-48], rax
+    mov     dword ptr [g_busy_rc+0], 20
+    mov     dword ptr [g_busy_rc+4], 16
+    mov     eax, dword ptr [rbp-60]
+    sub     eax, 18
+    mov     dword ptr [g_busy_rc+8], eax
+    mov     dword ptr [g_busy_rc+12], 46
+    WINCALL DrawTextW, qword ptr [rbp-16], qword ptr [rbp-48], -1, addr g_busy_rc, \
+            <DT_LEFT or DT_VCENTER or DT_SINGLELINE or DT_NOPREFIX or DT_END_ELLIPSIS>
+    ; subtitle (phase hint when mounting, active entry path when extracting)
+    WINCALL SelectObject, qword ptr [rbp-16], qword ptr [g_hfont]
+    mov     dword ptr [g_busy_rc+4], 46
+    mov     dword ptr [g_busy_rc+12], 68
+    cmp     dword ptr [g_busy_mode], 0
+    jne     dbc_sub_ext
+    WINCALL SetTextColor, qword ptr [rbp-16], CLR_HINT
+    lea     rax, [s_busy_kdf]
+    cmp     dword ptr [g_busy_phase], 0
+    je      dbc_sub_ok
+    lea     rax, [s_busy_fs]
+    cmp     dword ptr [g_busy_phase], 1
+    je      dbc_sub_ok
+    lea     rax, [s_busy_drv]
+dbc_sub_ok:
+    mov     qword ptr [rbp-48], rax
+    WINCALL DrawTextW, qword ptr [rbp-16], qword ptr [rbp-48], -1, addr g_busy_rc, \
+            <DT_LEFT or DT_VCENTER or DT_SINGLELINE or DT_NOPREFIX or DT_END_ELLIPSIS>
+    jmp     dbc_bar
+dbc_sub_ext:
+    mov     eax, dword ptr [g_rl_curlen]
+    test    eax, eax
+    jz      dbc_sub_prep
+    cmp     eax, 599
+    jbe     @F
+    mov     eax, 599
+@@:
+    mov     dword ptr [rbp-68], eax
+    WINCALL MultiByteToWideChar, CP_UTF8, 0, addr g_rl_curname, dword ptr [rbp-68], \
+            addr g_pg_txt, 599
+    test    eax, eax
+    jz      dbc_sub_prep
+    lea     rcx, [g_pg_txt]
+    mov     word ptr [rcx+rax*2], 0
+    WINCALL SetTextColor, qword ptr [rbp-16], CLR_WHITE
+    WINCALL DrawTextW, qword ptr [rbp-16], addr g_pg_txt, -1, addr g_busy_rc, \
+            <DT_LEFT or DT_VCENTER or DT_SINGLELINE or DT_NOPREFIX or DT_PATH_ELLIPSIS>
+    jmp     dbc_bar
+dbc_sub_prep:
+    WINCALL SetTextColor, qword ptr [rbp-16], CLR_HINT
+    WINCALL DrawTextW, qword ptr [rbp-16], addr s_busy_prep, -1, addr g_busy_rc, \
+            <DT_LEFT or DT_VCENTER or DT_SINGLELINE or DT_NOPREFIX or DT_END_ELLIPSIS>
+dbc_bar:
+    mov     dword ptr [g_busy_rc+0], 20
+    mov     eax, dword ptr [rbp-64]
+    sub     eax, 22
+    mov     dword ptr [g_busy_rc+4], eax
+    mov     eax, dword ptr [rbp-60]
+    sub     eax, 20
+    mov     dword ptr [g_busy_rc+8], eax
+    mov     eax, dword ptr [rbp-64]
+    sub     eax, 18
+    mov     dword ptr [g_busy_rc+12], eax
+    mov     rcx, qword ptr [rbp-16]
+    lea     rdx, [g_busy_rc]
+    mov     r8, qword ptr [g_hbr_accent]
+    call    draw_indet_bar
+    WINCALL SelectObject, qword ptr [rbp-16], qword ptr [rbp-40]
+    WINCALL BitBlt, qword ptr [rbp-8], dword ptr [rbp-52], dword ptr [rbp-56], \
+            dword ptr [rbp-60], dword ptr [rbp-64], qword ptr [rbp-16], 0, 0, SRCCOPY
+    WINCALL SelectObject, qword ptr [rbp-16], qword ptr [rbp-32]
+    WINCALL DeleteObject, qword ptr [rbp-24]
+dbc_del_dc:
+    WINCALL DeleteDC, qword ptr [rbp-16]
+dbc_ret:
+    add     rsp, 192
+    pop     rbp
+    ret
+draw_busy_card endp
+
+; =============================================================================
+; tcvc_mount_work / tcvc_mount_thread - unlock TC/VC header + enumerate FS
+; =============================================================================
+tcvc_mount_work proc
+    push    rbp
+    mov     rbp, rsp
+    sub     rsp, 64
+    mov     dword ptr [g_busy_phase], 0
+    WINCALL tcvc_open, addr g_filepath_w, addr g_cfg_pass, \
+            dword ptr [g_cfg_passlen], addr g_kf_paths, dword ptr [g_kf_count]
+    mov     dword ptr [rbp-8], eax
+    lea     rcx, [g_cfg_pass]
+    mov     rdx, MAX_PASSWORD_BYTES + 1
+    call    secure_zero
+    mov     dword ptr [g_cfg_passlen], 0
+    call    wipe_gui_keyfiles
+    mov     eax, dword ptr [rbp-8]
+    test    eax, eax
+    jnz     tmw_done
+    mov     dword ptr [g_busy_phase], 1
+    call    tcvc_to_index
+    test    eax, eax
+    jnz     tmw_done
+    mov     dword ptr [g_busy_phase], 2
+    WINCALL cfmount_mount, addr g_filepath_w, 1
+    xor     eax, eax
+tmw_done:
+    mov     dword ptr [g_tcvc_mnt_rc], eax
+    add     rsp, 64
+    pop     rbp
+    ret
+tcvc_mount_work endp
+
+tcvc_mount_thread proc
+    call    sstk_thread_init
+    sub     rsp, 40
+    call    tcvc_mount_work
+    call    sstk_thread_free
+    xor     eax, eax
+    add     rsp, 40
+    ret
+tcvc_mount_thread endp
+
+cfmount_work proc
+    push    rbp
+    mov     rbp, rsp
+    sub     rsp, 48
+    lea     rcx, [g_filepath_w]
+    mov     edx, dword ptr [g_cfm_is_tcvc]
+    call    cfmount_mount
+    mov     dword ptr [g_cfm_letter], eax
+    add     rsp, 48
+    pop     rbp
+    ret
+cfmount_work endp
+
+cfmount_thread proc
+    call    sstk_thread_init
+    sub     rsp, 40
+    call    cfmount_work
+    call    sstk_thread_free
+    xor     eax, eax
+    add     rsp, 40
+    ret
+cfmount_thread endp
+
+; =============================================================================
+; busy_wndproc - popup window proc for the open-ended container mount indicator
+; =============================================================================
+busy_wndproc proc
+    push    rbp
+    mov     rbp, rsp
+    sub     rsp, 96
+    mov     qword ptr [rbp-8], rcx
+    mov     qword ptr [rbp-16], rdx
+    mov     qword ptr [rbp-24], r8
+    mov     qword ptr [rbp-32], r9
+    mov     rax, rdx
+    cmp     rax, WM_CREATE
+    je      bwp_create
+    cmp     rax, WM_TIMER
+    je      bwp_timer
+    cmp     rax, WM_DRAWITEM
+    je      bwp_draw
+    cmp     rax, WM_NCHITTEST
+    je      bwp_hit
+    cmp     rax, WM_NCLBUTTONDBLCLK
+    je      bwp_zero
+    cmp     rax, WM_CLOSE
+    je      bwp_zero
+    cmp     rax, WM_DESTROY
+    je      bwp_destroy
+    jmp     bwp_def
+bwp_create:
+    mov     rax, qword ptr [rbp-8]
+    mov     qword ptr [g_ctl_parent], rax
+    lea     rcx, [cls_static]
+    lea     rdx, [s_empty]
+    mov     r8, ST_LOGO
+    mov     r9, ID_BUSY_BODY
+    mov     dword ptr [rsp+32], 0
+    mov     dword ptr [rsp+40], 0
+    mov     dword ptr [rsp+48], BUSY_W
+    mov     dword ptr [rsp+56], BUSY_H
+    call    create_ctl
+    mov     qword ptr [g_busy_body], rax
+    mov     qword ptr [g_ctl_parent], 0
+    WINCALL SetTimer, qword ptr [rbp-8], 1, 50, 0
+    jmp     bwp_zero
+bwp_timer:
+    cmp     qword ptr [g_busy_body], 0
+    je      bwp_zero
+    WINCALL InvalidateRect, qword ptr [g_busy_body], 0, 0
+    jmp     bwp_zero
+bwp_draw:
+    mov     rcx, qword ptr [rbp-32]
+    cmp     dword ptr [rcx+DI_CTLID], ID_BUSY_BODY
+    jne     bwp_def
+    call    draw_busy_card
+    mov     rax, 1
+    jmp     bwp_ret
+bwp_hit:
+    WINCALL DefWindowProcW, qword ptr [rbp-8], qword ptr [rbp-16], qword ptr [rbp-24], qword ptr [rbp-32]
+    cmp     rax, HTCLIENT
+    jne     bwp_ret
+    mov     rax, HTCAPTION
+    jmp     bwp_ret
+bwp_destroy:
+    WINCALL KillTimer, qword ptr [rbp-8], 1
+    mov     qword ptr [g_busy_body], 0
+bwp_zero:
+    xor     rax, rax
+    jmp     bwp_ret
+bwp_def:
+    WINCALL DefWindowProcW, qword ptr [rbp-8], qword ptr [rbp-16], qword ptr [rbp-24], qword ptr [rbp-32]
+bwp_ret:
+    add     rsp, 96
+    pop     rbp
+    ret
+busy_wndproc endp
+
+; =============================================================================
+; busy_run_popup(rcx = pfnThread, edx = initPhase) -> eax = 0 (joined) / 1 (no thread)
+; Shows the topmost animated busy popup while pfnThread runs on a worker thread.
+; =============================================================================
+busy_run_popup proc
+    push    rbp
+    mov     rbp, rsp
+    ; 240: CreateWindowExW takes 12 arguments (96B outgoing), locals end at [rbp-112].
+    sub     rsp, 240
+    mov     qword ptr [rbp-24], rcx     ; pfnThread
+    mov     dword ptr [g_busy_mode], 0
+    mov     dword ptr [g_busy_phase], edx
+    mov     dword ptr [rbp-36], 0       ; parentVis
+    mov     dword ptr [rbp-40], 0       ; sawQuit
+    mov     dword ptr [rbp-44], 0       ; quitCode
+    mov     dword ptr [rbp-48], 0       ; rc (0 = thread ran, 1 = fallback needed)
+    mov     qword ptr [rbp-16], 0       ; hParent
+    cmp     dword ptr [g_busy_reg], 0
+    jne     bmt_haveclass
+    lea     rcx, [g_wc]
+    xor     r9, r9
+bmt_zwc:
+    mov     byte ptr [rcx+r9], 0
+    inc     r9
+    cmp     r9, WC_SIZE
+    jb      bmt_zwc
+    mov     dword ptr [g_wc+0], WC_SIZE
+    mov     dword ptr [g_wc+4], CS_DROPSHADOW
+    lea     rax, [busy_wndproc]
+    mov     qword ptr [g_wc+8], rax
+    mov     rax, qword ptr [g_hinst]
+    mov     qword ptr [g_wc+24], rax
+    WINCALL LoadCursorW, 0, IDC_ARROW
+    mov     qword ptr [g_wc+40], rax
+    mov     rax, qword ptr [g_hbr_dark]
+    mov     qword ptr [g_wc+48], rax
+    lea     rax, [wc_busy]
+    mov     qword ptr [g_wc+64], rax
+    WINCALL RegisterClassExW, addr g_wc
+    mov     dword ptr [g_busy_reg], 1
+bmt_haveclass:
+    cmp     qword ptr [g_hwnd], 0
+    je      bmt_screen
+    WINCALL IsWindowVisible, qword ptr [g_hwnd]
+    test    eax, eax
+    jz      bmt_screen
+    mov     dword ptr [rbp-36], 1
+    mov     rax, qword ptr [g_hwnd]
+    mov     qword ptr [rbp-16], rax
+    WINCALL GetWindowRect, qword ptr [g_hwnd], addr g_lb_prc
+    mov     eax, dword ptr [g_lb_prc+0]
+    add     eax, dword ptr [g_lb_prc+8]
+    sar     eax, 1
+    sub     eax, BUSY_W / 2
+    mov     dword ptr [rbp-28], eax
+    mov     eax, dword ptr [g_lb_prc+4]
+    add     eax, dword ptr [g_lb_prc+12]
+    sar     eax, 1
+    sub     eax, BUSY_H / 2
+    mov     dword ptr [rbp-32], eax
+    WINCALL EnableWindow, qword ptr [g_hwnd], 0
+    jmp     bmt_create
+bmt_screen:
+    WINCALL GetSystemMetrics, SM_CXSCREEN
+    sub     eax, BUSY_W
+    sar     eax, 1
+    mov     dword ptr [rbp-28], eax
+    WINCALL GetSystemMetrics, SM_CYSCREEN
+    sub     eax, BUSY_H
+    sar     eax, 1
+    mov     dword ptr [rbp-32], eax
+bmt_create:
+    lea     r8, [s_busy_mount]
+    cmp     dword ptr [g_busy_phase], 2
+    jne     @F
+    lea     r8, [s_busy_vol]
+@@:
+    WINCALL CreateWindowExW, <WS_EX_TOOLWINDOW or WS_EX_LAYERED or WS_EX_TOPMOST>, addr wc_busy, r8, \
+            ST_MAINWND, dword ptr [rbp-28], dword ptr [rbp-32], BUSY_W, BUSY_H, \
+            qword ptr [rbp-16], 0, qword ptr [g_hinst], 0
+    mov     qword ptr [g_busy_hwnd], rax
+    test    rax, rax
+    jz      bmt_spawn
+    mov     rcx, rax
+    call    gui_protect_hwnd
+    WINCALL SetLayeredWindowAttributes, qword ptr [g_busy_hwnd], 0, WIN_ALPHA, LWA_ALPHA
+    WINCALL CreateRoundRectRgn, 0, 0, BUSY_W + 1, BUSY_H + 1, WIN_ROUND, WIN_ROUND
+    WINCALL SetWindowRgn, qword ptr [g_busy_hwnd], rax, 1
+    WINCALL ShowWindow, qword ptr [g_busy_hwnd], SW_SHOW
+    WINCALL SetForegroundWindow, qword ptr [g_busy_hwnd]
+    WINCALL UpdateWindow, qword ptr [g_busy_hwnd]
+bmt_spawn:
+    WINCALL CreateThread, 0, 0, qword ptr [rbp-24], 0, 0, addr g_tid
+    mov     qword ptr [rbp-8], rax
+    test    rax, rax
+    jnz     bmt_wait
+    mov     dword ptr [rbp-48], 1
+    jmp     bmt_cleanup
+bmt_wait:
+    WINCALL MsgWaitForMultipleObjects, 1, addr rbp-8, 0, 50, 04FFh
+    test    eax, eax
+    jz      bmt_joined
+bmt_drain:
+    WINCALL PeekMessageW, addr rbp-112, 0, 0, 0, 1
+    test    eax, eax
+    jz      bmt_wait
+    cmp     dword ptr [rbp-104], 0012h  ; WM_QUIT
+    jne     bmt_disp
+    mov     dword ptr [rbp-40], 1
+    mov     eax, dword ptr [rbp-96]
+    mov     dword ptr [rbp-44], eax
+    jmp     bmt_drain
+bmt_disp:
+    WINCALL TranslateMessage, addr rbp-112
+    WINCALL DispatchMessageW, addr rbp-112
+    jmp     bmt_drain
+bmt_joined:
+    WINCALL CloseHandle, qword ptr [rbp-8]
+bmt_cleanup:
+    cmp     dword ptr [rbp-36], 0
+    je      @F
+    WINCALL EnableWindow, qword ptr [g_hwnd], 1
+@@:
+    cmp     qword ptr [g_busy_hwnd], 0
+    je      @F
+    WINCALL DestroyWindow, qword ptr [g_busy_hwnd]
+    mov     qword ptr [g_busy_hwnd], 0
+@@:
+    cmp     dword ptr [rbp-40], 0
+    je      @F
+    WINCALL PostQuitMessage, dword ptr [rbp-44]
+@@:
+    mov     eax, dword ptr [rbp-48]
+    add     rsp, 240
+    pop     rbp
+    ret
+busy_run_popup endp
+
+; =============================================================================
+; busy_mount_tcvc -> eax = EXIT_* from tcvc_open + tcvc_to_index (+ drive mount)
+; =============================================================================
+busy_mount_tcvc proc
+    push    rbp
+    mov     rbp, rsp
+    sub     rsp, 48
+    mov     dword ptr [g_tcvc_mnt_rc], EXIT_IO
+    lea     rcx, [tcvc_mount_thread]
+    xor     edx, edx
+    call    busy_run_popup
+    test    eax, eax
+    jz      @F
+    call    tcvc_mount_work
+@@:
+    mov     eax, dword ptr [g_tcvc_mnt_rc]
+    add     rsp, 48
+    pop     rbp
+    ret
+busy_mount_tcvc endp
+
+; =============================================================================
+; busy_cfmount(ecx = isTcvc) -> eax = mounted drive letter ('D'..'Z' or 0)
+; =============================================================================
+busy_cfmount proc
+    push    rbp
+    mov     rbp, rsp
+    sub     rsp, 48
+    mov     dword ptr [g_cfm_is_tcvc], ecx
+    mov     dword ptr [g_cfm_letter], 0
+    lea     rcx, [cfmount_thread]
+    mov     edx, 2
+    call    busy_run_popup
+    test    eax, eax
+    jz      @F
+    call    cfmount_work
+@@:
+    mov     eax, dword ptr [g_cfm_letter]
+    add     rsp, 48
+    pop     rbp
+    ret
+busy_cfmount endp
+
+; =============================================================================
 ; draw_progwin(rcx = DRAWITEMSTRUCT*) - the whole progress half, in one pass.
 ;
 ; Heading, the file being worked on, a bar, and a count.  All owner-drawn for the
@@ -17894,6 +18938,19 @@ pgd_head:
     mov     dword ptr [g_pg_rc+4], PG_PAD + 62
     mov     dword ptr [g_pg_rc+8], PG_W - PG_PAD
     mov     dword ptr [g_pg_rc+12], PG_PAD + 62 + PG_BAR_H
+    cmp     dword ptr [g_pg_done], 0
+    jne     pgd_det_bar
+    cmp     dword ptr [g_is_tcvc], 0
+    jne     pgd_indet_bar
+    cmp     qword ptr [g_prog_total], 0
+    jne     pgd_det_bar
+pgd_indet_bar:
+    mov     rcx, qword ptr [g_dr_hdc]
+    lea     rdx, [g_pg_rc]
+    mov     r8, qword ptr [rbp-48]
+    call    draw_indet_bar
+    jmp     pgd_file
+pgd_det_bar:
     WINCALL FillRect, qword ptr [g_dr_hdc], addr g_pg_rc, qword ptr [g_hbr_track]
     mov     eax, dword ptr [g_prog_pct]
     cmp     eax, 100
@@ -18244,7 +19301,7 @@ pgw_create:
     mov     qword ptr [g_ctl_parent], 0
     ; its own timer, not the main window's: that one only ticks while g_running,
     ; and this window has a first frame to paint before the worker starts
-    WINCALL SetTimer, qword ptr [rbp-8], 4, 100, 0
+    WINCALL SetTimer, qword ptr [rbp-8], 4, 50, 0
     jmp     pgw_zero
 pgw_timer:
     cmp     dword ptr [g_pg_done], 0
@@ -18396,7 +19453,7 @@ pgs_haveclass:
     sub     eax, PG_H
     sar     eax, 1
     mov     dword ptr [rbp-12], eax
-    WINCALL CreateWindowExW, WS_EX_TOOLWINDOW, addr wc_progwin, addr s_pg_enc, \
+    WINCALL CreateWindowExW, <WS_EX_TOOLWINDOW or WS_EX_TOPMOST>, addr wc_progwin, addr s_pg_enc, \
             ST_MAINWND, dword ptr [rbp-8], dword ptr [rbp-12], PG_W, PG_H, \
             0, 0, qword ptr [g_hinst], 0
     mov     qword ptr [g_pg_hwnd], rax
@@ -18407,6 +19464,7 @@ pgs_haveclass:
     WINCALL CreateRoundRectRgn, 0, 0, PG_W+1, PG_H + PG_LOG_H + 1, WIN_ROUND, WIN_ROUND
     WINCALL SetWindowRgn, qword ptr [g_pg_hwnd], rax, 1
     WINCALL ShowWindow, qword ptr [g_pg_hwnd], SW_SHOW
+    WINCALL SetForegroundWindow, qword ptr [g_pg_hwnd]
     WINCALL UpdateWindow, qword ptr [g_pg_hwnd]
     mov     eax, 1
     add     rsp, 128
@@ -18869,8 +19927,8 @@ lb_create:
     je      @F
     WINCALL EnableWindow, qword ptr [g_hwnd], 0
 @@:
-    WINCALL ShowWindow, qword ptr [g_lb_hwnd], SW_SHOW
-    WINCALL UpdateWindow, qword ptr [g_lb_hwnd]
+    mov     rcx, qword ptr [g_lb_hwnd]
+    call    show_front_notopmost
 lb_loop:
     WINCALL GetMessageW, addr rbp-120, 0, 0, 0   ; MSG at [rbp-120..]
     test    eax, eax
@@ -19089,8 +20147,8 @@ sa_zwc:
     inc     r9d
     WINCALL CreateRoundRectRgn, 0, 0, r8d, r9d, WIN_ROUND, WIN_ROUND
     WINCALL SetWindowRgn, qword ptr [g_hwnd], rax, 1
-    WINCALL ShowWindow, qword ptr [g_hwnd], SW_SHOW
-    WINCALL UpdateWindow, qword ptr [g_hwnd]
+    mov     rcx, qword ptr [g_hwnd]
+    call    show_front_notopmost
 sa_loop:
     WINCALL GetMessageW, addr rbp-80, 0, 0, 0    ; MSG at [rbp-80..]
     test    eax, eax

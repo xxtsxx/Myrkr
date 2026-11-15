@@ -81,6 +81,8 @@ $p2 = $p2 -bor $LASTEXITCODE
 $p2 = $p2 -bor $LASTEXITCODE
 & $ps -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot "tcvcguitest.ps1")
 $p2 = $p2 -bor $LASTEXITCODE
+& $ps -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot "cfmounttest.ps1")
+$p2 = $p2 -bor $LASTEXITCODE
 & $ps -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot "shellexttest.ps1")
 $p2 = $p2 -bor $LASTEXITCODE
 

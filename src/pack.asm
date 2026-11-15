@@ -400,10 +400,6 @@ g_payoff    dq ?                        ; payload bytes written so far = the
                                         ; offset the next entry will start at
 g_entnext   dq ?                        ; ordinal to give the next entry
 g_entoff    dq ?                        ; where the entry in progress started
-g_entaad    db ENTRY_AAD_SEG_BYTES dup (?)  ; header || ordinal [|| segment]
-                                    ; sized for the LONGER of the two, so the
-                                    ; version-8 form does not overrun a buffer
-                                    ; declared for the version-7 one
 align 16
 g_rawblk    db CBLOCK dup (?)       ; raw tar accumulation block (pack)
 g_rawfill   dq ?
@@ -1154,15 +1150,10 @@ seg_bytes_from_hdr endp
 ; =============================================================================
 public entry_stream_open
 entry_stream_open proc frame
-    FRAME_PROLOG 112                        ; 112, not 80: the key made a fifth
-                                            ; local and at 64 it landed exactly
-                                            ; where gcm_init's outgoing area
-                                            ; began; the segment and the AAD
-                                            ; length make seven, and at 80 the
-                                            ; last two would land there instead.
-                                            ; framecheck is what says so.
+    FRAME_PROLOG 256
     ; [rbp-16]=ctx [rbp-24]=hdr [rbp-32]=ordinal [rbp-40]=decrypt [rbp-48]=key
-    ; [rbp-56]=segment [rbp-64]=aad length
+    ; [rbp-56]=segment [rbp-64]=aad length [rbp-80..-65]=nonce(16)
+    ; [rbp-192..-81]=aad(112 >= ENTRY_AAD_SEG_BYTES=92)
     mov     qword ptr [rbp-16], rcx
     mov     qword ptr [rbp-24], rdx
     mov     qword ptr [rbp-32], r8
@@ -1173,10 +1164,10 @@ entry_stream_open proc frame
     mov     dword ptr [rbp-56], eax             ; segment
     mov     rcx, r8
     inc     rcx
-    lea     rdx, [g_idxnonce]
+    lea     rdx, [rbp-80]
     mov     r8d, dword ptr [rbp-56]
     call    nonce_set
-    lea     r10, [g_entaad]
+    lea     r10, [rbp-192]
     mov     r11, qword ptr [rbp-24]
     xor     r9, r9
 eso_aad:
@@ -1202,11 +1193,11 @@ eso_len:
     mov     qword ptr [rbp-64], r8
     mov     rcx, qword ptr [rbp-16]
     mov     rdx, qword ptr [rbp-48]
-    lea     r8, [g_idxnonce]
+    lea     r8, [rbp-80]
     mov     r9, qword ptr [rbp-40]
     call    gcm_init
     mov     rcx, qword ptr [rbp-16]
-    lea     rdx, [g_entaad]
+    lea     rdx, [rbp-192]
     mov     r8, qword ptr [rbp-64]
     call    gcm_aad
     FRAME_EPILOG
@@ -3483,6 +3474,7 @@ snr_ret:
     ret
 sn_reserved endp
 
+public sanitize_name
 sanitize_name proc
     movzx   eax, byte ptr [rcx+0]
     test    al, al

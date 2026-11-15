@@ -18,6 +18,7 @@ include macros.inc
 
 extern tcvc_read_bytes:proc
 extern tcvc_idx_add:proc
+extern tcvc_is_sys_root:proc
 extern tcvc_sink_write:proc
 extern secure_zero:proc
 extern mem_alloc:proc
@@ -1471,6 +1472,14 @@ nwie_dot2:
     je      nwie_next
 
 nwie_join:
+    cmp     dword ptr [r13 + 8], 0
+    jne     nwie_not_sys
+    mov     rcx, rdi
+    mov     edx, r15d
+    call    tcvc_is_sys_root
+    test    eax, eax
+    jnz     nwie_next
+nwie_not_sys:
     mov     ecx, dword ptr [r13 + 8]        ; prefixLen
     lea     eax, [ecx + r15d]
     cmp     eax, ENTRY_NAME_MAX

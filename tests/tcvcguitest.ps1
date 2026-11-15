@@ -88,6 +88,9 @@ import sys
 sys.path.insert(0, r'$($PSScriptRoot)')
 import tcvctest as tc
 fs = tc.build_fat_image(12, {
+    '`$RECYCLE.BIN': {'S-1-5-21': {'deleted.txt': b'must not appear\n'}},
+    'System Volume Information': {'WPSettings.dat': b'must not appear\n'},
+    'pagefile.sys': b'must not appear\n',
     'hello.txt': b'Hello from GUI VeraCrypt browse!\n',
     'docs': {'readme.txt': b'Nested folder extracted selectively.\n'},
 })
@@ -144,14 +147,21 @@ with open(r'$hc', 'wb') as f:
     if (-not [TcVcGui]::IsWindowEnabled([TcVcGui]::Child($main, 171))) {
         throw "Open TC/VC glyph button (171) should remain enabled"
     }
+    if (-not [TcVcGui]::IsWindowEnabled([TcVcGui]::Child($main, 176))) {
+        throw "Mount drive glyph button (176) should be enabled for open TC/VC volume"
+    }
     $statusTxt = [TcVcGui]::Title([TcVcGui]::Child($main, 196))
-    if ($statusTxt -notmatch '^VeraCrypt .* AES-256 .* SHA-512 .* FAT12 .* Read-Only \(XTS\)$') {
-        throw "Unexpected TC/VC status line: '$statusTxt'"
+    if ($statusTxt -notmatch '^VeraCrypt .* AES-256 .* SHA-512 .* FAT12 .* ([D-Z]):\\ .* Read-Only \(XTS\)$') {
+        throw "Unexpected TC/VC status line (expected auto-mounted drive letter): '$statusTxt'"
+    }
+    $mntDrv = "$($Matches[1]):\"
+    if ([IO.File]::ReadAllText((Join-Path $mntDrv 'hello.txt')) -ne "Hello from GUI VeraCrypt browse!`n") {
+        throw "Mounted drive $mntDrv hello.txt content mismatch"
     }
     if ([TcVcGui]::Title([TcVcGui]::Child($main, 104)) -ne 'Extract all') {
         throw "Expected 'Extract all' on action button, got '$([TcVcGui]::Title([TcVcGui]::Child($main, 104)))'"
     }
-    'PASS: TC/VC browser disables Add/Delete, enables Open TC/VC glyph, and shows XTS metadata'
+    'PASS: TC/VC browser auto-mounts drive letter, disables Add/Delete, and shows XTS metadata'
 
     # 3. Select row 0 ('docs' folder) -> 'Extract selected' -> extract only docs/readme.txt
     [TcVcGui]::SetRowSelected($p.Handle, $lv, 0, $true)
@@ -191,10 +201,23 @@ with open(r'$hc', 'wb') as f:
     if ([IO.File]::ReadAllText($rootOut) -ne "Hello from GUI VeraCrypt browse!`n") {
         throw "Extracted hello.txt content mismatch"
     }
+    foreach ($sysEntry in @('$RECYCLE.BIN', 'System Volume Information', 'pagefile.sys')) {
+        if (Test-Path -LiteralPath (Join-Path $outDir $sysEntry)) {
+            throw "OS volume metadata '$sysEntry' leaked into extracted output!"
+        }
+    }
     if ((Get-FileHash -LiteralPath $hc).Hash -ne $beforeHash) {
         throw "Source .hc container was modified during read-only browse/extract!"
     }
     'PASS: Extract all extracts full volume and preserves source container byte-for-byte'
+
+    # 5. Close window cleanly and verify auto-unmount removes drive letter
+    [void][TcVcGui]::PostMessageW($main, 0x0111, [IntPtr]107, [IntPtr]::Zero)
+    if (-not $p.WaitForExit(5000)) { throw "Myrkr window did not close cleanly on Close button" }
+    if (Test-Path -LiteralPath $mntDrv) {
+        throw "Mounted drive $mntDrv remained mapped after Myrkr exited"
+    }
+    'PASS: Closing Myrkr cleanly unmounts the session drive letter'
 } finally {
     if ($p -and -not $p.HasExited) { $p.Kill(); $p.WaitForExit() }
     if ($null -eq $old) { Remove-Item Env:\MYRKR_DBG_NOSECDESK -ErrorAction SilentlyContinue } else { $env:MYRKR_DBG_NOSECDESK = $old }

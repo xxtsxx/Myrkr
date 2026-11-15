@@ -23,37 +23,37 @@ reach - one of them only noticed after a live install went wrong.)
 FLOORS = {
     "framecheck": {
         # FRAME_PROLOG procs whose frame was actually sized and checked.
-        "procs": 445,                    # 495 measured
+        "procs": 465,                    # 519 measured
         # RAW procs (push rbp / sub rsp,N) given the same spill-overlap
         # analysis.  Floored separately because they are nearly all of gui.asm,
         # and the summary line used to report only the count above - which read
         # as "gui.asm is not covered" to at least one person reviewing it.
-        "raw": 150,                      # 167 measured
+        "raw": 160,                      # 179 measured
     },
     "wincallcheck": {
         # WINCALL sites whose argument list was parsed and checked for reads of
         # a register the macro has already overwritten.
-        "sites": 1125,                   # 1251 measured
+        "sites": 1300,                   # 1447 measured
     },
     "constcheck": {
         # constants deliberately mirrored across modules and compared.
         "mirrored": 46,                  # 52 measured
-        "files": 43,                     # 48 sources incl. macros.inc
+        "files": 44,                     # 49 sources incl. macros.inc
     },
     "deadcode": {
-        "symbols": 2850,                 # 3190 measured
+        "symbols": 3000,                 # 3358 measured
     },
     "aligncheck": {
-        "scalars": 100,                  # 115 measured
+        "scalars": 100,                  # 116 measured
     },
     "nvcheck": {
         # procs whose writes to callee-saved registers were checked for a save
         # and a restore.
-        "procs": 760,                    # 850 measured
+        "procs": 800,                    # 894 measured
     },
     "wstrcheck": {
         # call sites whose bound-carrying register was checked.
-        "calls": 50,                     # 56 measured
+        "calls": 55,                     # 62 measured
     },
 }
 

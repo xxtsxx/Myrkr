@@ -298,6 +298,38 @@ rx2_ret:
     ret
 rlog_extracted endp
 
+; =============================================================================
+; rlog_current(rcx = UTF-8 name, edx = length) - publish the in-flight entry
+; name BEFORE extracting a potentially multi-GB file so live progress indicators
+; show the entry currently being extracted rather than the previous one.
+; =============================================================================
+public rlog_current
+rlog_current proc
+    test    rcx, rcx
+    jz      rc_ret
+    test    edx, edx
+    jz      rc_ret
+    mov     dword ptr [g_rl_curlen], 0
+    mov     r9d, edx
+    cmp     r9d, RL_CUR_MAX
+    jbe     @F
+    mov     r9d, RL_CUR_MAX
+@@:
+    xor     r10d, r10d
+    lea     r11, [g_rl_curname]
+rc_loop:
+    cmp     r10d, r9d
+    jae     rc_done
+    mov     al, byte ptr [rcx + r10]
+    mov     byte ptr [r11 + r10], al
+    inc     r10d
+    jmp     rc_loop
+rc_done:
+    mov     dword ptr [g_rl_curlen], r9d
+rc_ret:
+    ret
+rlog_current endp
+
 ; -----------------------------------------------------------------------------
 ; rl_num(rax = value) -> rcx = ptr, edx = length.  Decimal, unpadded.  Leaf.
 ; log.asm's log_putn is fixed-width and zero-pads, which reads as "0913 added".

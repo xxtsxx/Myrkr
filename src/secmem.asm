@@ -65,6 +65,7 @@ externdef uz_opad:byte                  ; unzip.asm: HMAC-SHA1 outer pad
 externdef uz_sctx:byte                  ; unzip.asm: HMAC-SHA1 context
 externdef uz_inner:byte                 ; unzip.asm: HMAC-SHA1 inner digest
 externdef g_tcvc_sec:byte               ; tcvc.asm: TC/VC XTS schedule + KDF/keyfile secrets
+externdef g_cf_mrk_key:byte             ; cfmount.asm: mounted .mrk 32-byte container key
 
 SECMEM_MAX      equ 32             ; registered static secret regions
 ; Slack added to the working set when a lock is refused for quota.  One lock is
@@ -259,6 +260,11 @@ secmem_init proc frame
     ; TrueCrypt/VeraCrypt unlocked XTS schedule, mixed password & keyfile pool
     lea     rcx, [g_tcvc_sec]
     mov     rdx, TCVC_SEC_SIZE
+    call    secmem_add
+
+    ; Cloud-Files mounted .mrk container key copy
+    lea     rcx, [g_cf_mrk_key]
+    mov     rdx, KEY_LEN
     call    secmem_add
 
     mov     qword ptr [g_sm_dyn_ptr], 0

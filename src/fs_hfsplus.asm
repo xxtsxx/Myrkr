@@ -18,6 +18,7 @@ include macros.inc
 
 extern tcvc_read_bytes:proc
 extern tcvc_idx_add:proc
+extern tcvc_is_sys_root:proc
 extern tcvc_sink_write:proc
 extern secure_zero:proc
 extern mem_alloc:proc
@@ -1337,7 +1338,14 @@ hwd_do_decode:
     test    eax, eax
     jz      hwd_corrupt
     mov     ebx, eax                        ; compLen
-
+    cmp     dword ptr [rbp-76], 0
+    jne     hwd_not_sys
+    lea     rcx, [g_hfs_comp8]
+    mov     edx, ebx
+    call    tcvc_is_sys_root
+    test    eax, eax
+    jnz     hwd_rec_adv
+hwd_not_sys:
     mov     ecx, dword ptr [rbp-76]         ; prefixLen
     lea     eax, [ecx + ebx]
     cmp     eax, ENTRY_NAME_MAX

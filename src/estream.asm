@@ -108,6 +108,7 @@ extern progress_done:proc
 extern drag_rows_mark:proc
 extern drag_prog_show:proc
 extern drag_prog_tick:proc
+extern drag_tcvc_tick:proc
 extern InvalidateRect:proc
 externdef g_hwnd:qword
 externdef g_hprog:qword
@@ -794,6 +795,13 @@ es_code endp
 ; a temp file that was never deleted.
 ; locals: [rbp-16] this
 ; =============================================================================
+public es_cur_pos
+es_cur_pos proc
+    mov     rax, qword ptr [rcx+ES_pos]
+    ret
+es_cur_pos endp
+
+public es_destroy
 es_destroy proc frame
     FRAME_PROLOG 48
     mov     qword ptr [rbp-16], rcx
@@ -1189,6 +1197,7 @@ ES_Release endp
 ; happened to leave there.
 ; locals: [rbp-16] this [rbp-24] pv [rbp-32] cb [rbp-40] pcbRead [rbp-48] n
 ; -----------------------------------------------------------------------------
+public ES_Read
 ES_Read proc frame
     FRAME_PROLOG 80
     mov     qword ptr [rbp-16], rcx
@@ -1282,6 +1291,7 @@ ES_Read endp
 ; Forward is served by reading and discarding, which is what it costs.
 ; locals: [rbp-16] this [rbp-24] target [rbp-32] plib
 ; -----------------------------------------------------------------------------
+public ES_Seek
 ES_Seek proc frame
     FRAME_PROLOG 64
     mov     qword ptr [rbp-16], rcx
@@ -1671,6 +1681,9 @@ ZS_Read proc frame
     mov     r10, qword ptr [rbp-16]
     mov     rax, qword ptr [rbp-48]
     add     qword ptr [r10+ZS_pos], rax
+    cmp     dword ptr [g_drag_prog], 0
+    je      zrd_ok
+    call    drag_tcvc_tick
 zrd_ok:
     mov     r10, qword ptr [rbp-40]
     test    r10, r10

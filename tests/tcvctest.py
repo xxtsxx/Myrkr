@@ -641,8 +641,18 @@ def build_exfat_image() -> tuple[bytes, dict[str, bytes]]:
     vol_lbl[1] = 4
     vol_lbl[2:10] = "EXFV".encode("utf-16le")
 
+    # OS metadata root folders/files on exFAT (MUST be hidden/skipped at volume root!)
+    sys_sub = _make_exfat_entry_set("WPSettings.dat", False, 10, 64, 64, True)
+    img[clus_off(5) : clus_off(5) + len(sys_sub)] = sys_sub
+    rec_sub = _make_exfat_entry_set("S-1-5-21.bin", False, 10, 64, 64, True)
+    img[clus_off(6) : clus_off(6) + len(rec_sub)] = rec_sub
+
     root_dir = (
         bytes(vol_lbl)
+        + _make_exfat_entry_set("System Volume Information", True, 5, cbytes, cbytes, True)
+        + _make_exfat_entry_set("$RECYCLE.BIN", True, 6, cbytes, cbytes, True)
+        + _make_exfat_entry_set(".Spotlight-V100", True, 5, cbytes, cbytes, True)
+        + _make_exfat_entry_set("pagefile.sys", False, 10, 128, 128, True)
         + _make_exfat_entry_set("contiguous_no_fat_chain.bin", False, 10, len(contig_data), len(contig_data), True)
         + _make_exfat_entry_set("fragmented_chained.bin", False, 25, len(frag_data), len(frag_data), False)
         + _make_exfat_entry_set("vdl_zero_tail.dat", False, 30, 5000, 9500, True)
@@ -945,8 +955,19 @@ def build_ntfs_image() -> tuple[bytes, dict[str, bytes]]:
 
     # Build Root Directory Record 5 with $INDEX_ROOT:$I30 pointing to $INDEX_ALLOCATION:$I30 subnode VCN 0 @ LCN 50!
     fn_extend = _ntfs_fn_val(5, 1, "$Extend", namespace=3)  # system $ name at root -> skipped
+    # Records 20, 21, 22: OS volume metadata ($RECYCLE.BIN, System Volume Information, pagefile.sys) -> MUST be skipped!
+    fn_recbin = _ntfs_fn_val(5, 1, "$RECYCLE.BIN", namespace=1)
+    ir_recbin = struct.pack("<IIII", 0x30, 1, cbytes, 1) + struct.pack("<IIII", 16, 32, 32, 0) + _ntfs_idx_end()
+    put_mft(20, _ntfs_mft_record(1, True, [_ntfs_attr_res(0x30, fn_recbin), _ntfs_attr_res(0x90, ir_recbin, name="$I30")]))
+    fn_svi = _ntfs_fn_val(5, 1, "System Volume Information", namespace=1)
+    put_mft(21, _ntfs_mft_record(1, True, [_ntfs_attr_res(0x30, fn_svi), _ntfs_attr_res(0x90, ir_recbin, name="$I30")]))
+    fn_pg = _ntfs_fn_val(5, 1, "pagefile.sys", namespace=1)
+    put_mft(22, _ntfs_mft_record(1, False, [_ntfs_attr_res(0x30, fn_pg), _ntfs_attr_res(0x80, b"PAGEFILE_JUNK")]))
     leaf_ents = (
         _ntfs_idx_entry(11, 1, fn_extend)
+        + _ntfs_idx_entry(20, 1, fn_recbin)
+        + _ntfs_idx_entry(21, 1, fn_svi)
+        + _ntfs_idx_entry(22, 1, fn_pg)
         + _ntfs_idx_entry(24, 2, fn24)
         + _ntfs_idx_entry(25, 3, fn25_dos)
         + _ntfs_idx_entry(25, 3, fn25_win)
@@ -1075,12 +1096,19 @@ def build_ext2_image() -> tuple[bytes, dict[str, bytes]]:
 
     # Inode 14: Symlink (0xA1FF) -> MUST be skipped!
     put_inode(14, 0xA1FF, 10, 0, b"/etc/hosts")
+    # Inodes 15 & 16: Root OS metadata dir & file ($RECYCLE.BIN, .Trash-1000 / .Trashes) -> MUST be skipped!
+    img[41 * bsize : 42 * bsize] = _pack_ext_dir_block([(15, b".", 2), (2, b"..", 2)], bsize)
+    put_inode(15, 0x41ED, bsize, 0, struct.pack("<I", 41))
+    put_inode(16, 0x81A4, 4, 0, struct.pack("<I", 40))
 
     # Root Inode 2 -> directory block 10
     root_blk = _pack_ext_dir_block(
         [
             (2, b".", 2),
             (2, b"..", 2),
+            (15, b"$RECYCLE.BIN", 2),
+            (15, b"System Volume Information", 2),
+            (16, b"hiberfil.sys", 1),
             (12, b"indirect_and_sparse.bin", 1),
             (13, b"caf\xe9_note.txt", 1),
             (14, b"skipped_symlink", 7),
@@ -1342,11 +1370,19 @@ def build_hfsx_image() -> tuple[bytes, dict[str, bytes]]:
     expected = {"CaseDir/Readme_HX.txt": body_a}
 
     cat_nsize = 8192
+    # Catalog B-tree records sorted or walked: include root OS metadata (.Spotlight-V100, .fseventsd, .Trashes, $RECYCLE.BIN) -> MUST be skipped!
     leaf_recs = [
+        _hfs_cat_key(2, "$RECYCLE.BIN") + _hfs_folder_rec(18),
+        _hfs_cat_key(2, ".Spotlight-V100") + _hfs_folder_rec(19),
+        _hfs_cat_key(2, ".Trashes") + _hfs_folder_rec(20),
+        _hfs_cat_key(2, ".fseventsd") + _hfs_folder_rec(21),
+        _hfs_cat_key(2, ".VolumeIcon.icns") + _hfs_file_rec(22, 64, 1, [(10, 1)], file_mode=0),
         _hfs_cat_key(2, "CaseDir") + _hfs_folder_rec(16),
         _hfs_cat_key(16, "Readme_HX.txt") + _hfs_file_rec(17, len(body_a), 1, [(10, 1)], file_mode=0),
+        _hfs_cat_key(18, "deleted_mac.bin") + _hfs_file_rec(23, 64, 1, [(10, 1)], file_mode=0),
+        _hfs_cat_key(19, "Store-V2") + _hfs_file_rec(24, 64, 1, [(10, 1)], file_mode=0),
     ]
-    cat_n0 = _hfs_btree_hdr_node(1, 1, 2, 1, 1, cat_nsize, 2)
+    cat_n0 = _hfs_btree_hdr_node(1, 1, len(leaf_recs), 1, 1, cat_nsize, 2)
     cat_n1 = _hfs_pack_btree_node(-1, 1, 0, 0, leaf_recs, cat_nsize)
     cat_blob = cat_n0 + cat_n1
     img[4 * bsize : 4 * bsize + len(cat_blob)] = cat_blob
@@ -2009,6 +2045,61 @@ def main() -> int:
         except Exception as exc:
             failures += 1
             print(f"  [FAIL] 4K exFAT / ext4 edge cases: {exc}")
+
+        # ---------------------------------------------------------------------
+        # Case 12: OS Storage-Volume Metadata Exclusion ($RECYCLE.BIN, RECYCLER,
+        #          System Volume Information, pagefile/hiberfil/swapfile/DumpStack,
+        #          macOS .Spotlight-V100/.fseventsd/.Trashes/.TemporaryItems)
+        #          while preserving nested user files/dirs with identical names
+        # ---------------------------------------------------------------------
+        try:
+            sys_tree = {
+                "$RECYCLE.BIN": {"S-1-5-21": {"deleted.txt": b"hidden recycle"}},
+                "RECYCLER": {"old.bin": b"hidden xp recycler"},
+                "RECYCLED": {"win98.bin": b"hidden win9x"},
+                "System Volume Information": {"WPSettings.dat": b"hidden svi", "IndexerVolumeGuid": b"guid"},
+                "pagefile.sys": b"hidden pagefile",
+                "HIBERFIL.SYS": b"hidden hiberfil",
+                "swapfile.sys": b"hidden swapfile",
+                "DumpStack.log": b"hidden dumpstack",
+                "DumpStack.log.tmp": b"hidden dumpstack tmp",
+                ".Spotlight-V100": {"Store-V2": {"db": b"hidden spotlight"}},
+                ".fseventsd": {"00000001": b"hidden fsevents"},
+                ".Trashes": {"501": {"trash.txt": b"hidden trashes"}},
+                ".TemporaryItems": {"tmp1": b"hidden temp"},
+                ".VolumeIcon.icns": b"hidden icon",
+                "keep_root.txt": b"Visible root file!\n",
+                "user_docs": {
+                    "pagefile.sys": b"Nested user file named pagefile.sys MUST be kept!\n",
+                    "$RECYCLE.BIN": {"keep.txt": b"Nested user subfolder MUST be kept!\n"},
+                },
+            }
+            sys_expected = {
+                "keep_root.txt": b"Visible root file!\n",
+                "user_docs/pagefile.sys": b"Nested user file named pagefile.sys MUST be kept!\n",
+                "user_docs/$RECYCLE.BIN/keep.txt": b"Nested user subfolder MUST be kept!\n",
+            }
+            sys_fat = build_fat_image(32, sys_tree, spc=1)
+            hc_sys = os.path.join(tmp, "sys_filter.hc")
+            with open(hc_sys, "wb") as f:
+                f.write(build_tcvc_volume(sys_fat, b"SysFilterPass!", [], is_vera=True, kdf_alg="sha256", salt_seed=b"sysf"))
+
+            rc, list_out = run_myrkr(exe, ["list", hc_sys, "-p", "SysFilterPass!"])
+            assert rc == EXIT_OK, f"list failed: rc={rc} out={list_out}"
+            for forbidden in ("System Volume Information", "WPSettings.dat", "HIBERFIL.SYS", "swapfile.sys", ".Spotlight-V100", ".fseventsd"):
+                assert forbidden not in list_out, f"OS metadata {forbidden!r} leaked into list output:\n{list_out}"
+            assert "keep_root.txt" in list_out and "user_docs/pagefile.sys" in list_out
+
+            out_sys = os.path.join(tmp, "out_sys_filter")
+            rc, out = run_myrkr(exe, ["decrypt", hc_sys, "-o", out_sys, "-p", "SysFilterPass!"])
+            assert rc == EXIT_OK, f"decrypt failed: rc={rc} out={out}"
+            assert_tree_matches(collect_extracted_files(out_sys), sys_expected, "VC-SysFilter")
+            for hidden_dir in ("$RECYCLE.BIN", "RECYCLER", "RECYCLED", "System Volume Information", ".Spotlight-V100", ".fseventsd", ".Trashes", ".TemporaryItems"):
+                assert not os.path.exists(os.path.join(out_sys, hidden_dir)), f"Hidden root dir {hidden_dir} created on disk!"
+            print("  [PASS] Volume-root OS metadata hidden across list & decrypt while preserving nested user paths")
+        except Exception as exc:
+            failures += 1
+            print(f"  [FAIL] OS metadata exclusion: {exc}")
 
     if failures:
         print(f"FAILED: {failures} test case(s)")

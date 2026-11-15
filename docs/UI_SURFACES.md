@@ -33,6 +33,7 @@ What each format can do, and which of the three surfaces reaches it: the
 |---|---|---|---|---|---|---|
 | create | yes | yes | **no** | Create .mrk / Create ZIP | yes | right-click / right-drag |
 | open / browse | yes | yes | yes (incl. disguised files via drive glyph) | Open TrueCrypt/VeraCrypt container (`ID_OPENTC`) | yes (`.tc`/`.hc`) | double-click, right-click, or right-drag |
+| mount as read-only drive (`Z:`..`D:`) | yes (manual toggle) | **no** | yes (auto-mounts on open + toggle) | Mount as read-only drive (`ID_MOUNTDRV`) | — | browse directly in Explorer |
 | extract all | yes | yes | yes | Extract all | — | yes (single `.tc`/`.hc` right-drag) |
 | extract selected | yes | yes | yes | Extract selected | — | — |
 | drag entries out | yes | yes | yes (up to 512 MiB per entry) | — | drag out to Explorer | — |
@@ -43,8 +44,12 @@ When opening a TrueCrypt/VeraCrypt volume, the password prompt (`myrkr_secdesk`)
 adds a **Keyfiles** row (**+ File**, **+ Folder**, **Clear**) and lifts the
 encryption password-policy floor (permitting empty passwords when keyfiles are
 staged, up to 128 UTF-8 password bytes). Once unlocked, **Add files**, **Add
-folder**, **Delete**, and drop-to-append are disabled, and the status bar displays
-the detected format, cipher/cascade, KDF, filesystem, and `Read-Only (XTS)`.
+folder**, **Delete**, and drop-to-append are disabled, OS-created volume metadata
+(`$RECYCLE.BIN`, `System Volume Information`, `pagefile.sys`, `.Spotlight-V100`,
+`.fseventsd`, `.Trashes`, etc.) is hidden at the volume root, a user-mode Cloud
+Files read-only drive letter (`Z:` downward) is mounted automatically, and the
+status bar displays the mounted drive letter alongside the detected format,
+cipher/cascade, KDF, filesystem, and `Read-Only (XTS)`.
 
 ## The gap this closed
 

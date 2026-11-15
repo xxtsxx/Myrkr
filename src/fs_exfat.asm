@@ -15,6 +15,7 @@ include macros.inc
 
 extern tcvc_read_bytes:proc
 extern tcvc_idx_add:proc
+extern tcvc_is_sys_root:proc
 extern tcvc_sink_write:proc
 extern secure_zero:proc
 extern WideCharToMultiByte:proc
@@ -628,6 +629,14 @@ ewd_chk_d2:
     je      ewd_loop
 
 ewd_join:
+    cmp     dword ptr [rbp-68], 0
+    jne     ewd_not_sys
+    mov     rcx, rdi
+    mov     edx, r14d
+    call    tcvc_is_sys_root
+    test    eax, eax
+    jnz     ewd_loop
+ewd_not_sys:
     mov     ecx, dword ptr [rbp-68]         ; prefixLen
     lea     eax, [ecx + r14d]
     cmp     eax, ENTRY_NAME_MAX

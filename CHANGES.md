@@ -41,6 +41,27 @@ what changed and why, not a raw commit dump.
     status line), single-file `.tc`/`.hc` right-drag classification in
     `myrkrshell.dll`, and `.tc`/`.hc` → `Myrkr.VolumeContainer` MSI registration
     (`MYRKR_NOTCASSOC=1` opt-out).
+- **User-mode read-only Windows drive mounting (`src/cfmount.asm`).** Open
+  TrueCrypt/VeraCrypt (`.tc`/`.hc`) volumes now auto-mount as a session Windows
+  drive letter (`Z:` downward) for direct File Explorer access without kernel
+  drivers or UAC elevation, and a new command-bar **Mount as read-only drive**
+  glyph button (`ID_MOUNTDRV`) toggles drive mounting for both `.tc`/`.hc` and
+  native `.mrk` containers (`tests/cfmounttest.ps1`). Backed by inbox
+  `cldapi.dll` + `DefineDosDeviceW`, non-indexed sync-root folders, fail-closed
+  AES-256-GCM authentication before hydration on `.mrk` streams, automatic
+  placeholder dehydration (`0` on-disk bytes) on handle close, and stale-mount
+  sweeping on startup.
+- **Animated indeterminate mount/extract progress & OS volume metadata
+  filtering.** Added a topmost sweeping-bar busy popup while unlocking,
+  scanning, and mounting TrueCrypt & VeraCrypt volumes (`Opening container...`
+  → `Mounting volume...` in `busy_mount_tcvc` / `busy_cfmount`), topmost
+  sweeping progress bars + current-file status during `.tc`/`.hc` extraction,
+  drag-out, and `--to` progress windows, initial front Z-order placement on new
+  Myrkr windows without persistent always-on-top lock, and root-level filtering
+  of OS-created volume metadata (`$RECYCLE.BIN`, `System Volume Information`,
+  `pagefile.sys`, `hiberfil.sys`, `swapfile.sys`, `.Spotlight-V100`,
+  `.fseventsd`, `.Trashes`, `.TemporaryItems`, `.VolumeIcon.icns`) across all 5
+  filesystem readers.
 
 ### Security & Hardening
 

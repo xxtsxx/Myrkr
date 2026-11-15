@@ -15,6 +15,7 @@ include macros.inc
 
 extern tcvc_read_bytes:proc
 extern tcvc_idx_add:proc
+extern tcvc_is_sys_root:proc
 extern tcvc_sink_write:proc
 extern secure_zero:proc
 extern MultiByteToWideChar:proc
@@ -934,6 +935,15 @@ fwd_chk_dot2:
     je      fwd_loop
 
 fwd_build_path:
+    ; Skip OS volume-root metadata ($RECYCLE.BIN, System Volume Information, etc.)
+    cmp     dword ptr [rbp-72], 0
+    jne     fwd_not_sys
+    mov     rcx, rdi
+    mov     edx, ebx
+    call    tcvc_is_sys_root
+    test    eax, eax
+    jnz     fwd_loop
+fwd_not_sys:
     ; Combine prefix + comp8 into g_fat_path
     mov     ecx, dword ptr [rbp-72]         ; prefixLen
     lea     eax, [ecx + ebx]
