@@ -605,8 +605,10 @@ NMCD_dwItemSpec     equ 56
 NMLVCD_iSubItem     equ 88
 CDDS_PREPAINT       equ 00001h
 CDDS_ITEMPREPAINT   equ 10001h
+CDDS_ITEMPOSTPAINT  equ 10002h
 CDDS_ITEMPREPAINT_SUB equ 30001h
 CDRF_SKIPDEFAULT    equ 00004h
+CDRF_NOTIFYPOSTPAINT equ 00010h
 CDRF_NOTIFYITEMDRAW equ 00020h
 CDRF_NOTIFYSUBITEMDRAW equ 00020h
 ; list-view dark colouring
@@ -719,13 +721,21 @@ LAY_LV_MIN_H        equ 40
 LAY_COL_SIZE        equ 80
 LAY_COL_PROG        equ 103
 LAY_COL_FIXED       equ LAY_COL_SIZE + LAY_COL_PROG + 4   ; +4 = column grid slack
+LVM_GETNEXTITEM     equ 0100Ch               ; LVM_FIRST + 12
 LVM_SETCOLUMNWIDTH  equ 0101Eh               ; LVM_FIRST + 30
+LVM_SETITEMSTATE    equ 0102Bh               ; LVM_FIRST + 43
 LVM_GETITEMSTATE    equ 0102Ch               ; LVM_FIRST + 44
 LVM_GETSELECTEDCOUNT equ 01032h              ; LVM_FIRST + 50
+LVI_state           equ 12
+LVI_stateMask       equ 16
 LVI_iIndent         equ 48                   ; LVITEMW.iIndent on x64
 LVIF_INDENT         equ 00010h
+NM_CLICK            equ 0FFFFFFFEh            ; NM_FIRST - 2
 NM_DBLCLK           equ 0FFFFFFFDh            ; NM_FIRST - 3
 NMIA_iItem          equ 24                   ; NMITEMACTIVATE.iItem on x64
+NMIA_ptActionX      equ 44                   ; NMITEMACTIVATE.ptAction.x on x64
+VK_LEFT             equ 00025h
+VK_RIGHT            equ 00027h
 LVN_ITEMCHANGED     equ 0FFFFFF9Bh            ; LVN_FIRST - 1 (= -101)
 LVN_BEGINDRAG       equ 0FFFFFF93h            ; LVN_FIRST - 9 (= -109)
 NMLV_iItem          equ 24                   ; NMLISTVIEW on x64
@@ -2247,10 +2257,10 @@ g_busy_reg    dd ?                           ; 1 once wc_busy is registered
 g_tcvc_mnt_rc dd ?                           ; EXIT_* from tcvc_mount_thread
 g_cfm_is_tcvc dd ?                           ; modeFlags input for cfmount_thread
 g_cfm_letter  dd ?                           ; drive letter output from cfmount_thread
-g_automount_mrk  dd ?                        ; 1 = auto-mount .mrk archive on open
 g_force_ro_mount dd ?                        ; 1 = mount Read-Only (unmerged .delta.mrk kept)
 g_commit_mode    dd ?                        ; 0 = finish_commit+merge, 1 = crash-recovery merge
 g_commit_rc      dd ?                        ; EXIT_* from commit_thread
+ALIGN 8
 g_saved_setid    db 16 dup (?)               ; 12B CONTAINER_HDR.set_id snapshot
 g_gui_delta_w    dw MAX_PATH_CHARS dup (?)   ; <stem>.delta.mrk wide path
 g_busy_rc     dd 4 dup (?)                   ; scratch RECT for busy card paint
@@ -5323,6 +5333,7 @@ pl_z:
     lea     r10, [g_rows]
     add     r10, rax
     mov     eax, dword ptr [r10+ROW_depth]
+    inc     eax                              ; +1 indent unit reserves 16px left chevron gutter
     mov     dword ptr [g_lvi+LVI_iIndent], eax
     mov     rcx, qword ptr [rbp-8]
     call    row_display
@@ -5379,6 +5390,7 @@ pl_ret:
     ; scrolled past the end.
     call    lv_metrics
     call    lv_apply
+    call    container_update_action
     add     rsp, 64
     pop     rbp
     ret
@@ -7428,7 +7440,8 @@ switch_to_output proc frame
     je      @F
     WINCALL EnableWindow, qword ptr [g_hopentc], 1
 @@:
-    mov     dword ptr [g_automount_mrk], 1
+    lea     rcx, [g_expanded]
+    call    pset_clear
     call    container_load
 sto_ret:
     FRAME_EPILOG
@@ -8108,6 +8121,8 @@ tdm_call_tcvc:
 
 tdm_call_mrk:
     mov     dword ptr [rbp-24], 0
+    cmp     dword ptr [g_force_ro_mount], 0
+    jne     tdm_mrk_flags
     WINCALL delta_path_for, addr g_filepath_w, addr g_gui_delta_w, MAX_PATH_CHARS
     test    eax, eax
     jz      tdm_mrk_flags
@@ -12284,8 +12299,6 @@ refresh_mrk_listing proc frame
     test    eax, eax
     jnz     rml_ret
     call    populate_list
-    call    container_expand_top
-    call    populate_list
     call    idx_summarise
     mov     rax, qword ptr [g_idx_files]
     mov     qword ptr [g_scan_files], rax
@@ -12305,9 +12318,6 @@ refresh_mrk_listing endp
 
 container_load proc frame
     FRAME_PROLOG 80
-    mov     eax, dword ptr [g_automount_mrk]
-    mov     dword ptr [g_automount_mrk], 0
-    mov     dword ptr [rbp-24], eax
     mov     dword ptr [g_force_ro_mount], 0
     call    busy_unmount_commit
     lea     rax, [g_filepath_w]
@@ -12473,13 +12483,9 @@ cl_tcvc_err:
 cl_listed:
     ; populate_list derives the rows from the inventory itself now, so there is
     ; no separate rows_from_index call here to fall out of step with it.
-    call    populate_list
-    ; Open on the top LEVEL, not on the top ROW.  An input list starts collapsed
-    ; because its top level is what the user picked and each row names something
-    ; they chose; a container's top level is an accident of how it was packed -
-    ; very often exactly one folder - and a list with one row in it is not a
-    ; listing of anything.  Seeded once, so a collapse made afterwards sticks.
-    call    container_expand_top
+    ; Folders start collapsed by default (matching the encrypt input list) and
+    ; open or close when the user clicks a folder's chevron, double-clicks, or
+    ; presses Left/Right arrow keys.
     call    populate_list
     ; The summary reports what the inventory says, and it says FILES.  This was
     ; g_idxcount - every index entry, directories included - so a folder tree
@@ -12504,7 +12510,7 @@ cl_listed:
     jne     cl_mount_synced
     mov     eax, dword ptr [g_remount_after_edit]
     mov     dword ptr [g_remount_after_edit], 0
-    or      eax, dword ptr [rbp-24]
+    test    eax, eax
     jz      cl_mount_synced
     cmp     byte ptr [g_pkhdr + CONTAINER_HDR.archive], 1
     jne     cl_mount_synced
@@ -12536,13 +12542,6 @@ cl_fail:
     ret
 container_load endp
 
-; =============================================================================
-; container_expand_top - mark every top-level directory of a freshly loaded
-; container as expanded.  Runs over the ROW model rather than over the inventory
-; a second time: straight after the first populate_list every row is depth 0, so
-; this is the top level by construction.  The depth test keeps that true if it
-; is ever called anywhere else.
-; =============================================================================
 ; =============================================================================
 ; container_expand_prefix - open the folder an add just went into, and every
 ; folder above it, so that what was added can be seen.
@@ -12613,34 +12612,6 @@ cep_ret:
     FRAME_EPILOG
     ret
 container_expand_prefix endp
-
-container_expand_top proc frame
-    FRAME_PROLOG 64
-    mov     qword ptr [rbp-24], 0
-cet_row:
-    mov     rax, qword ptr [rbp-24]
-    cmp     rax, qword ptr [g_rowcount]
-    jae     cet_done
-    imul    rax, rax, ROW_SIZE
-    lea     r10, [g_rows]
-    add     r10, rax
-    cmp     dword ptr [r10+ROW_depth], 0
-    jne     cet_next
-    mov     eax, dword ptr [r10+ROW_flags]
-    test    eax, ROWF_DIR
-    jz      cet_next
-    mov     rcx, qword ptr [rbp-24]
-    call    row_path
-    lea     rcx, [g_expanded]
-    mov     rdx, rax
-    call    pset_add
-cet_next:
-    inc     qword ptr [rbp-24]
-    jmp     cet_row
-cet_done:
-    FRAME_EPILOG
-    ret
-container_expand_top endp
 
 ; =============================================================================
 ; idx_summarise - files, directories and bytes across the WHOLE inventory.
@@ -14411,6 +14382,102 @@ dlp_ret:
 draw_lv_progress endp
 
 ; =============================================================================
+; draw_lv_chevron(rcx = NMLVCUSTOMDRAW*) - paint a right-pointing '>' (collapsed)
+; or down-pointing 'v' (expanded) chevron in the 16px left gutter of directory
+; rows.  locals (frame 128): hdc[-24] row[-32] flags[-36] depth[-40] cy[-44]
+;   cx[-48] pen[-56] oldpen[-64] scratch[-76..-68]
+; =============================================================================
+draw_lv_chevron proc frame
+    FRAME_PROLOG 128
+    mov     rax, qword ptr [rcx+NMCD_hdc]
+    mov     qword ptr [rbp-24], rax
+    mov     rax, qword ptr [rcx+NMCD_dwItemSpec]
+    mov     qword ptr [rbp-32], rax
+    cmp     rax, qword ptr [g_rowcount]
+    jae     dlc_ret
+    imul    rax, rax, ROW_SIZE
+    lea     r10, [g_rows]
+    add     r10, rax
+    mov     eax, dword ptr [r10+ROW_flags]
+    test    eax, ROWF_DIR
+    jz      dlc_ret
+    mov     dword ptr [rbp-36], eax
+    mov     eax, dword ptr [r10+ROW_depth]
+    mov     dword ptr [rbp-40], eax
+
+    mov     dword ptr [g_lvrc+0], LVIR_BOUNDS
+    WINCALL SendMessageW, qword ptr [g_hlist], LVM_GETITEMRECT, qword ptr [rbp-32], addr g_lvrc
+    test    eax, eax
+    jz      dlc_ret
+
+    mov     eax, dword ptr [g_lvrc+4]
+    add     eax, dword ptr [g_lvrc+12]
+    sar     eax, 1
+    mov     dword ptr [rbp-44], eax          ; cy
+
+    mov     eax, dword ptr [rbp-40]
+    shl     eax, 4
+    add     eax, 11
+    mov     dword ptr [rbp-48], eax          ; cx = 11 + depth * 16
+
+    mov     edx, CLR_HINT
+    test    dword ptr [rbp-36], ROWF_EXPANDED
+    jz      @F
+    mov     edx, CLR_WHITE
+@@:
+    WINCALL CreatePen, PS_SOLID, 1, edx
+    test    rax, rax
+    jz      dlc_ret
+    mov     qword ptr [rbp-56], rax
+    WINCALL SelectObject, qword ptr [rbp-24], qword ptr [rbp-56]
+    mov     qword ptr [rbp-64], rax
+
+    test    dword ptr [rbp-36], ROWF_EXPANDED
+    jnz     dlc_open
+
+    ; Collapsed '>': (cx-2, cy-4) -> (cx+2, cy) -> (cx-3, cy+5)
+    mov     edx, dword ptr [rbp-48]
+    sub     edx, 2
+    mov     r8d, dword ptr [rbp-44]
+    sub     r8d, 4
+    WINCALL MoveToEx, qword ptr [rbp-24], edx, r8d, 0
+    mov     edx, dword ptr [rbp-48]
+    add     edx, 2
+    mov     r8d, dword ptr [rbp-44]
+    WINCALL LineTo, qword ptr [rbp-24], edx, r8d
+    mov     edx, dword ptr [rbp-48]
+    sub     edx, 3
+    mov     r8d, dword ptr [rbp-44]
+    add     r8d, 5
+    WINCALL LineTo, qword ptr [rbp-24], edx, r8d
+    jmp     dlc_clean
+
+dlc_open:
+    ; Expanded 'v': (cx-4, cy-2) -> (cx, cy+2) -> (cx+5, cy-3)
+    mov     edx, dword ptr [rbp-48]
+    sub     edx, 4
+    mov     r8d, dword ptr [rbp-44]
+    sub     r8d, 2
+    WINCALL MoveToEx, qword ptr [rbp-24], edx, r8d, 0
+    mov     edx, dword ptr [rbp-48]
+    mov     r8d, dword ptr [rbp-44]
+    add     r8d, 2
+    WINCALL LineTo, qword ptr [rbp-24], edx, r8d
+    mov     edx, dword ptr [rbp-48]
+    add     edx, 5
+    mov     r8d, dword ptr [rbp-44]
+    sub     r8d, 3
+    WINCALL LineTo, qword ptr [rbp-24], edx, r8d
+
+dlc_clean:
+    WINCALL SelectObject, qword ptr [rbp-24], qword ptr [rbp-64]
+    WINCALL DeleteObject, qword ptr [rbp-56]
+dlc_ret:
+    FRAME_EPILOG
+    ret
+draw_lv_chevron endp
+
+; =============================================================================
 ; draw_bar(rcx = DRAWITEMSTRUCT*) - flat, solid, borderless progress bar for the
 ; strength meter (ID_STRENGTH) and the operation bar (ID_PROG).  Reads its fill
 ; percent + colour from globals keyed by the control id.
@@ -14777,6 +14844,56 @@ ls_ret_saved:
     mov     rax, qword ptr [rbp-40]
     jmp     ls_ret
 ls_notpaint:
+    cmp     rdx, WM_KEYDOWN
+    jne     ls_notkey
+    mov     rax, qword ptr [rbp-24]
+    cmp     rax, VK_RIGHT
+    je      ls_key_lr
+    cmp     rax, VK_LEFT
+    jne     ls_nothover
+ls_key_lr:
+    WINCALL SendMessageW, qword ptr [rbp-8], LVM_GETNEXTITEM, -1, LVIS_FOCUSED
+    cmp     rax, 0
+    jge     @F
+    WINCALL SendMessageW, qword ptr [rbp-8], LVM_GETNEXTITEM, -1, LVIS_SELECTED
+    cmp     rax, 0
+    jl      ls_nothover
+@@:
+    cmp     rax, qword ptr [g_rowcount]
+    jae     ls_nothover
+    mov     qword ptr [rbp-56], rax
+    imul    rax, rax, ROW_SIZE
+    lea     r10, [g_rows]
+    add     r10, rax
+    mov     ecx, dword ptr [r10+ROW_flags]
+    test    ecx, ROWF_DIR
+    jz      ls_nothover
+    cmp     qword ptr [rbp-24], VK_RIGHT
+    jne     ls_key_left
+    test    ecx, ROWF_EXPANDED
+    jnz     ls_key_done
+    jmp     ls_key_tog
+ls_key_left:
+    test    ecx, ROWF_EXPANDED
+    jz      ls_key_done
+ls_key_tog:
+    mov     ecx, dword ptr [rbp-56]
+    call    row_toggle
+    lea     rcx, [g_lvi]
+    xor     r10, r10
+@@:
+    mov     byte ptr [rcx+r10], 0
+    inc     r10
+    cmp     r10, 96
+    jb      @B
+    mov     dword ptr [g_lvi+LVI_mask], LVIF_STATE
+    mov     dword ptr [g_lvi+LVI_state], LVIS_SELECTED or LVIS_FOCUSED
+    mov     dword ptr [g_lvi+LVI_stateMask], LVIS_SELECTED or LVIS_FOCUSED
+    WINCALL SendMessageW, qword ptr [rbp-8], LVM_SETITEMSTATE, qword ptr [rbp-56], addr g_lvi
+ls_key_done:
+    xor     rax, rax
+    jmp     ls_ret
+ls_notkey:
     cmp     rdx, WM_LBUTTONDOWN
     je      ls_lbdown
     cmp     rdx, WM_LBUTTONUP
@@ -15873,9 +15990,34 @@ wp_notify:
     cmp     rdx, ID_LIST
     jne     wp_default
     mov     eax, dword ptr [rcx+NMH_code]
-    ; Double-click opens or closes a folder row.  Chosen over a click target on
-    ; a chevron because the rows are owner-measured and a hit zone that small
-    ; would be its own source of misses.
+    ; Single-click in a folder row's 16px left chevron gutter opens or closes it;
+    ; double-clicking anywhere on a folder row does the same.
+    cmp     eax, NM_CLICK
+    jne     @F
+    movsxd  r10, dword ptr [rcx+NMIA_iItem]
+    cmp     r10, 0
+    jl      wp_default
+    cmp     r10, qword ptr [g_rowcount]
+    jae     wp_default
+    imul    rax, r10, ROW_SIZE
+    lea     r11, [g_rows]
+    add     r11, rax
+    test    dword ptr [r11+ROW_flags], ROWF_DIR
+    jz      wp_default
+    mov     eax, dword ptr [r11+ROW_depth]
+    inc     eax
+    shl     eax, 4
+    add     eax, 4
+    mov     edx, dword ptr [rcx+NMIA_ptActionX]
+    test    edx, edx
+    js      wp_default
+    cmp     edx, eax
+    jge     wp_default
+    mov     ecx, r10d
+    call    row_toggle
+    xor     rax, rax
+    jmp     wp_ret
+@@:
     cmp     eax, NM_DBLCLK
     jne     @F
     mov     ecx, dword ptr [rcx+NMIA_iItem]
@@ -15933,8 +16075,26 @@ wp_notify:
 @@:
     cmp     eax, CDDS_ITEMPREPAINT
     jne     @F
-    ; Native painting now owns the complete background, with no row overpaint.
+    ; Native painting now owns the complete background, with no row overpaint;
+    ; directory rows also ask for post-paint to draw their expand/collapse chevron.
+    mov     rax, qword ptr [rcx+NMCD_dwItemSpec]
+    cmp     rax, qword ptr [g_rowcount]
+    jae     wp_cd_nodir
+    imul    rax, rax, ROW_SIZE
+    lea     r10, [g_rows]
+    add     r10, rax
+    test    dword ptr [r10+ROW_flags], ROWF_DIR
+    jz      wp_cd_nodir
+    mov     rax, CDRF_NOTIFYSUBITEMDRAW or CDRF_NOTIFYPOSTPAINT
+    jmp     wp_ret
+wp_cd_nodir:
     mov     rax, CDRF_NOTIFYSUBITEMDRAW
+    jmp     wp_ret
+@@:
+    cmp     eax, CDDS_ITEMPOSTPAINT
+    jne     @F
+    call    draw_lv_chevron
+    xor     rax, rax                     ; CDRF_DODEFAULT
     jmp     wp_ret
 @@:
     cmp     eax, CDDS_ITEMPREPAINT_SUB
@@ -16670,7 +16830,6 @@ gm_notbadset:
     ; only to decide whether to ask before the window appears.
     cmp     dword ptr [g_container], 0
     je      gm_notcontainer
-    mov     dword ptr [g_automount_mrk], 1
     call    container_load
     test    eax, eax
     jnz     gm_cl_failed

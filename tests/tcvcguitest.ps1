@@ -135,8 +135,19 @@ with open(r'$hc', 'wb') as f:
         Start-Sleep -Milliseconds 100
     }
     $rowCount = [TcVcGui]::SendMessageW($lv, 0x1004, [IntPtr]::Zero, [IntPtr]::Zero).ToInt64()
-    # container_expand_top expands top-level folders: row 0 = docs, row 1 = docs/readme.txt, row 2 = hello.txt
-    if ($rowCount -ne 3) { throw "Expected 3 tree rows (docs, docs/readme.txt, hello.txt), got $rowCount" }
+    # Folders start collapsed by default: row 0 = docs (collapsed), row 1 = hello.txt
+    if ($rowCount -ne 2) { throw "Expected 2 collapsed tree rows on open (docs, hello.txt), got $rowCount" }
+
+    # Single-click the chevron gutter on row 0 ('docs', x=11, y=10) to expand it
+    $chevPt = [IntPtr]((10 -shl 16) -bor 11)
+    [void][TcVcGui]::PostMessageW($lv, 0x0201, [IntPtr]1, $chevPt)
+    [void][TcVcGui]::PostMessageW($lv, 0x0202, [IntPtr]0, $chevPt)
+    for ($i = 0; $i -lt 30; $i++) {
+        if ([TcVcGui]::SendMessageW($lv, 0x1004, [IntPtr]::Zero, [IntPtr]::Zero).ToInt64() -eq 3) { break }
+        Start-Sleep -Milliseconds 50
+    }
+    $rowCountExp = [TcVcGui]::SendMessageW($lv, 0x1004, [IntPtr]::Zero, [IntPtr]::Zero).ToInt64()
+    if ($rowCountExp -ne 3) { throw "Clicking folder chevron did not expand 'docs' (expected 3 rows, got $rowCountExp)" }
 
     foreach ($disabledId in @(154, 155, 161)) {
         $ctl = [TcVcGui]::Child($main, $disabledId)
@@ -163,8 +174,16 @@ with open(r'$hc', 'wb') as f:
     }
     'PASS: TC/VC browser auto-mounts drive letter, disables Add/Delete, and shows XTS metadata'
 
-    # 3. Select row 0 ('docs' folder) -> 'Extract selected' -> extract only docs/readme.txt
+    # 3. Select row 0 ('docs' folder), verify Left/Right arrow collapse & expand, then 'Extract selected'
     [TcVcGui]::SetRowSelected($p.Handle, $lv, 0, $true)
+    [void][TcVcGui]::SendMessageW($lv, 0x0100, [IntPtr]0x25, [IntPtr]::Zero) # VK_LEFT collapses 'docs'
+    if ([TcVcGui]::SendMessageW($lv, 0x1004, [IntPtr]::Zero, [IntPtr]::Zero).ToInt64() -ne 2) {
+        throw "VK_LEFT did not collapse 'docs' folder back to 2 rows"
+    }
+    [void][TcVcGui]::SendMessageW($lv, 0x0100, [IntPtr]0x27, [IntPtr]::Zero) # VK_RIGHT re-expands 'docs'
+    if ([TcVcGui]::SendMessageW($lv, 0x1004, [IntPtr]::Zero, [IntPtr]::Zero).ToInt64() -ne 3) {
+        throw "VK_RIGHT did not re-expand 'docs' folder to 3 rows"
+    }
     if ([TcVcGui]::Title([TcVcGui]::Child($main, 104)) -ne 'Extract selected') {
         throw "Selecting row 0 did not switch action button to 'Extract selected'"
     }

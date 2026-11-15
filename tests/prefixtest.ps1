@@ -98,7 +98,20 @@ function Find-Row($c,$name) {
   for($r=0;$r -lt $n;$r++){ if ((Get-RowText $c $r) -eq $name) { return $r } }
   return -1
 }
-# state and stateMask are at offsets 12 and 16, NOT 0 and 4. Getting that wrong
+function Expand-Row($c,$row) {
+  $rc=New-Object byte[] 16; $wr=[IntPtr]::Zero
+  [void][X]::WriteProcessMemory($c.p.Handle,$c.mem,$rc,[IntPtr]16,[ref]$wr)
+  [void][X]::SendMessageW($c.lv,0x100E,[IntPtr]$row,$c.mem)
+  $out=New-Object byte[] 16; $rd=[IntPtr]::Zero
+  [void][X]::ReadProcessMemory($c.p.Handle,$c.mem,$out,[IntPtr]16,[ref]$rd)
+  $x=[BitConverter]::ToInt32($out,0)+11
+  $y=[int](([BitConverter]::ToInt32($out,4)+[BitConverter]::ToInt32($out,12))/2)
+  $lp=[IntPtr](([int64]$y -shl 16) -bor ([int64]$x -band 0xFFFF))
+  [void][X]::PostMessageW($c.lv,0x0201,[IntPtr]1,$lp)
+  [void][X]::PostMessageW($c.lv,0x0202,[IntPtr]0,$lp)
+  Start-Sleep -Milliseconds 500
+}
+# state and stateMask live at +12 and +16 in LVITEMW (x64): getting those wrong
 # selects nothing, and a test that then counts rows "passes" vacuously.
 function Select-Row($c,$row) {
   $li=New-Object byte[] 88; $wr=[IntPtr]::Zero
@@ -173,6 +186,7 @@ foreach ($case in $cases) {
   if (-not $c) { "  FAIL [$($case.label)] window never opened"; $fail++; Stop-Myrkr; continue }
   $ok = $true
   if ($case.sel) {
+    if ($case.sel -eq 'a.txt') { Expand-Row $c (Find-Row $c 'docs') }
     $r = Find-Row $c $case.sel
     if ($r -lt 0) { "  FAIL [$($case.label)] no row named '$($case.sel)'"; $fail++; $ok=$false }
     else {
@@ -247,6 +261,7 @@ foreach ($case in $cases) {
   if (-not $c) { "  FAIL [$($case.label)] container never opened"; $fail++; Stop-Myrkr; continue }
   $ok = $true
   if ($case.sel) {
+    if ($case.sel -eq 'a.txt') { Expand-Row $c (Find-Row $c 'docs') }
     $r = Find-Row $c $case.sel
     if ($r -lt 0) { "  FAIL [$($case.label)] no row named '$($case.sel)'"; $fail++; $ok=$false }
     else {

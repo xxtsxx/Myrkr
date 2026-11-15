@@ -5,7 +5,8 @@
 #   2. VeraCrypt (.hc) auto-mounts Read-Only on GUI open, serves exact file
 #      contents, blocks writes, dehydrates placeholders back to 0 on-disk bytes
 #      on handle close, and toggles unmount/remount via command-bar button 176.
-#   3. Native Myrkr (.mrk) archive auto-mounts Read/Write by default; closing
+#   3. Native Myrkr (.mrk) archive opens directly in Myrkr UI without auto-mounting
+#      a drive; clicking button 176 mounts it Read/Write on demand, and closing
 #      with zero edits never creates .delta.mrk and leaves .mrk byte-identical.
 #   4. Live R/W edits on Z:\ (creates, nested dirs, partial overwrite of base
 #      placeholder, rename of unhydrated base placeholder, deletion) lazily
@@ -321,7 +322,7 @@ Write-Output `$h
     'PASS: Command-bar button 176 cleanly unmounts and re-mounts TC/VC volumes'
 
     # -------------------------------------------------------------------------
-    # 3. Native .mrk default R/W auto-mount + zero-edit dismount invariance
+    # 3. Native .mrk opens unmounted by default; button 176 mounts R/W + zero-edit invariance
     # -------------------------------------------------------------------------
     $mrkPass = 'Mount-Mrk-Strong#99'
     $srcDir = Join-Path $work 'mrk_src'
@@ -349,9 +350,14 @@ Write-Output `$h
     if (-not [CfMountGui]::IsWindowEnabled($mntBtnMrk0)) {
         throw "Mount drive button (176) should be enabled when browsing .mrk container"
     }
+    $initStat0 = [CfMountGui]::Title([CfMountGui]::Child($mainMrk0, 196))
+    if ($initStat0 -match '([D-Z]):\\') {
+        throw "Native .mrk must NOT auto-mount a drive on open (status='$initStat0')"
+    }
+    [void][CfMountGui]::PostMessageW($mainMrk0, 0x0111, [IntPtr]176, [IntPtr]::Zero)
     $mnt0 = Wait-DriveStatus $mainMrk0
     if ($mnt0.Status -notmatch '\(Read/Write\)') {
-        throw "Expected default Read/Write status for native .mrk archive, got '$($mnt0.Status)'"
+        throw "Expected on-demand Read/Write status for native .mrk archive, got '$($mnt0.Status)'"
     }
     $mrkDrv0 = $mnt0.Root
     $mountedA0 = Join-Path $mrkDrv0 'mrk_src\payload.txt'
@@ -375,7 +381,7 @@ Write-Output `$h
     if ((Get-FileHash -LiteralPath $goodMrk -Algorithm SHA256).Hash -ne $origMrkHash) {
         throw "Zero-edit dismount modified original good.mrk!"
     }
-    'PASS: Native .mrk archive auto-mounts Read/Write by default and leaves container byte-identical on zero-edit close'
+    'PASS: Native .mrk opens directly in Myrkr UI by default, mounts Read/Write on demand, and leaves container byte-identical on zero-edit close'
 
     # -------------------------------------------------------------------------
     # 4. Live R/W edits -> lazy v9 .delta.mrk sidecar + independent verification
@@ -384,6 +390,7 @@ Write-Output `$h
     $pMrk1 = Start-Myrkr @($goodMrk)
     Unlock-Prompt $pMrk1 $mrkPass
     $mainMrk1 = Wait-Win $pMrk1 'myrkr_window'
+    [void][CfMountGui]::PostMessageW($mainMrk1, 0x0111, [IntPtr]176, [IntPtr]::Zero)
     $mnt1 = Wait-DriveStatus $mainMrk1
     $mrkDrv1 = $mnt1.Root
 
@@ -490,13 +497,14 @@ print('DELTA_INDEP_OK')
         throw "good.delta.mrk did not survive simulated crash!"
     }
 
-    # Test direct salvage: opening salvage.delta.mrk mounts Read-Only and never creates .delta.delta.mrk
+    # Test direct salvage: opening salvage.delta.mrk + clicking 176 mounts Read-Only and never creates .delta.delta.mrk
     $pSalv = Start-Myrkr @($salvageDelta)
     Unlock-Prompt $pSalv $mrkPass
     $mainSalv = Wait-Win $pSalv 'myrkr_window'
+    [void][CfMountGui]::PostMessageW($mainSalv, 0x0111, [IntPtr]176, [IntPtr]::Zero)
     $mntSalv = Wait-DriveStatus $mainSalv
     if ($mntSalv.Status -notmatch '\(Read-Only\)') {
-        throw "Opening .delta.mrk directly must mount Read-Only, got '$($mntSalv.Status)'"
+        throw "Mounting .delta.mrk directly must mount Read-Only, got '$($mntSalv.Status)'"
     }
     if ([IO.File]::ReadAllText("$($mntSalv.Root)fresh_root.txt") -ne 'Created on R/W Cloud Files drive!') {
         throw "Salvage mount failed to serve fresh_root.txt from salvage.delta.mrk"
@@ -509,9 +517,9 @@ print('DELTA_INDEP_OK')
     }
     [void][CfMountGui]::PostMessageW($mainSalv, 0x0111, [IntPtr]107, [IntPtr]::Zero)
     if (-not $pSalv.WaitForExit(5000)) { throw "Salvage window did not exit cleanly" }
-    'PASS: Opening .delta.mrk directly mounts Read-Only for post-crash salvage'
+    'PASS: Mounting .delta.mrk directly mounts Read-Only for post-crash salvage'
 
-    # Re-open good.mrk after crash -> first decline merge (Cancel = 107) -> mounts Read-Only, preserves good.delta.mrk
+    # Re-open good.mrk after crash -> first decline merge (Cancel = 107) -> preserves good.delta.mrk, on-demand mount is Read-Only
     $pRecCancel = Start-Myrkr @($goodMrk)
     Unlock-Prompt $pRecCancel $mrkPass
     $recBox1 = Wait-Win $pRecCancel 'myrkr_mbox'
@@ -520,9 +528,10 @@ print('DELTA_INDEP_OK')
     }
     [void][CfMountGui]::PostMessageW($recBox1, 0x0111, [IntPtr]107, [IntPtr]::Zero) # Cancel
     $mainRecCancel = Wait-Win $pRecCancel 'myrkr_window'
+    [void][CfMountGui]::PostMessageW($mainRecCancel, 0x0111, [IntPtr]176, [IntPtr]::Zero)
     $mntRecCancel = Wait-DriveStatus $mainRecCancel
     if ($mntRecCancel.Status -notmatch '\(Read-Only\)') {
-        throw "Declining crash recovery must mount base container Read-Only, got '$($mntRecCancel.Status)'"
+        throw "Declining crash recovery must force on-demand mount Read-Only, got '$($mntRecCancel.Status)'"
     }
     if (-not (Test-Path -LiteralPath $deltaMrk)) {
         throw "Declining crash recovery must keep good.delta.mrk untouched"
@@ -533,18 +542,19 @@ print('DELTA_INDEP_OK')
         throw "Declining crash recovery altered good.mrk!"
     }
 
-    # Re-open good.mrk again -> accept merge (OK = 104) -> merges atomically, deletes .delta.mrk, mounts R/W
+    # Re-open good.mrk again -> accept merge (OK = 104) -> merges atomically, deletes .delta.mrk, on-demand mount is R/W
     $pRecOk = Start-Myrkr @($goodMrk)
     Unlock-Prompt $pRecOk $mrkPass
     $recBox2 = Wait-Win $pRecOk 'myrkr_mbox'
     [void][CfMountGui]::PostMessageW($recBox2, 0x0111, [IntPtr]104, [IntPtr]::Zero) # OK
     $mainRecOk = Wait-Win $pRecOk 'myrkr_window'
-    $mntRecOk = Wait-DriveStatus $mainRecOk
-    if ($mntRecOk.Status -notmatch '\(Read/Write\)') {
-        throw "Accepting crash recovery must mount merged container Read/Write, got '$($mntRecOk.Status)'"
-    }
     if (Test-Path -LiteralPath $deltaMrk) {
         throw "good.delta.mrk was not removed after successful crash-recovery merge"
+    }
+    [void][CfMountGui]::PostMessageW($mainRecOk, 0x0111, [IntPtr]176, [IntPtr]::Zero)
+    $mntRecOk = Wait-DriveStatus $mainRecOk
+    if ($mntRecOk.Status -notmatch '\(Read/Write\)') {
+        throw "Accepting crash recovery must allow Read/Write on-demand mount, got '$($mntRecOk.Status)'"
     }
     $recRoot = $mntRecOk.Root
     if ([IO.File]::ReadAllText("${recRoot}fresh_root.txt") -ne 'Created on R/W Cloud Files drive!') {
@@ -644,6 +654,7 @@ print('MERGED_INDEP_OK')
     $pBad = Start-Myrkr @($tamperMrk)
     Unlock-Prompt $pBad $mrkPass
     $mainBad = Wait-Win $pBad 'myrkr_window'
+    [void][CfMountGui]::PostMessageW($mainBad, 0x0111, [IntPtr]176, [IntPtr]::Zero)
     $mntBad = Wait-DriveStatus $mainBad
     $badDrv = $mntBad.Root
     $tamperedReadFailed = $false

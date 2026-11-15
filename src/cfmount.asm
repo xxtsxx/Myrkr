@@ -1,10 +1,10 @@
 ; =============================================================================
 ; cfmount.asm - User-Mode Drive Mounting via Windows Cloud Files API
 ; -----------------------------------------------------------------------------
-; Mounts unlocked native Myrkr (.mrk) archives Read/Write by default and
-; TrueCrypt/VeraCrypt (.tc/.hc) or fallback .mrk containers Read-Only as
-; standard session-scoped Windows drive letters (Z: downward) with zero
-; elevation and zero kernel driver installation:
+; Mounts unlocked native Myrkr (.mrk) archives Read/Write on demand (via
+; ID_MOUNTDRV) and TrueCrypt/VeraCrypt (.tc/.hc) or fallback .mrk containers
+; Read-Only as standard session-scoped Windows drive letters (Z: downward) with
+; zero elevation and zero kernel driver installation:
 ;   1. Creates an isolated sync-root directory under %LOCALAPPDATA%\Myrkr\Mounts
 ;      (marked FILE_ATTRIBUTE_NOT_CONTENT_INDEXED, without EFS so Windows never
 ;      nags to back up an EFS certificate) plus an exclusive DELETE_ON_CLOSE

@@ -109,9 +109,18 @@ function Get-RowRect($c,$row) {
 function Row-Point($c,$row) {
   $r = Get-RowRect $c $row
   $lr = New-Object L+RECT; [void][L]::GetWindowRect($c.lv,[ref]$lr)
-  $x = $lr.L + $r.L + 20
+  $x = $lr.L + $r.L + 28
   $y = $lr.T + [int](($r.T + $r.B)/2)
   return @{ x=$x; y=$y; packed=[IntPtr](([int64]$y -shl 32) -bor ([int64]$x -band 0xFFFFFFFF)) }
+}
+function Expand-Row($c,$row) {
+  $r = Get-RowRect $c $row
+  $x = $r.L + 11
+  $y = [int](($r.T + $r.B)/2)
+  $lp = [IntPtr](([int64]$y -shl 16) -bor ([int64]$x -band 0xFFFF))
+  [void][L]::PostMessageW($c.lv,0x0201,[IntPtr]1,$lp)
+  [void][L]::PostMessageW($c.lv,0x0202,[IntPtr]0,$lp)
+  Start-Sleep -Milliseconds 500
 }
 function Select-Row($c,$row) {
   $li=New-Object byte[] 88; $wr=[IntPtr]::Zero
@@ -227,6 +236,7 @@ $z = Fresh-Zip 'track'
 $c = Open-Zip $z
 if (-not $c) { "  FAIL window never opened"; $fail++ }
 else {
+  Expand-Row $c (Find-Row $c 'docs')
   # one row's height, measured rather than assumed
   $r0 = Get-RowRect $c 0
   $rowH = $r0.B - $r0.T
@@ -260,6 +270,7 @@ $z = Fresh-Zip 'cursor'
 $c = Open-Zip $z
 if (-not $c) { "  FAIL window never opened"; $fail++ }
 else {
+  Expand-Row $c (Find-Row $c 'docs')
   $a   = Find-Row $c 'a.txt'
   $top = Find-Row $c 'top.txt'
   if ($a -lt 0 -or $top -lt 0) { "  FAIL rows not found (a.txt=$a top.txt=$top)"; $fail++ }
@@ -322,6 +333,7 @@ $z = Fresh-Zip 'collapsed'
 $c = Open-Zip $z
 if (-not $c) { "  FAIL window never opened"; $fail++ }
 else {
+  Expand-Row $c (Find-Row $c 'docs')
   $sub = Find-Row $c 'sub'          # a folder one level down: collapsed on load
   $n0  = [int][L]::SendMessageW($c.lv,0x1004,[IntPtr]::Zero,[IntPtr]::Zero)
   if ($sub -lt 0) { "  FAIL no 'sub' row"; $fail++ }

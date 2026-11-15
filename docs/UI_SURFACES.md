@@ -33,7 +33,7 @@ What each format can do, and which of the three surfaces reaches it: the
 |---|---|---|---|---|---|---|
 | create | yes | yes | **no** | Create .mrk / Create ZIP | yes | right-click / right-drag |
 | open / browse | yes | yes | yes (incl. disguised files via drive glyph) | Open TrueCrypt/VeraCrypt container (`ID_OPENTC`) | yes (`.tc`/`.hc`) | double-click, right-click, or right-drag |
-| mount as Windows drive (`Z:`..`D:`) | yes (**Read/Write** auto-mount + `.delta.mrk` merge; Read-Only for single-file / split / `.delta.mrk` / read-only dir) | **no** | yes (**Read-Only** auto-mounts on open + toggle) | Mount / Unmount drive (`ID_MOUNTDRV`) | — | browse & edit directly in Explorer |
+| mount as Windows drive (`Z:`..`D:`) | yes (**Read/Write** on demand via `ID_MOUNTDRV` + `.delta.mrk` merge; Read-Only for single-file / split / `.delta.mrk` / read-only dir) | **no** | yes (**Read-Only** auto-mounts on open + toggle) | Mount / Unmount drive (`ID_MOUNTDRV`) | — | browse & edit directly in Explorer |
 | extract all | yes | yes | yes | Extract all | — | yes (single `.tc`/`.hc` right-drag) |
 | extract selected | yes | yes | yes | Extract selected | — | — |
 | drag entries out | yes | yes | yes (up to 512 MiB per entry) | — | drag out to Explorer | — |
@@ -51,17 +51,19 @@ Files read-only drive letter (`Z:` downward) is mounted automatically, and the
 status bar displays the mounted drive letter alongside the detected format,
 cipher/cascade, KDF, filesystem, and `Read-Only (XTS)`.
 
-Standard native `.mrk` archive containers (`archive == 1`, single-volume, in a
-writable folder, and not themselves named `*.delta.mrk`) auto-mount on open and
-post-encrypt as a **Read/Write** Cloud Files drive (`Mounted Z:\ (Read/Write)`).
+Standard native `.mrk` archive containers open directly in Myrkr's built-in
+container browser with zero drive-mounting overhead. Clicking the command-bar
+**Mount container as drive** button (`ID_MOUNTDRV`) mounts an archive container
+(`archive == 1`, single-volume, in a writable folder, and not named `*.delta.mrk`)
+on demand as a **Read/Write** Cloud Files drive (`Mounted Z:\ (Read/Write)`).
 Browsing without edits leaves the `.mrk` file byte-for-byte untouched; any write,
 rename, or delete on the mounted drive lazily writes a visible, format-v9
 `<stem>.delta.mrk` sidecar (`Mounted Z:\ (Read/Write - unsaved)`) and merges
 atomically (`Saving volume...`) into a freshly keyed `.mrk` on unmount, window
 close, or GUI Add/Delete. If `<stem>.delta.mrk` is found on next open after an
 unclean exit, Myrkr offers to merge the recovered changes (**OK**) or keep the
-sidecar untouched and mount Read-Only (**Cancel**); opening `<stem>.delta.mrk`
-directly mounts it Read-Only for direct file salvage.
+sidecar untouched (**Cancel**, forcing Read-Only if mounted); mounting
+`<stem>.delta.mrk` directly mounts it Read-Only for file salvage.
 
 ## The gap this closed
 
