@@ -79,6 +79,10 @@ $p2 = $p2 -bor $LASTEXITCODE
 $p2 = $p2 -bor $LASTEXITCODE
 & $ps -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot "inputcaptest.ps1")
 $p2 = $p2 -bor $LASTEXITCODE
+& $ps -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot "tcvcguitest.ps1")
+$p2 = $p2 -bor $LASTEXITCODE
+& $ps -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot "shellexttest.ps1")
+$p2 = $p2 -bor $LASTEXITCODE
 
 Write-Host "`n=== Phase 1: testio build (adversarial crypto/input tests) ==="
 Build "testio strict"
@@ -95,6 +99,10 @@ $p1 = $p1 -bor $LASTEXITCODE
 python (Join-Path $PSScriptRoot "extracthazardtest.py") $exe
 $p1 = $p1 -bor $LASTEXITCODE
 python (Join-Path $PSScriptRoot "nonceforktest.py") $exe
+$p1 = $p1 -bor $LASTEXITCODE
+python (Join-Path $PSScriptRoot "tcvctest.py") $exe
+$p1 = $p1 -bor $LASTEXITCODE
+python (Join-Path $PSScriptRoot "tcvcfuzz.py") $exe
 $p1 = $p1 -bor $LASTEXITCODE
 
 Write-Host "`n=== Restore: shipping build ==="

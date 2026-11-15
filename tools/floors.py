@@ -23,37 +23,37 @@ reach - one of them only noticed after a live install went wrong.)
 FLOORS = {
     "framecheck": {
         # FRAME_PROLOG procs whose frame was actually sized and checked.
-        "procs": 340,                    # 381 measured
+        "procs": 445,                    # 495 measured
         # RAW procs (push rbp / sub rsp,N) given the same spill-overlap
         # analysis.  Floored separately because they are nearly all of gui.asm,
         # and the summary line used to report only the count above - which read
         # as "gui.asm is not covered" to at least one person reviewing it.
-        "raw": 140,                      # 159 measured
+        "raw": 150,                      # 167 measured
     },
     "wincallcheck": {
         # WINCALL sites whose argument list was parsed and checked for reads of
         # a register the macro has already overwritten.
-        "sites": 1020,                   # 1135 measured
+        "sites": 1125,                   # 1251 measured
     },
     "constcheck": {
         # constants deliberately mirrored across modules and compared.
-        "mirrored": 45,                  # 50 measured
-        "files": 28,                     # 32 sources incl. macros.inc
+        "mirrored": 46,                  # 52 measured
+        "files": 43,                     # 48 sources incl. macros.inc
     },
     "deadcode": {
-        "symbols": 2350,                 # 2622 measured
+        "symbols": 2850,                 # 3190 measured
     },
     "aligncheck": {
-        "scalars": 73,                   # 82 measured
+        "scalars": 100,                  # 115 measured
     },
     "nvcheck": {
         # procs whose writes to callee-saved registers were checked for a save
         # and a restore.
-        "procs": 615,                    # 688 measured
+        "procs": 760,                    # 850 measured
     },
     "wstrcheck": {
         # call sites whose bound-carrying register was checked.
-        "calls": 45,                     # 51 measured
+        "calls": 50,                     # 56 measured
     },
 }
 

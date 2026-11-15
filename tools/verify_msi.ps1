@@ -241,6 +241,7 @@ foreach ($d in $expectDefaults) {
     Check (-not $stray) ("{0} writes only under Defaults, never the policy key" -f $d.Prop)
 }
 Check ($secure -contains "MYRKR_NOASSOC")    "MYRKR_NOASSOC is in SecureCustomProperties"
+Check ($secure -contains "MYRKR_NOTCASSOC")  "MYRKR_NOTCASSOC is in SecureCustomProperties"
 Check ($secure -contains "MYRKR_NOCONTEXT")  "MYRKR_NOCONTEXT is in SecureCustomProperties"
 Check ($secure -contains "MYRKR_NOSHELLEXT") "MYRKR_NOSHELLEXT is in SecureCustomProperties"
 
@@ -281,6 +282,22 @@ Check ([bool]$assocClean) "ProgId is removed on uninstall (Name='-')"
 # itself to the extension key.
 $extClean = $regRows | Where-Object { $_[2] -eq "$CK\.mrk" -and $_[3] -eq "-" }
 Check (-not $extClean) ".mrk extension key is NOT deleted on uninstall (other apps may share it)"
+
+# --- .tc / .hc associations -------------------------------------------------
+foreach ($tcExt in @(".tc", ".hc")) {
+    $tcDef = $regRows | Where-Object { $_[2] -eq "$CK\$tcExt" -and -not $_[3] }
+    Check ($tcDef -and $tcDef[4] -eq "Myrkr.VolumeContainer") ("{0} default value -> Myrkr.VolumeContainer" -f $tcExt)
+    $tcOw = $regRows | Where-Object { $_[2] -eq "$CK\$tcExt\OpenWithProgids" -and $_[3] -eq "Myrkr.VolumeContainer" }
+    Check ([bool]$tcOw) ("{0} OpenWithProgids lists Myrkr.VolumeContainer" -f $tcExt)
+    $tcExtClean = $regRows | Where-Object { $_[2] -eq "$CK\$tcExt" -and $_[3] -eq "-" }
+    Check (-not $tcExtClean) ("{0} extension key is NOT deleted on uninstall" -f $tcExt)
+}
+$tcCmd = $regRows | Where-Object { $_[2] -eq "$CK\Myrkr.VolumeContainer\shell\open\command" }
+Check ($tcCmd -and $tcCmd[4] -match '"\[INSTALLDIR\]myrkr\.exe"\s+"%1"') "Myrkr.VolumeContainer open command quotes both exe and %1"
+$tcIcon = $regRows | Where-Object { $_[2] -eq "$CK\Myrkr.VolumeContainer\DefaultIcon" }
+Check ($tcIcon -and $tcIcon[4] -match 'myrkr\.exe,1$') "Myrkr.VolumeContainer DefaultIcon uses the container icon (index 1)"
+$tcClean = $regRows | Where-Object { $_[2] -eq "$CK\Myrkr.VolumeContainer" -and $_[3] -eq "-" }
+Check ([bool]$tcClean) "Myrkr.VolumeContainer ProgId is removed on uninstall (Name='-')"
 
 # --- context-menu handler ---------------------------------------------------
 # Defined here rather than in the drag-drop section below, because both
@@ -511,8 +528,9 @@ try {
         $st = Comp-State $s $compName
         Check ($st -ne $INSTALLSTATE_LOCAL) ("without {0}: default component not installed" -f $d.Prop)
     }
-    Check ((Comp-State $s "FileAssoc")  -eq $INSTALLSTATE_LOCAL) "by default: .mrk association IS installed"
-    Check ((Comp-State $s "CtxHandler") -eq $INSTALLSTATE_LOCAL) "by default: the context-menu handler IS installed"
+    Check ((Comp-State $s "FileAssoc")   -eq $INSTALLSTATE_LOCAL) "by default: .mrk association IS installed"
+    Check ((Comp-State $s "TcFileAssoc") -eq $INSTALLSTATE_LOCAL) "by default: .tc/.hc association IS installed"
+    Check ((Comp-State $s "CtxHandler")  -eq $INSTALLSTATE_LOCAL) "by default: the context-menu handler IS installed"
     Check ((Comp-State $s "ShellExt")  -eq $INSTALLSTATE_LOCAL) "by default: the drag-drop handler IS installed"
     # The point of the whole exception: named nothing, still enforced.
     Check ((Comp-State $s "PolSecureDesk") -eq $INSTALLSTATE_LOCAL) `
@@ -548,11 +566,18 @@ try {
 
     # (c) the opt-outs must actually opt out
     $s = Cost-Session "MYRKR_NOASSOC=1 MYRKR_NOCONTEXT=1 MYRKR_NOSHELLEXT=1"
-    Check ((Comp-State $s "FileAssoc")  -ne $INSTALLSTATE_LOCAL) "MYRKR_NOASSOC=1 suppresses the association"
-    Check ((Comp-State $s "CtxHandler") -ne $INSTALLSTATE_LOCAL) "MYRKR_NOCONTEXT=1 suppresses the context-menu handler"
+    Check ((Comp-State $s "FileAssoc")   -ne $INSTALLSTATE_LOCAL) "MYRKR_NOASSOC=1 suppresses the .mrk association"
+    Check ((Comp-State $s "TcFileAssoc") -ne $INSTALLSTATE_LOCAL) "MYRKR_NOASSOC=1 also suppresses the .tc/.hc association"
+    Check ((Comp-State $s "CtxHandler")  -ne $INSTALLSTATE_LOCAL) "MYRKR_NOCONTEXT=1 suppresses the context-menu handler"
     # This one suppresses the FILE as well as the registration - opting out means
     # nothing of Myrkr's is on the machine for Explorer to load.
-    Check ((Comp-State $s "ShellExt")   -ne $INSTALLSTATE_LOCAL) "MYRKR_NOSHELLEXT=1 suppresses the DLL and its registration"
+    Check ((Comp-State $s "ShellExt")    -ne $INSTALLSTATE_LOCAL) "MYRKR_NOSHELLEXT=1 suppresses the DLL and its registration"
+    [void][Runtime.InteropServices.Marshal]::ReleaseComObject($s)
+
+    # MYRKR_NOTCASSOC=1 skips .tc/.hc while keeping .mrk registered.
+    $s = Cost-Session "MYRKR_NOTCASSOC=1"
+    Check ((Comp-State $s "TcFileAssoc") -ne $INSTALLSTATE_LOCAL) "MYRKR_NOTCASSOC=1 suppresses the .tc/.hc association"
+    Check ((Comp-State $s "FileAssoc")   -eq $INSTALLSTATE_LOCAL) "MYRKR_NOTCASSOC=1 leaves .mrk association installed"
     [void][Runtime.InteropServices.Marshal]::ReleaseComObject($s)
 
     # ...and NOSHELLEXT alone must take the context handler with it, since those

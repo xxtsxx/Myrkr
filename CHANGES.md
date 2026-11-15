@@ -8,6 +8,40 @@ what changed and why, not a raw commit dump.
 
 ## [Unreleased]
 
+### Added
+
+- **Read-only TrueCrypt (`.tc`) & VeraCrypt (`.hc`) container support.** Pure
+  user-mode x64 MASM implementation (`asInvoker`, zero kernel drivers, zero
+  external DLLs) supporting:
+  - **All 5 ciphers & 15 XTS single/cascade modes**: `AES-256`, `Serpent-256`,
+    `Twofish-256`, `Camellia-256`, and `Kuznyechik` (`src/aesxts.asm`,
+    `src/serpent.asm`, `src/twofish.asm`, `src/camellia.asm`,
+    `src/kuznyechik.asm`) across TrueCrypt 7.1a (`"TRUE"`) and VeraCrypt
+    (`"VERA"`), with automatic backup-header fallback.
+  - **All 7 header KDFs & keyfiles**: `PBKDF2-HMAC` over `SHA-512`, `SHA-256`,
+    `BLAKE2s-256`, `Whirlpool`, `Streebog-512`, and `RIPEMD-160`, plus VeraCrypt
+    `Argon2id` (`src/sha512.asm`, `src/blake2s.asm`, `src/ripemd160.asm`,
+    `src/whirlpool.asm`, `src/streebog.asm`, `src/tcvc.asm`), with 2-thread
+    parallel KDF trial and order-independent CRC-32 mixing for `1..N` keyfiles
+    and keyfile folders (with or without a password).
+  - **All 5 filesystem families**: user-mode read-only parsers for
+    `FAT12`/`FAT16`/`FAT32` + VFAT LFN (`src/fs_fat.asm`), `exFAT`
+    (`src/fs_exfat.asm`), `NTFS` including resident, non-resident, sparse,
+    `LZNT1`-compressed `$DATA`, `$ATTRIBUTE_LIST`, and `$I30` B-trees
+    (`src/fs_ntfs.asm`), `ext2`/`ext3`/`ext4` including indirect blocks and
+    extent B-trees (`src/fs_ext.asm`), and macOS `HFS+` including `"BD"` wrapper
+    partitions, Catalog + Extents Overflow B-Trees, and NFD→NFC UTF-16BE names
+    (`src/fs_hfsplus.asm`), backed by `tests/tcvctest.py` and adversarial
+    fuzzing (`tests/tcvcfuzz.py`).
+  - **GUI, shell & MSI integration**: top command-bar **Open TrueCrypt/VeraCrypt
+    container** glyph button (`ID_OPENTC`) with tooltip (supporting disguised
+    filenames without `.tc`/`.hc`), keyfile picker row on the private-desktop
+    password prompt, read-only container browser (`Extract all`, `Extract
+    selected`, virtual drag-out, disabled Add/Delete/drop-append, XTS metadata
+    status line), single-file `.tc`/`.hc` right-drag classification in
+    `myrkrshell.dll`, and `.tc`/`.hc` → `Myrkr.VolumeContainer` MSI registration
+    (`MYRKR_NOTCASSOC=1` opt-out).
+
 ### Security & Hardening
 
 - **Authenticate-before-decrypt AES-GCM & hardware key schedule.** One-shot

@@ -172,6 +172,18 @@ SHA1_CTX_SIZE       equ 96
 ; gui.asm-local because secmem.asm locks those buffers and must size them with
 ; the same constant that declares them.
 PWBUF_CHARS         equ 1100
+; Locked secret block for TrueCrypt/VeraCrypt container sessions (tcvc.asm):
+; active XTS_CTX (25552) + mixed password (128) + keyfile pool (128) +
+; KDF output scratch (192) + decrypted header (448) + header salt (64).
+TCVC_SEC_SIZE       equ 26512
+MAX_KEYFILES        equ 64
+TCVC_FS_FAT12       equ 1
+TCVC_FS_FAT16       equ 2
+TCVC_FS_FAT32       equ 3
+TCVC_FS_EXFAT       equ 4
+TCVC_FS_NTFS        equ 5
+TCVC_FS_EXT         equ 6
+TCVC_FS_HFSPLUS     equ 7
 
 ; Auto-compression threshold: when neither --compress nor --store is given, the
 ; default is to compress inputs whose total size is below this, and store above.

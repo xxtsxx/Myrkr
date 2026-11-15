@@ -66,7 +66,7 @@ try {
     $bar = [CmdBarPaint]::Child($main,160)
     if ($bar -eq [IntPtr]::Zero) { throw 'Command bar not found' }
     $background = Pixel $bar
-    foreach ($id in @(154,155,161,162,142,164)) {
+    foreach ($id in @(154,155,171,161,162,142,164)) {
         $button = [CmdBarPaint]::Child($main,$id)
         if ($button -eq [IntPtr]::Zero) { throw "Button $id not found" }
         [void][CmdBarPaint]::EnableWindow($button,$true)

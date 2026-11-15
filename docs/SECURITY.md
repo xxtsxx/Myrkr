@@ -157,6 +157,27 @@ expectation ever changes, the fix is a larger symmetric key inside the same
 format — not a change of cryptographic species, because the species vulnerable
 to Shor was never here.
 
+### 3.2 Read-only TrueCrypt (`.tc`) and VeraCrypt (`.hc`) containers
+
+Myrkr can open and extract standard non-hidden TrueCrypt 7.1a and VeraCrypt file
+containers strictly **read-only** in user mode (`GENERIC_READ`, zero kernel
+drivers), supporting all 5 block ciphers (`AES-256`, `Serpent-256`,
+`Twofish-256`, `Camellia-256`, `Kuznyechik`), all 15 XTS single/cascade modes,
+all 7 header KDFs (`PBKDF2-HMAC` over `SHA-512`, `SHA-256`, `BLAKE2s-256`,
+`Whirlpool`, `Streebog-512`, `RIPEMD-160`, plus VeraCrypt `Argon2id`), keyfiles,
+and 5 filesystems (`FAT12/16/32`, `exFAT`, `NTFS`, `ext2/3/4`, macOS `HFS+`).
+
+The security boundary differs from `.mrk` in one fundamental way that the UI
+makes visible (`Read-Only (XTS)` in the status bar):
+
+| Property | `.mrk` container | `.tc` / `.hc` volume |
+|---|---|---|
+| Encryption mode | AES-256-GCM (AEAD) | XTS (IEEE P1619, 1–3 cipher cascade) |
+| Data tamper detection | Full cryptographic tag over header + index + every chunk | **Header only** (`"TRUE"`/`"VERA"` magic + header & key-set CRC-32); XTS data sectors carry **no MAC** |
+| Filesystem parser | Authenticated tar-like index | User-mode `FAT`/`exFAT`/`NTFS`/`ext`/`HFS+` readers treating decrypted sectors as **untrusted input** (`tests/tcvcfuzz.py`) |
+| Symlinks / reparse points | Refused | Skipped at enumeration and extraction (`tests/tcvcfuzz.py`) |
+| Secret residency | `VirtualLock`ed `secmem` | Expanded XTS schedules in `VirtualLock`ed `secmem`; password + keyfile pool wiped immediately after header unlock |
+
 ---
 
 ## 4. Exploit hardening — claim, mechanism, evidence

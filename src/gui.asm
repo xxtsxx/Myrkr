@@ -77,6 +77,14 @@ externdef g_file_done:qword              ; per-positional bytes done (MAX_ARGS e
 externdef g_file_total:qword             ; per-positional total bytes (MAX_ARGS entries)
 externdef g_allow_screencap:dword        ; main.asm: 0 = exclude windows from capture
 externdef g_allow_unc:dword              ; main.asm: 1 = allow UNC shares; 0 = block UNC
+extern tcvc_open:proc
+extern tcvc_to_index:proc
+extern tcvc_close:proc
+extern tcvc_is_open:proc
+extern tcvc_format_status:proc
+extern do_tcvc_gui_extract:proc
+externdef g_kf_paths:qword
+externdef g_kf_count:dword
 
 ; ---- Win32 imports ----------------------------------------------------------
 extern GetModuleHandleW:proc
@@ -677,7 +685,7 @@ LAY_BTN_GAP         equ 8                    ; gap between Exit and the action
 ; of the caption code the rest of the body reports.  Kept clear of every control
 ; (the sidebar starts at LAY_MARGIN, the list ends LAY_MARGIN from the right).
 LAY_EDGE            equ 6                    ; resize gripper thickness
-LAY_MIN_W           equ 420                  ; below this the button row collides
+LAY_MIN_W           equ 460                  ; below this the button row collides
 ; +STAT_BAND: the statistics row grew the band below the list, and without this
 ; the floor that used to leave three rows leaves two.  The minimum is about how
 ; much LIST survives, so it has to move with everything that is not the list.
@@ -798,6 +806,12 @@ ID_KDFTIME          equ 167                  ; Argon2 time-cost slider
 ID_KDFMEM           equ 168                  ; Argon2 memory slider (drags in MiB)
 ID_KDFHDR           equ 169                  ; "Argon2 KDF" section header
 ID_VOLSPLIT         equ 170                  ; file-split size cycler (docs/VOLUMES.md)
+ID_OPENTC           equ 171                  ; Open TrueCrypt/VeraCrypt container glyph
+ID_SDKFFILE         equ 172                  ; TC/VC prompt: + File keyfile picker
+ID_SDKFDIR          equ 173                  ; TC/VC prompt: + Folder keyfile picker
+ID_SDKFCLR          equ 174                  ; TC/VC prompt: Clear keyfiles
+TCVC_MAX_KF         equ 64
+TCVC_MAX_PASS       equ 128
 ID_LOGLVL           equ 144                  ; log-level cycler button
 ID_PWMINLEN         equ 145                  ; password min-length cycler
 ID_PWMINCLASSES     equ 146                  ; password min-classes cycler
@@ -835,9 +849,12 @@ SD_BTN_GAP          equ 10
 SD_EYE_W            equ 38                   ; show/hide eye column, right of the field
 SD_ROW_H            equ 26                   ; format row, between the fields and the buttons
 SDF_CONFIRM         equ 1                    ; flags bit 0: ask twice (encrypt)
+SDF_TCVC            equ 2                    ; flags bit 1: TC/VC unlock + keyfile row
 SDR_OK              equ 1
 SDR_CANCEL          equ 0
 SDR_UNAVAILABLE     equ -1                   ; fail closed: no private desktop
+SDR_KF_FILE         equ 2                    ; pick keyfile(s) then re-open prompt
+SDR_KF_DIR          equ 3                    ; pick keyfile folder then re-open prompt
 
 ; --- themed message box (replaces MessageBoxW) --------------------------------
 ; The OK button deliberately reuses ID_ACTION and the secondary ID_CANCEL:
@@ -960,6 +977,7 @@ GLYPH_SETTINGS      equ 0E713h               ; gear       (Fluent "Setting")
 GLYPH_REMOVE        equ 0E738h               ; minus      (Fluent "Remove")
 GLYPH_CLEAR         equ 0E894h               ; clear      (Fluent "Clear")
 GLYPH_CLOSE         equ 0E711h               ; x          (Fluent "Cancel")
+GLYPH_HARDDRIVE     equ 0EDA2h               ; volume     (Fluent "HardDrive")
 ; A glyph button with this flag draws its window text beside the glyph instead
 ; of centring the glyph alone - the command bar reads as labelled commands, the
 ; sidebar as bare icons.
@@ -1285,6 +1303,17 @@ WSTR s_tip_delete, <Delete selected entries from this archive. Saved immediately
 WSTR s_tip_extract, <Copy entries out of the archive. The archive is unchanged.>
 WSTR s_tip_clear,     <Remove every item from the list>
 WSTR s_tip_settings,  <Settings>
+WSTR s_open_tcvc,     <Open TrueCrypt/VeraCrypt container>
+WSTR t_pick_kf,       <Select keyfile(s)>
+WSTR t_pick_kfdir,    <Select keyfile folder>
+WSTR s_kf_none,       <Keyfiles: none>
+WSTR s_kf_lbl,        <Keyfiles: >
+WSTR s_kf_addfile,    <+ File>
+WSTR s_kf_adddir,     <+ Folder>
+WSTR s_kf_clear,      <Clear>
+WSTR m_tcvc_auth,     <Unlock failed: wrong password or keyfile, or this file is not a TrueCrypt/VeraCrypt volume.>
+WSTR m_tcvc_unsup,    <Unsupported TrueCrypt/VeraCrypt volume parameters or unrecognised filesystem.>
+WSTR m_tcvc_corrupt,  <The volume or its filesystem structure is damaged or truncated.>
 WSTR s_change,  <Change...>
 WSTR w_opt_to,  <--to>
 WSTR s_bslash,  <\>
@@ -1730,6 +1759,9 @@ ab_body:
     dw 0
 WSTR s_ext_agcm, <.mrk>
 WSTR s_ext_zip,  <.zip>
+WSTR s_ext_tc,   <.tc>
+WSTR s_ext_hc,   <.hc>
+WSTR s_files_sfx,<_files>
 WSTR s_extract,  <Extract>
 WSTR s_extract_all, <Extract all>
 WSTR s_extract_sel, <Extract selected>
@@ -1821,6 +1853,7 @@ g_dr_ob2    dq ?
 g_has_file  dd ?
 g_op        dd ?                        ; 0 = encrypt, 1 = decrypt
 g_is_zip    dd ?                        ; 1 = decrypt mode is a WinZip-AES .zip extract
+g_is_tcvc   dd ?                        ; 1 = decrypt mode is a TrueCrypt/VeraCrypt volume
 g_zip_enc   dd ?                        ; 1 = the .zip has encrypted entries (needs a password)
 g_is_archive dd ?                       ; container archive flag (decrypt)
 g_op_result dd ?
@@ -2140,6 +2173,13 @@ g_sd_height  dd ?                            ; computed client height
 g_sd_fmty    dd ?                            ; y of the format row, from the height pass
 g_sd_done    dd ?                            ; 1 once the window is gone
 g_sd_reg     dd ?                            ; 1 once the class is registered
+g_hopentc    dq ?                            ; command bar: Open TC/VC container glyph
+g_sd_hkffile dq ?                            ; prompt: + File keyfile button
+g_sd_hkfdir  dq ?                            ; prompt: + Folder keyfile button
+g_sd_hkfclr  dq ?                            ; prompt: Clear keyfiles button
+g_sd_kftxt   dw 32 dup (?)                   ; prompt: "Keyfiles: N" scratch
+g_tcvc_statw dw STATUSW_CHARS dup (?)        ; status line for open TC/VC volume
+g_gui_kfslots dw (TCVC_MAX_KF*SLOT_CHARS) dup (?) ; wide keyfile path storage
 
 .code
 
@@ -2708,6 +2748,9 @@ drop_allowed proc
     ; Never while an operation is running: adding inputs underneath one would
     ; change what it is working on.
     cmp     dword ptr [g_running], 0
+    jne     dal_ret
+    ; A TrueCrypt/VeraCrypt volume is strictly read-only: refuse drops onto it.
+    cmp     dword ptr [g_is_tcvc], 0
     jne     dal_ret
     ; Browsing an archive?  Then a drop MEANS "add these to it".
     cmp     dword ptr [g_container], 0
@@ -6558,6 +6601,7 @@ dl_hok:
     WINCALL SetWindowPos, qword ptr [g_hcmdbar], 0, LV_X, CMDBAR_Y, qword ptr [g_lay_lvw], CMDBAR_H, 014h
     WINCALL SetWindowPos, qword ptr [g_haddfiles], 0, LV_X, CMDBAR_Y, CMD_ICON_W, CMDBAR_H-2, 014h
     WINCALL SetWindowPos, qword ptr [g_haddfolder], 0, LV_X + CMD_ICON_W, CMDBAR_Y, CMD_ICON_W, CMDBAR_H-2, 014h
+    WINCALL SetWindowPos, qword ptr [g_hopentc], 0, LV_X + 2*CMD_ICON_W, CMDBAR_Y, CMD_ICON_W, CMDBAR_H-2, 014h
     ; The list commands are right-aligned, with CMD_SPACER of clear air between
     ; them and the gear so "acts on the list" and "opens settings" do not read
     ; as one run of buttons.  Everything below is measured back from the bar's
@@ -6873,6 +6917,7 @@ create_controls_enc proc
     ; coordinates here only matter until the first layout pass.
     MKCTL   cls_button, s_ready, ST_OWNERBTN_NT, ID_ADDFILES,  LV_X, CMDBAR_Y, CMD_ICON_W, CMDBAR_H-2, g_haddfiles
     MKCTL   cls_button, s_ready, ST_OWNERBTN_NT, ID_ADDFOLDER, LV_X, CMDBAR_Y, CMD_ICON_W, CMDBAR_H-2, g_haddfolder
+    MKCTL   cls_button, s_ready, ST_OWNERBTN_NT, ID_OPENTC,    LV_X, CMDBAR_Y, CMD_ICON_W, CMDBAR_H-2, g_hopentc
     MKCTL   cls_button, s_ready, ST_OWNERBTN_NT, ID_HAMBURGER, LV_X, CMDBAR_Y, CMD_ICON_W, CMDBAR_H-2, g_hburger
     ; Give each one its glyph and the hover subclass.  The window text set below
     ; stays the accessible name - the glyph itself is nothing to a screen reader.
@@ -6884,6 +6929,11 @@ create_controls_enc proc
     mov     edx, GLYPH_FOLDER
     xor     r8d, r8d
     call    glyph_attach
+    mov     rcx, qword ptr [g_hopentc]
+    mov     edx, GLYPH_HARDDRIVE
+    xor     r8d, r8d
+    call    glyph_attach
+    WINCALL SetWindowTextW, qword ptr [g_hopentc], addr s_open_tcvc
     mov     rcx, qword ptr [g_hburger]
     mov     edx, GLYPH_SETTINGS
     xor     r8d, r8d
@@ -6907,6 +6957,9 @@ create_controls_enc proc
     call    tip_add
     mov     rcx, qword ptr [g_haddfolder]
     lea     rdx, [s_tip_addfolder]
+    call    tip_add
+    mov     rcx, qword ptr [g_hopentc]
+    lea     rdx, [s_open_tcvc]
     call    tip_add
     mov     rcx, qword ptr [g_hburger]
     lea     rdx, [s_tip_settings]
@@ -7102,8 +7155,9 @@ ccd_nopw:
     ; action (Decrypt / Extract) on the right, Exit just to its left (match encrypt)
     MKCTL   cls_button, s_exit, ST_OWNERBTN, ID_CANCEL, 307, 146, 80, 32, g_hcancel
     MKCTL   cls_button, s_decrypt, ST_OWNERBTN, ID_ACTION, 395, 146, 120, 32, g_haction
-    cmp     dword ptr [g_is_zip], 0
-    je      ccd_lbl_done
+    mov     eax, dword ptr [g_is_zip]
+    or      eax, dword ptr [g_is_tcvc]
+    jz      ccd_lbl_done
     WINCALL SetWindowTextW, qword ptr [g_haction], addr s_extract
 ccd_lbl_done:
     ; clear placeholder text from the password field / underline (if present)
@@ -7181,6 +7235,8 @@ create_controls endp
 ; =============================================================================
 switch_to_output proc frame
     FRAME_PROLOG 64
+    call    tcvc_close
+    call    wipe_gui_keyfiles
     ; the file just written becomes the one input
     lea     rcx, [g_filepath_w]
     lea     rdx, [g_outpath_w]
@@ -7226,6 +7282,10 @@ switch_to_output proc frame
     WINCALL ShowWindow, qword ptr [g_hprog], SW_HIDE
     WINCALL EnableWindow, qword ptr [g_haction], 1
     WINCALL EnableWindow, qword ptr [g_hpass], 1
+    cmp     qword ptr [g_hopentc], 0
+    je      @F
+    WINCALL EnableWindow, qword ptr [g_hopentc], 1
+@@:
     call    container_load
 sto_ret:
     FRAME_EPILOG
@@ -7263,6 +7323,32 @@ adapt_for_container proc frame
 afc_action:
     WINCALL SetWindowTextW, qword ptr [g_haction], addr s_extract_all
     WINCALL SetWindowTextW, qword ptr [g_hcmdremove], addr s_delete
+    mov     rcx, qword ptr [g_haction]
+    lea     rdx, [s_tip_extract]
+    call    tip_add
+    cmp     dword ptr [g_is_tcvc], 0
+    je      afc_mutable
+    ; Read-only TrueCrypt/VeraCrypt volume: disable archive-mutation buttons.
+    WINCALL EnableWindow, qword ptr [g_haddfiles], 0
+    WINCALL EnableWindow, qword ptr [g_haddfolder], 0
+    WINCALL EnableWindow, qword ptr [g_hcmdremove], 0
+    WINCALL InvalidateRect, qword ptr [g_haddfiles], 0, 1
+    WINCALL InvalidateRect, qword ptr [g_haddfolder], 0, 1
+    WINCALL InvalidateRect, qword ptr [g_hcmdremove], 0, 1
+    lea     rdx, [s_ready]
+    cmp     word ptr [g_tcvc_statw], 0
+    je      @F
+    lea     rdx, [g_tcvc_statw]
+@@:
+    WINCALL SetWindowTextW, qword ptr [g_hstatus], rdx
+    jmp     afc_done_ro
+afc_mutable:
+    WINCALL EnableWindow, qword ptr [g_haddfiles], 1
+    WINCALL EnableWindow, qword ptr [g_haddfolder], 1
+    WINCALL EnableWindow, qword ptr [g_hcmdremove], 1
+    WINCALL InvalidateRect, qword ptr [g_haddfiles], 0, 1
+    WINCALL InvalidateRect, qword ptr [g_haddfolder], 0, 1
+    WINCALL InvalidateRect, qword ptr [g_hcmdremove], 0, 1
     WINCALL SetWindowTextW, qword ptr [g_hstatus], addr s_edits_saved
     mov     rcx, qword ptr [g_haddfiles]
     lea     rdx, [s_tip_archive_files]
@@ -7273,9 +7359,7 @@ afc_action:
     mov     rcx, qword ptr [g_hcmdremove]
     lea     rdx, [s_tip_delete]
     call    tip_add
-    mov     rcx, qword ptr [g_haction]
-    lea     rdx, [s_tip_extract]
-    call    tip_add
+afc_done_ro:
     ; create_controls_enc disables the action until the password meets policy.
     ; That is an ENCRYPT rule - there is no policy to meet when decrypting, and
     ; the password has already been given by the time this window is shown.
@@ -7284,6 +7368,421 @@ afc_action:
     FRAME_EPILOG
     ret
 adapt_for_container endp
+
+; =============================================================================
+; adapt_for_encrypt - restore empty encrypt-mode controls if container_load is
+; cancelled or fails when triggered from open_tcvc_via_picker.
+; =============================================================================
+adapt_for_encrypt proc frame
+    FRAME_PROLOG 48
+    WINCALL ShowWindow, qword ptr [g_hcmdclear], SW_SHOW
+    WINCALL EnableWindow, qword ptr [g_haddfiles], 1
+    WINCALL EnableWindow, qword ptr [g_haddfolder], 1
+    WINCALL EnableWindow, qword ptr [g_hcmdremove], 1
+    WINCALL InvalidateRect, qword ptr [g_haddfiles], 0, 1
+    WINCALL InvalidateRect, qword ptr [g_haddfolder], 0, 1
+    WINCALL InvalidateRect, qword ptr [g_hcmdremove], 0, 1
+    WINCALL SetWindowTextW, qword ptr [g_hcmdremove], addr s_cmd_remove
+    lea     rdx, [s_encrypt]
+    cmp     dword ptr [g_make_zip], 0
+    je      @F
+    lea     rdx, [s_execute]
+@@:
+    WINCALL SetWindowTextW, qword ptr [g_haction], rdx
+    WINCALL SetWindowTextW, qword ptr [g_hwnd], addr wtitle_enc
+    WINCALL SetWindowTextW, qword ptr [g_hstatus], addr s_ready
+    mov     rcx, qword ptr [g_haddfiles]
+    lea     rdx, [s_tip_addfiles]
+    call    tip_add
+    mov     rcx, qword ptr [g_haddfolder]
+    lea     rdx, [s_tip_addfolder]
+    call    tip_add
+    mov     rcx, qword ptr [g_hcmdremove]
+    lea     rdx, [s_tip_remove]
+    call    tip_add
+    cmp     qword ptr [g_hpass], 0
+    je      @F
+    WINCALL ShowWindow, qword ptr [g_hpass], SW_SHOW
+    WINCALL ShowWindow, qword ptr [g_hpw_under], SW_SHOW
+    WINCALL ShowWindow, qword ptr [g_hshow], SW_SHOW
+    call    hide_pwrow
+@@:
+    call    do_layout
+    FRAME_EPILOG
+    ret
+adapt_for_encrypt endp
+
+; =============================================================================
+; wipe_gui_keyfiles - securely clear GUI keyfile path slots and g_kf_paths.
+; =============================================================================
+wipe_gui_keyfiles proc
+    sub     rsp, 40
+    lea     rcx, [g_gui_kfslots]
+    mov     rdx, TCVC_MAX_KF * SLOT_CHARS * 2
+    call    secure_zero
+    lea     rcx, [g_kf_paths]
+    mov     rdx, TCVC_MAX_KF * 8
+    call    secure_zero
+    mov     dword ptr [g_kf_count], 0
+    add     rsp, 40
+    ret
+wipe_gui_keyfiles endp
+
+; =============================================================================
+; append_gui_keyfile(rcx = wide path) -> eax = 1 if added (or duplicate skipped)
+; =============================================================================
+append_gui_keyfile proc
+    push    rbp
+    mov     rbp, rsp
+    sub     rsp, 64
+    mov     qword ptr [rbp-8], rcx
+    mov     eax, dword ptr [g_kf_count]
+    cmp     eax, TCVC_MAX_KF
+    jae     agk_no
+    mov     rcx, qword ptr [rbp-8]
+    call    wlen
+    test    rax, rax
+    jz      agk_no
+    inc     rax
+    cmp     rax, SLOT_CHARS
+    ja      agk_no
+
+    ; Skip case-insensitive duplicates already in g_kf_paths[0..count-1]
+    xor     r10d, r10d
+agk_dup_loop:
+    cmp     r10d, dword ptr [g_kf_count]
+    jae     agk_store
+    lea     r11, [g_kf_paths]
+    mov     r9, qword ptr [r11 + r10*8]
+    mov     rcx, qword ptr [rbp-8]
+    xor     r8, r8
+agk_cmp:
+    movzx   eax, word ptr [rcx + r8*2]
+    movzx   edx, word ptr [r9 + r8*2]
+    cmp     eax, 'A'
+    jb      @F
+    cmp     eax, 'Z'
+    ja      @F
+    add     eax, 20h
+@@:
+    cmp     edx, 'A'
+    jb      @F
+    cmp     edx, 'Z'
+    ja      @F
+    add     edx, 20h
+@@:
+    cmp     eax, edx
+    jne     agk_dup_next
+    test    eax, eax
+    jz      agk_ok                          ; exact match -> silently ignore duplicate
+    inc     r8
+    jmp     agk_cmp
+agk_dup_next:
+    inc     r10d
+    jmp     agk_dup_loop
+
+agk_store:
+    mov     eax, dword ptr [g_kf_count]
+    imul    rcx, rax, SLOT_CHARS * 2
+    lea     r9, [g_gui_kfslots]
+    add     rcx, r9                         ; dst slot
+    mov     qword ptr [rbp-16], rcx
+    mov     rdx, qword ptr [rbp-8]
+    lea     r8, [rcx + (SLOT_CHARS - 1) * 2]
+    call    wcopy
+    mov     eax, dword ptr [g_kf_count]
+    lea     r11, [g_kf_paths]
+    mov     rcx, qword ptr [rbp-16]
+    mov     qword ptr [r11 + rax*8], rcx
+    inc     dword ptr [g_kf_count]
+agk_ok:
+    mov     eax, 1
+    jmp     agk_ret
+agk_no:
+    xor     eax, eax
+agk_ret:
+    add     rsp, 64
+    pop     rbp
+    ret
+append_gui_keyfile endp
+
+; =============================================================================
+; take_kf_shellitem(rcx = IShellItem*) - resolve path and append to g_kf_paths.
+; =============================================================================
+take_kf_shellitem proc
+    push    rbp
+    mov     rbp, rsp
+    sub     rsp, 64
+    mov     qword ptr [rbp-8], rcx
+    mov     qword ptr [rbp-16], 0
+    mov     rcx, qword ptr [rbp-8]
+    mov     edx, SIGDN_FILESYSPATH
+    lea     r8, [rbp-16]
+    mov     rax, qword ptr [rcx]
+    call    qword ptr [rax+VT_GetDisplayName]
+    test    eax, eax
+    jnz     tks_ret
+    mov     rcx, qword ptr [rbp-16]
+    call    append_gui_keyfile
+    WINCALL CoTaskMemFree, qword ptr [rbp-16]
+tks_ret:
+    add     rsp, 64
+    pop     rbp
+    ret
+take_kf_shellitem endp
+
+; =============================================================================
+; pick_tcvc_keyfiles(ecx = 1 for folder, 0 for file(s)) - interactive picker
+; invoked on the main desktop when + File / + Folder is clicked in the prompt.
+; =============================================================================
+pick_tcvc_keyfiles proc
+    push    rbp
+    mov     rbp, rsp
+    sub     rsp, 160
+    mov     dword ptr [rbp-40], ecx
+    mov     qword ptr [rbp-8], 0
+    mov     qword ptr [rbp-16], 0
+    WINCALL CoInitializeEx, 0, COINIT_APARTMENTTHREADED
+    lea     rax, [rbp-8]
+    WINCALL CoCreateInstance, addr clsid_fileopen, 0, CLSCTX_INPROC_SERVER, addr iid_ifileopen, rax
+    test    eax, eax
+    jnz     pkf_uninit
+    mov     rcx, qword ptr [rbp-8]
+    lea     rdx, [rbp-48]
+    mov     rax, qword ptr [rcx]
+    call    qword ptr [rax+VT_GetOptions]
+    mov     edx, dword ptr [rbp-48]
+    or      edx, FOS_FILEMUSTEXIST
+    cmp     dword ptr [rbp-40], 0
+    je      pkf_files
+    or      edx, FOS_PICKFOLDERS
+    jmp     pkf_setopt
+pkf_files:
+    or      edx, FOS_ALLOWMULTISELECT
+pkf_setopt:
+    mov     rcx, qword ptr [rbp-8]
+    mov     rax, qword ptr [rcx]
+    call    qword ptr [rax+VT_SetOptions]
+    lea     rdx, [t_pick_kf]
+    cmp     dword ptr [rbp-40], 0
+    je      @F
+    lea     rdx, [t_pick_kfdir]
+@@:
+    mov     rcx, qword ptr [rbp-8]
+    mov     rax, qword ptr [rcx]
+    call    qword ptr [rax+VT_SetTitle]
+    mov     rcx, qword ptr [rbp-8]
+    mov     rdx, qword ptr [g_hwnd]
+    mov     rax, qword ptr [rcx]
+    call    qword ptr [rax+VT_Show]
+    test    eax, eax
+    jnz     pkf_release
+    cmp     dword ptr [rbp-40], 0
+    je      pkf_multi
+    mov     rcx, qword ptr [rbp-8]
+    lea     rdx, [rbp-16]
+    mov     rax, qword ptr [rcx]
+    call    qword ptr [rax+VT_GetResult]
+    test    eax, eax
+    jnz     pkf_release
+    mov     rcx, qword ptr [rbp-16]
+    call    take_kf_shellitem
+    mov     rcx, qword ptr [rbp-16]
+    mov     rax, qword ptr [rcx]
+    call    qword ptr [rax+VT_Release]
+    jmp     pkf_release
+pkf_multi:
+    mov     rcx, qword ptr [rbp-8]
+    lea     rdx, [rbp-16]
+    mov     rax, qword ptr [rcx]
+    call    qword ptr [rax+VT_GetResults]
+    test    eax, eax
+    jnz     pkf_release
+    mov     dword ptr [rbp-56], 0
+    mov     rcx, qword ptr [rbp-16]
+    lea     rdx, [rbp-56]
+    mov     rax, qword ptr [rcx]
+    call    qword ptr [rax+VT_SIA_GetCount]
+    mov     qword ptr [rbp-64], 0
+pkf_loop:
+    mov     eax, dword ptr [rbp-56]
+    cmp     qword ptr [rbp-64], rax
+    jae     pkf_arrdone
+    mov     qword ptr [rbp-72], 0
+    mov     rcx, qword ptr [rbp-16]
+    mov     edx, dword ptr [rbp-64]
+    lea     r8, [rbp-72]
+    mov     rax, qword ptr [rcx]
+    call    qword ptr [rax+VT_SIA_GetItemAt]
+    test    eax, eax
+    jnz     pkf_arrnext
+    mov     rcx, qword ptr [rbp-72]
+    call    take_kf_shellitem
+    mov     rcx, qword ptr [rbp-72]
+    mov     rax, qword ptr [rcx]
+    call    qword ptr [rax+VT_Release]
+pkf_arrnext:
+    inc     qword ptr [rbp-64]
+    jmp     pkf_loop
+pkf_arrdone:
+    mov     rcx, qword ptr [rbp-16]
+    mov     rax, qword ptr [rcx]
+    call    qword ptr [rax+VT_Release]
+pkf_release:
+    mov     rcx, qword ptr [rbp-8]
+    test    rcx, rcx
+    jz      pkf_uninit
+    mov     rax, qword ptr [rcx]
+    call    qword ptr [rax+VT_Release]
+pkf_uninit:
+    WINCALL CoUninitialize
+    add     rsp, 160
+    pop     rbp
+    ret
+pick_tcvc_keyfiles endp
+
+; =============================================================================
+; open_tcvc_via_picker - command-bar glyph handler ("Open TrueCrypt/VeraCrypt
+; container").  Allows opening any TC/VC volume regardless of file extension.
+; =============================================================================
+open_tcvc_via_picker proc
+    push    rbp
+    mov     rbp, rsp
+    sub     rsp, 128
+    mov     qword ptr [rbp-8], 0
+    mov     qword ptr [rbp-16], 0
+    mov     qword ptr [rbp-24], 0
+    mov     dword ptr [rbp-32], 0
+    WINCALL CoInitializeEx, 0, COINIT_APARTMENTTHREADED
+    lea     rax, [rbp-8]
+    WINCALL CoCreateInstance, addr clsid_fileopen, 0, CLSCTX_INPROC_SERVER, addr iid_ifileopen, rax
+    test    eax, eax
+    jnz     otp_uninit
+    mov     rcx, qword ptr [rbp-8]
+    lea     rdx, [rbp-40]
+    mov     rax, qword ptr [rcx]
+    call    qword ptr [rax+VT_GetOptions]
+    mov     edx, dword ptr [rbp-40]
+    or      edx, FOS_FILEMUSTEXIST
+    mov     rcx, qword ptr [rbp-8]
+    mov     rax, qword ptr [rcx]
+    call    qword ptr [rax+VT_SetOptions]
+    mov     rcx, qword ptr [rbp-8]
+    lea     rdx, [s_open_tcvc]
+    mov     rax, qword ptr [rcx]
+    call    qword ptr [rax+VT_SetTitle]
+    mov     rcx, qword ptr [rbp-8]
+    mov     rdx, qword ptr [g_hwnd]
+    mov     rax, qword ptr [rcx]
+    call    qword ptr [rax+VT_Show]
+    test    eax, eax
+    jnz     otp_release
+    mov     rcx, qword ptr [rbp-8]
+    lea     rdx, [rbp-16]
+    mov     rax, qword ptr [rcx]
+    call    qword ptr [rax+VT_GetResult]
+    test    eax, eax
+    jnz     otp_release
+    mov     rcx, qword ptr [rbp-16]
+    mov     edx, SIGDN_FILESYSPATH
+    lea     r8, [rbp-24]
+    mov     rax, qword ptr [rcx]
+    call    qword ptr [rax+VT_GetDisplayName]
+    test    eax, eax
+    jnz     otp_relitem
+    mov     rcx, qword ptr [rbp-24]
+    call    wlen
+    inc     rax
+    cmp     rax, FILEPATH_CHARS
+    ja      otp_freepath
+    mov     dword ptr [rbp-32], 1           ; valid path picked
+otp_freepath:
+    cmp     dword ptr [rbp-32], 0
+    jne     otp_relitem                     ; copy after closing previous state
+    WINCALL CoTaskMemFree, qword ptr [rbp-24]
+    mov     qword ptr [rbp-24], 0
+otp_relitem:
+    mov     rcx, qword ptr [rbp-16]
+    mov     rax, qword ptr [rcx]
+    call    qword ptr [rax+VT_Release]
+otp_release:
+    mov     rcx, qword ptr [rbp-8]
+    test    rcx, rcx
+    jz      otp_uninit
+    mov     rax, qword ptr [rcx]
+    call    qword ptr [rax+VT_Release]
+otp_uninit:
+    WINCALL CoUninitialize
+    cmp     dword ptr [rbp-32], 0
+    je      otp_ret                         ; cancelled: leave existing view untouched
+
+    ; Tear down any prior container/session secrets cleanly before switching
+    call    tcvc_close
+    call    wipe_gui_keyfiles
+    lea     rcx, [g_key]
+    mov     rdx, 32
+    call    secure_zero
+    lea     rcx, [g_cfg_pass]
+    mov     rdx, MAX_PASSWORD_BYTES+1
+    call    secure_zero
+    mov     dword ptr [g_cfg_passlen], 0
+    mov     dword ptr [g_pw_ready], 0
+    mov     word ptr [g_tcvc_statw], 0
+    lea     rcx, [g_expanded]
+    call    pset_clear
+    lea     rcx, [g_excluded]
+    call    pset_clear
+    call    pfx_reset
+
+    ; Install picked path as sole input and enter TC/VC container mode
+    lea     rcx, [g_filepath_w]
+    mov     rdx, qword ptr [rbp-24]
+    WBOUND  r8, g_filepath_w, FILEPATH_CHARS
+    call    wcopy
+    WINCALL CoTaskMemFree, qword ptr [rbp-24]
+    mov     qword ptr [g_poscount], 1
+    mov     rcx, 1
+    call    set_input_ptrs
+    mov     dword ptr [g_has_file], 1
+    mov     dword ptr [g_have_dest], 0
+    mov     dword ptr [g_out_chosen], 0
+    mov     dword ptr [g_op], 1
+    mov     dword ptr [g_is_tcvc], 1
+    mov     dword ptr [g_is_zip], 0
+    mov     dword ptr [g_is_archive], 1
+    mov     dword ptr [g_container], 1
+    call    adapt_for_container
+    WINCALL SetWindowTextW, qword ptr [g_hwnd], addr wtitle_dec
+    call    compute_root
+    call    build_crumb
+    call    build_crumb_short
+    call    do_layout
+    WINCALL RedrawWindow, qword ptr [g_hwnd], 0, 0, 0185h
+
+    call    container_load
+    test    eax, eax
+    jz      otp_ret
+
+    ; Unlock cancelled or failed: revert cleanly to empty encrypt view
+    call    tcvc_close
+    call    wipe_gui_keyfiles
+    mov     qword ptr [g_poscount], 0
+    mov     dword ptr [g_has_file], 0
+    mov     dword ptr [g_op], 0
+    mov     dword ptr [g_is_tcvc], 0
+    mov     dword ptr [g_is_zip], 0
+    mov     dword ptr [g_is_archive], 0
+    mov     dword ptr [g_container], 0
+    mov     dword ptr [g_pw_ready], 0
+    call    adapt_for_encrypt
+    call    refresh_inputs
+    call    update_strength
+    WINCALL RedrawWindow, qword ptr [g_hwnd], 0, 0, 0185h
+otp_ret:
+    add     rsp, 128
+    pop     rbp
+    ret
+open_tcvc_via_picker endp
 
 ; =============================================================================
 ; make_logo_ctl - create the owner-draw STATIC for the logo header band.
@@ -7872,6 +8371,8 @@ remove_selected proc frame
     ; "do not encrypt this" but "take this out of the container".
     cmp     dword ptr [g_container], 0
     je      rs_inputs
+    cmp     dword ptr [g_is_tcvc], 0
+    jne     rs_done                           ; read-only TC/VC volume
     call    container_remove_selected
     jmp     rs_done
 rs_inputs:
@@ -9733,6 +10234,62 @@ ewz_done:
     ret
 ends_with_zip endp
 
+; ends_with_tcvc(rcx = wide path) -> eax = 1 if it ends in ".tc" or ".hc" (any case)
+ends_with_tcvc proc
+    push    rbp
+    mov     rbp, rsp
+    sub     rsp, 48
+    mov     qword ptr [rbp-8], rcx
+    call    wlen
+    cmp     rax, 4                          ; require at least 1 stem char + ".tc"
+    jb      ewt_no
+    mov     r10, qword ptr [rbp-8]
+    lea     r10, [r10+rax*2-6]              ; last 3 wide chars
+    lea     r8, [s_ext_tc]
+    xor     r9, r9
+ewt_tc:
+    movzx   eax, word ptr [r10+r9*2]
+    movzx   edx, word ptr [r8+r9*2]
+    cmp     eax, 'A'
+    jb      @F
+    cmp     eax, 'Z'
+    ja      @F
+    add     eax, 20h
+@@:
+    cmp     eax, edx
+    jne     ewt_try_hc
+    inc     r9
+    cmp     r9, 3
+    jb      ewt_tc
+    mov     eax, 1
+    jmp     ewt_done
+ewt_try_hc:
+    lea     r8, [s_ext_hc]
+    xor     r9, r9
+ewt_hc:
+    movzx   eax, word ptr [r10+r9*2]
+    movzx   edx, word ptr [r8+r9*2]
+    cmp     eax, 'A'
+    jb      @F
+    cmp     eax, 'Z'
+    ja      @F
+    add     eax, 20h
+@@:
+    cmp     eax, edx
+    jne     ewt_no
+    inc     r9
+    cmp     r9, 3
+    jb      ewt_hc
+    mov     eax, 1
+    jmp     ewt_done
+ewt_no:
+    xor     eax, eax
+ewt_done:
+    add     rsp, 48
+    pop     rbp
+    ret
+ends_with_tcvc endp
+
 ; =============================================================================
 ; detect_op - classify the inputs into g_op (0 = encrypt, 1 = decrypt).
 ; Decrypt iff exactly one input that ends in ".mrk" AND carries the container
@@ -9746,6 +10303,7 @@ detect_op proc
     mov     dword ptr [g_container], 0
     mov     dword ptr [g_is_archive], 0
     mov     dword ptr [g_is_zip], 0
+    mov     dword ptr [g_is_tcvc], 0
     mov     dword ptr [g_zip_enc], 1     ; safe default: assume a password is needed
     cmp     qword ptr [g_poscount], 1
     jne     do_done
@@ -9809,7 +10367,7 @@ do_checkzip:
     lea     rcx, [g_filepath_w]
     call    ends_with_zip
     test    eax, eax
-    jz      do_done
+    jz      do_checktcvc
     lea     rcx, [g_filepath_w]
     call    file_open_read
     cmp     rax, INVALID_HVAL
@@ -9837,6 +10395,33 @@ do_checkzip:
     test    eax, eax                     ; 0 = no encrypted entries
     jnz     do_done                      ; 1 (encrypted) or -1 (unknown) -> keep default
     mov     dword ptr [g_zip_enc], 0
+    jmp     do_done
+do_checktcvc:
+    ; .tc / .hc TrueCrypt/VeraCrypt volumes carry no unencrypted magic, so route
+    ; by extension unless the file begins with Myrkr's own MYRK or MVOL magic.
+    lea     rcx, [g_filepath_w]
+    call    ends_with_tcvc
+    test    eax, eax
+    jz      do_done
+    lea     rcx, [g_filepath_w]
+    call    file_open_read
+    cmp     rax, INVALID_HVAL
+    je      do_done
+    mov     qword ptr [rbp-8], rax
+    mov     dword ptr [rbp-16], 0
+    WINCALL ReadFile, qword ptr [rbp-8], addr g_hdrbuf, 4, addr rbp-16, 0
+    WINCALL CloseHandle, qword ptr [rbp-8]
+    cmp     dword ptr [rbp-16], 4
+    jb      @F
+    cmp     dword ptr [g_hdrbuf], HDR_MAGIC
+    je      do_done
+    cmp     dword ptr [g_hdrbuf], 4C4F564Dh  ; "MVOL"
+    je      do_done
+@@:
+    mov     dword ptr [g_op], 1
+    mov     dword ptr [g_is_tcvc], 1
+    mov     dword ptr [g_is_archive], 1
+    mov     dword ptr [g_container], 1
 do_done:
     ; ---- a RIGHT-DRAG acts, it does not browse ------------------------------
     ; --to is only ever passed by the shell extension when there is a drop
@@ -9887,6 +10472,45 @@ build_output proc
     call    wcopy
     jmp     bo_done
 bo_dec:
+    ; A TrueCrypt/VeraCrypt filesystem has root-level files rather than a single
+    ; top-level tar wrapper, so extract into <stem> (minus .tc/.hc) or <path>_files.
+    cmp     dword ptr [g_is_tcvc], 0
+    je      bo_dec_not_tcvc
+    lea     rcx, [g_filepath_w]
+    call    ends_with_tcvc
+    test    eax, eax
+    jz      bo_tcvc_sfx
+    lea     rcx, [g_filepath_w]
+    call    wlen
+    sub     rax, 3
+    cmp     rax, OUTPATH_CHARS - 1
+    jbe     @F
+    mov     rax, OUTPATH_CHARS - 1
+@@:
+    lea     rcx, [g_outpath_w]
+    lea     rdx, [g_filepath_w]
+    xor     r9, r9
+bo_tcvc_cp:
+    cmp     r9, rax
+    jae     bo_tcvc_cpdone
+    mov     r10w, word ptr [rdx+r9*2]
+    mov     word ptr [rcx+r9*2], r10w
+    inc     r9
+    jmp     bo_tcvc_cp
+bo_tcvc_cpdone:
+    mov     word ptr [rcx+r9*2], 0
+    jmp     bo_done
+bo_tcvc_sfx:
+    lea     rcx, [g_outpath_w]
+    lea     rdx, [g_filepath_w]
+    WBOUND  r8, g_outpath_w, OUTPATH_CHARS
+    call    wcopy
+    mov     rcx, rax
+    lea     rdx, [s_files_sfx]
+    WBOUND  r8, g_outpath_w, OUTPATH_CHARS
+    call    wcopy
+    jmp     bo_done
+bo_dec_not_tcvc:
     ; An archive (.mrk with the archive flag, or a .zip) already carries its own
     ; top-level folder inside the tar, so the destination is the folder to
     ; extract INTO - the container's own directory - not a fresh folder named
@@ -10380,6 +11004,14 @@ container_drag_out proc frame
     je      cdo_ret
     cmp     dword ptr [g_ole_ok], 0
     je      cdo_ret                         ; OleInitialize failed at startup
+    cmp     dword ptr [g_is_tcvc], 0
+    je      @F
+    call    tcvc_is_open
+    test    eax, eax
+    jz      cdo_ret
+    mov     dword ptr [rbp-56], 2           ; DO_kind = 2 -> tcvc_entry_to_mem
+    jmp     cdo_gated
+@@:
     mov     eax, dword ptr [g_is_zip]
     mov     dword ptr [rbp-56], eax
     test    eax, eax
@@ -11238,6 +11870,8 @@ container_load proc frame
     FRAME_PROLOG 64
     lea     rax, [g_filepath_w]
     mov     qword ptr [g_cfg_in], rax
+    cmp     dword ptr [g_is_tcvc], 0
+    jne     cl_tcvc
     cmp     dword ptr [g_is_zip], 0
     jne     cl_zip
     ; the password, once: read_password caches it, so the Decrypt that follows
@@ -11286,6 +11920,65 @@ cl_ziplist:
     call    zip_to_index
     test    eax, eax
     jnz     cl_fail
+    jmp     cl_listed
+cl_tcvc:
+    call    tcvc_close
+    call    read_password
+    test    eax, eax
+    jnz     cl_tcvc_cancel
+    mov     dword ptr [g_pw_ready], 1
+    lea     rcx, [g_filepath_w]
+    lea     rdx, [g_cfg_pass]
+    mov     r8d, dword ptr [g_cfg_passlen]
+    lea     r9,  [g_kf_paths]
+    mov     eax, dword ptr [g_kf_count]
+    mov     qword ptr [rsp+32], rax
+    call    tcvc_open
+    mov     dword ptr [rbp-16], eax
+    ; Wipe password + keyfile paths immediately: XTS schedules live in locked secmem.
+    lea     rcx, [g_cfg_pass]
+    mov     rdx, MAX_PASSWORD_BYTES+1
+    call    secure_zero
+    mov     dword ptr [g_cfg_passlen], 0
+    call    wipe_gui_keyfiles
+    cmp     dword ptr [rbp-16], 0
+    jne     cl_tcvc_err
+    call    tcvc_to_index
+    mov     dword ptr [rbp-16], eax
+    test    eax, eax
+    jnz     cl_tcvc_err
+    lea     rcx, [g_tcvc_statw]
+    mov     edx, STATUSW_CHARS
+    call    tcvc_format_status
+    jmp     cl_listed
+cl_tcvc_cancel:
+    call    wipe_gui_keyfiles
+    jmp     cl_fail
+cl_tcvc_err:
+    mov     dword ptr [g_pw_ready], 0
+    call    tcvc_close
+    mov     eax, dword ptr [rbp-16]
+    lea     rcx, [m_io]
+    cmp     eax, EXIT_AUTH
+    jne     @F
+    lea     rcx, [m_tcvc_auth]
+@@:
+    cmp     eax, EXIT_UNSUPPORTED
+    jne     @F
+    lea     rcx, [m_tcvc_unsup]
+@@:
+    cmp     eax, EXIT_CORRUPT
+    jne     @F
+    lea     rcx, [m_tcvc_corrupt]
+@@:
+    cmp     eax, EXIT_OOM
+    jne     @F
+    lea     rcx, [m_oom]
+@@:
+    lea     rdx, [t_err]
+    mov     r8d, MB_OK or MB_ICONERROR
+    call    mbox
+    jmp     cl_fail
 cl_listed:
     ; populate_list derives the rows from the inventory itself now, so there is
     ; no separate rows_from_index call here to fall out of step with it.
@@ -11314,7 +12007,12 @@ cl_listed:
     call    fmt_summary
     WINCALL SetWindowTextW, qword ptr [g_hscan], addr g_summbuf
     call    container_update_action
-    WINCALL SetWindowTextW, qword ptr [g_hstatus], addr s_edits_saved
+    lea     rdx, [s_edits_saved]
+    cmp     dword ptr [g_is_tcvc], 0
+    je      @F
+    lea     rdx, [g_tcvc_statw]
+@@:
+    WINCALL SetWindowTextW, qword ptr [g_hstatus], rdx
     xor     eax, eax
     FRAME_EPILOG
     ret
@@ -11753,6 +12451,11 @@ wt_encrypt:
     call    do_encrypt
     jmp     wt_fin
 wt_dec:
+    cmp     dword ptr [g_is_tcvc], 0
+    je      @F
+    call    do_tcvc_gui_extract
+    jmp     wt_fin
+@@:
     cmp     dword ptr [g_is_zip], 0
     je      wt_decrypt
     call    do_unzip
@@ -11795,6 +12498,10 @@ enter_running proc
     ; disable inputs
     WINCALL EnableWindow, qword ptr [g_haction], 0
     WINCALL EnableWindow, qword ptr [g_hpass], 0
+    cmp     qword ptr [g_hopentc], 0
+    je      @F
+    WINCALL EnableWindow, qword ptr [g_hopentc], 0
+@@:
     cmp     qword ptr [g_hconfirm], 0
     je      @F
     WINCALL EnableWindow, qword ptr [g_hconfirm], 0
@@ -11866,12 +12573,30 @@ read_password proc
     ; and post a click, which is exactly how this GUI was driven headlessly in
     ; testing.  secdesk_prompt asks on a desktop that other processes cannot
     ; enumerate or message.
+rp_prompt:
     xor     ecx, ecx
     cmp     dword ptr [g_op], 0             ; 0 = encrypt -> confirm the password
     jne     @F
     mov     ecx, SDF_CONFIRM
+    jmp     rp_call_sd
 @@:
+    cmp     dword ptr [g_is_tcvc], 0
+    je      rp_call_sd
+    mov     ecx, SDF_TCVC
+rp_call_sd:
     call    secdesk_prompt
+    cmp     eax, SDR_KF_FILE
+    jne     @F
+    xor     ecx, ecx
+    call    pick_tcvc_keyfiles
+    jmp     rp_prompt
+@@:
+    cmp     eax, SDR_KF_DIR
+    jne     @F
+    mov     ecx, 1
+    call    pick_tcvc_keyfiles
+    jmp     rp_prompt
+@@:
     cmp     eax, SDR_UNAVAILABLE
     jne     @F
     ; fail closed - see secdesk_prompt.  Falling back to the ordinary desktop
@@ -11901,6 +12626,11 @@ rp_have:
     dec     eax
     cmp     eax, MAX_PASSWORD_BYTES
     ja      rp_bad
+    cmp     dword ptr [g_is_tcvc], 0
+    je      @F
+    cmp     eax, TCVC_MAX_PASS
+    ja      rp_bad
+@@:
     mov     dword ptr [g_cfg_passlen], eax
     xor     eax, eax
     jmp     rp_ret
@@ -12072,6 +12802,7 @@ se_wipe:
     lea     rcx, [g_passw]
     mov     rdx, PWBUF_CHARS
     call    wzero
+    call    wipe_gui_keyfiles
 se_ret:
     add     rsp, 64
     pop     rbp
@@ -12166,6 +12897,7 @@ sd_wipe:
     lea     rcx, [g_passw]
     mov     rdx, PWBUF_CHARS
     call    wzero
+    call    wipe_gui_keyfiles
 sd_ret:
     add     rsp, 64
     pop     rbp
@@ -12340,6 +13072,9 @@ dps_hide:
     cmp     dword ptr [g_container], 0
     je      @F
     lea     rdx, [s_edits_saved]
+    cmp     dword ptr [g_is_tcvc], 0
+    je      @F
+    lea     rdx, [g_tcvc_statw]
 @@:
     WINCALL SetWindowTextW, qword ptr [g_hstatus], rdx
 dps_ret:
@@ -12644,10 +13379,22 @@ od_err:
     cmp     eax, EXIT_AUTH
     jne     @F
     lea     rcx, [m_auth]
+    cmp     dword ptr [g_is_tcvc], 0
+    je      @F
+    lea     rcx, [m_tcvc_auth]
 @@:
     cmp     eax, EXIT_CORRUPT
     jne     @F
     lea     rcx, [m_corrupt]
+    cmp     dword ptr [g_is_tcvc], 0
+    je      @F
+    lea     rcx, [m_tcvc_corrupt]
+@@:
+    cmp     eax, EXIT_UNSUPPORTED
+    jne     @F
+    cmp     dword ptr [g_is_tcvc], 0
+    je      @F
+    lea     rcx, [m_tcvc_unsup]
 @@:
     cmp     eax, EXIT_OOM
     jne     @F
@@ -12818,6 +13565,10 @@ od_c_reload:
     mov     dword ptr [g_wt_job], 0
     WINCALL EnableWindow, qword ptr [g_haction], 1
     WINCALL EnableWindow, qword ptr [g_hpass], 1
+    cmp     qword ptr [g_hopentc], 0
+    je      @F
+    WINCALL EnableWindow, qword ptr [g_hopentc], 1
+@@:
     ; Open the folder it went into BEFORE reloading, so the rebuilt tree shows
     ; what arrived.  container_load seeds the top level only, which leaves an
     ; add into a collapsed folder invisible.
@@ -12838,6 +13589,10 @@ od_restore:
     WINCALL ShowWindow, qword ptr [g_hprog], SW_HIDE
     WINCALL EnableWindow, qword ptr [g_haction], 1
     WINCALL EnableWindow, qword ptr [g_hpass], 1
+    cmp     qword ptr [g_hopentc], 0
+    je      @F
+    WINCALL EnableWindow, qword ptr [g_hopentc], 1
+@@:
     cmp     qword ptr [g_hconfirm], 0
     je      @F
     WINCALL EnableWindow, qword ptr [g_hconfirm], 1
@@ -12852,6 +13607,9 @@ od_restore:
     cmp     dword ptr [g_container], 0
     je      @F
     lea     rdx, [s_edits_saved]
+    cmp     dword ptr [g_is_tcvc], 0
+    je      @F
+    lea     rdx, [g_tcvc_statw]
 @@:
     WINCALL SetWindowTextW, qword ptr [g_hstatus], rdx
     ; clear password fields + internal EDIT HLOCAL/undo buffers + globals
@@ -12869,6 +13627,10 @@ od_restore:
     mov     rdx, MAX_PASSWORD_BYTES+1
     call    secure_zero
     mov     dword ptr [g_cfg_passlen], 0
+    cmp     dword ptr [g_container], 0
+    jne     @F
+    call    wipe_gui_keyfiles
+@@:
     ; refresh the strength UI back to the empty state (encrypt mode)
     cmp     dword ptr [g_op], 0
     jne     od_fin
@@ -14351,6 +15113,12 @@ dr_notglyph:
     mov     rax, 1
     jmp     wp_ret
 @@:
+    cmp     eax, ID_OPENTC
+    jne     @F
+    call    draw_glyph_btn
+    mov     rax, 1
+    jmp     wp_ret
+@@:
     cmp     eax, ID_SHOWPW
     jne     @F
     call    draw_show_icon
@@ -14590,6 +15358,8 @@ wp_command:
     je      wp_addfiles
     cmp     eax, ID_ADDFOLDER
     je      wp_addfolder
+    cmp     eax, ID_OPENTC
+    je      wp_opentc
     cmp     eax, ID_CMD_REMOVE
     je      wp_cmdremove
     cmp     eax, ID_CMD_CLEAR
@@ -14632,6 +15402,8 @@ wp_showlog:
 wp_addfiles:
     cmp     dword ptr [g_running], 0
     jne     wp_zero
+    cmp     dword ptr [g_is_tcvc], 0
+    jne     wp_zero
     cmp     dword ptr [g_menu_open], 0
     je      @F
     call    toggle_menu                  ; only if the user left it open
@@ -14647,6 +15419,8 @@ wp_addfiles:
 wp_addfolder:
     cmp     dword ptr [g_running], 0
     jne     wp_zero
+    cmp     dword ptr [g_is_tcvc], 0
+    jne     wp_zero
     cmp     dword ptr [g_menu_open], 0
     je      @F
     call    toggle_menu
@@ -14658,6 +15432,17 @@ wp_addfolder:
     jmp     wp_zero
 @@:
     call    add_via_picker
+    jmp     wp_zero
+wp_opentc:
+    cmp     dword ptr [g_running], 0
+    jne     wp_zero
+    cmp     dword ptr [g_scanning], 0
+    jne     wp_zero
+    cmp     dword ptr [g_menu_open], 0
+    je      @F
+    call    toggle_menu
+@@:
+    call    open_tcvc_via_picker
     jmp     wp_zero
 wp_cmdremove:
     call    remove_selected
@@ -14808,6 +15593,8 @@ wp_destroy_noole:
     mov     dword ptr [g_ole_ok], 0
     WINCALL OleUninitialize
 wp_destroy_quit:
+    call    tcvc_close
+    call    wipe_gui_keyfiles
     mov     rcx, qword ptr [g_hpass]
     call    gui_hwnd_scrub
     mov     rcx, qword ptr [g_hconfirm]
@@ -15640,9 +16427,31 @@ draw_secdesk proc
     mov     dword ptr [g_mb_rc+12], eax
     WINCALL DrawTextW, qword ptr [g_dr_hdc], addr s_sd_hint2, -1, addr g_mb_rc, \
             <DT_LEFT or DT_SINGLELINE or DT_NOPREFIX>
-    ; No drawn field labels: each edit carries its own in-field cue
-    ; (edit_subclass), which is where the user is already looking.  Having
-    ; both printed the word twice, once above the box and once inside it.
+    test    dword ptr [g_sd_flags], SDF_TCVC
+    jz      dsd_done
+    mov     eax, dword ptr [g_sd_fmty]
+    mov     dword ptr [g_mb_rc+0], SD_PAD
+    mov     dword ptr [g_mb_rc+4], eax
+    mov     dword ptr [g_mb_rc+8], SD_W - SD_PAD - 224
+    add     eax, SD_ROW_H
+    mov     dword ptr [g_mb_rc+12], eax
+    cmp     dword ptr [g_kf_count], 0
+    jne     dsd_kf_count
+    WINCALL SetTextColor, qword ptr [g_dr_hdc], CLR_HINT
+    WINCALL DrawTextW, qword ptr [g_dr_hdc], addr s_kf_none, -1, addr g_mb_rc, \
+            <DT_LEFT or DT_VCENTER or DT_SINGLELINE or DT_NOPREFIX>
+    jmp     dsd_done
+dsd_kf_count:
+    lea     rcx, [g_sd_kftxt]
+    lea     rdx, [s_kf_lbl]
+    WBOUND  r8, g_sd_kftxt, 32
+    call    wcopy
+    mov     rcx, rax
+    mov     eax, dword ptr [g_kf_count]
+    call    u64_to_wide
+    WINCALL SetTextColor, qword ptr [g_dr_hdc], CLR_WHITE
+    WINCALL DrawTextW, qword ptr [g_dr_hdc], addr g_sd_kftxt, -1, addr g_mb_rc, \
+            <DT_LEFT or DT_VCENTER or DT_SINGLELINE or DT_NOPREFIX>
 dsd_done:
     add     rsp, 96
     pop     rbp
@@ -15708,8 +16517,11 @@ make_secdesk_controls proc
     ; confirm edit + format row (encrypt only)
     mov     qword ptr [g_sd_hconf], 0
     mov     qword ptr [g_sd_hfmt], 0
+    mov     qword ptr [g_sd_hkffile], 0
+    mov     qword ptr [g_sd_hkfdir], 0
+    mov     qword ptr [g_sd_hkfclr], 0
     test    dword ptr [g_sd_flags], SDF_CONFIRM
-    jz      msc_buttons
+    jz      msc_chk_tcvc
     lea     rcx, [cls_edit]
     lea     rdx, [s_empty]
     mov     r8, ST_PWEDIT
@@ -15756,6 +16568,48 @@ make_secdesk_controls proc
     cmp     dword ptr [g_lock_format], 0
     je      msc_buttons
     WINCALL EnableWindow, qword ptr [g_sd_hfmt], 0
+    jmp     msc_buttons
+msc_chk_tcvc:
+    test    dword ptr [g_sd_flags], SDF_TCVC
+    jz      msc_buttons
+    ; Keyfile picker buttons on the TC/VC prompt row (right-aligned)
+    lea     rcx, [cls_button]
+    lea     rdx, [s_kf_addfile]
+    mov     r8, ST_OWNERBTN
+    mov     r9, ID_SDKFFILE
+    mov     dword ptr [rsp+32], SD_W - SD_PAD - 60 - 6 - 78 - 6 - 68
+    mov     eax, dword ptr [g_sd_fmty]
+    mov     dword ptr [rsp+40], eax
+    mov     dword ptr [rsp+48], 68
+    mov     dword ptr [rsp+56], SD_ROW_H
+    call    create_ctl
+    mov     qword ptr [g_sd_hkffile], rax
+    lea     rcx, [cls_button]
+    lea     rdx, [s_kf_adddir]
+    mov     r8, ST_OWNERBTN
+    mov     r9, ID_SDKFDIR
+    mov     dword ptr [rsp+32], SD_W - SD_PAD - 60 - 6 - 78
+    mov     eax, dword ptr [g_sd_fmty]
+    mov     dword ptr [rsp+40], eax
+    mov     dword ptr [rsp+48], 78
+    mov     dword ptr [rsp+56], SD_ROW_H
+    call    create_ctl
+    mov     qword ptr [g_sd_hkfdir], rax
+    lea     rcx, [cls_button]
+    lea     rdx, [s_kf_clear]
+    mov     r8, ST_OWNERBTN
+    mov     r9, ID_SDKFCLR
+    mov     dword ptr [rsp+32], SD_W - SD_PAD - 60
+    mov     eax, dword ptr [g_sd_fmty]
+    mov     dword ptr [rsp+40], eax
+    mov     dword ptr [rsp+48], 60
+    mov     dword ptr [rsp+56], SD_ROW_H
+    call    create_ctl
+    mov     qword ptr [g_sd_hkfclr], rax
+    xor     edx, edx
+    cmp     dword ptr [g_kf_count], 0
+    setne   dl
+    WINCALL EnableWindow, qword ptr [g_sd_hkfclr], edx
 msc_buttons:
     mov     eax, dword ptr [g_sd_height]
     sub     eax, SD_PAD + SD_BTN_H
@@ -15783,6 +16637,12 @@ msc_buttons:
     call    create_ctl
     ; OK starts disabled: nothing typed yet cannot satisfy the policy
     WINCALL EnableWindow, qword ptr [g_sd_hok], 0
+    test    dword ptr [g_sd_flags], SDF_TCVC
+    jz      @F
+    cmp     dword ptr [g_kf_count], 0
+    je      @F
+    WINCALL EnableWindow, qword ptr [g_sd_hok], 1
+@@:
     mov     dword ptr [g_pw_state], 0
     mov     dword ptr [g_cf_state], 0
     WINCALL SetFocus, qword ptr [g_sd_hpass]
@@ -15995,6 +16855,28 @@ sd_update proc
     sub     rsp, 80
     WINCALL GetWindowTextW, qword ptr [g_sd_hpass], addr g_passw, PWBUF_CHARS
     mov     dword ptr [rbp-8], eax               ; password length
+    test    dword ptr [g_sd_flags], SDF_TCVC
+    jz      sdu_std_policy
+    ; TC/VC unlock: no password policy floor; allow non-empty password OR keyfiles
+    xor     eax, eax
+    cmp     dword ptr [rbp-8], 0
+    je      @F
+    mov     eax, 4                               ; green when typed
+@@:
+    mov     dword ptr [g_pw_state], eax
+    mov     dword ptr [g_cf_state], 0
+    mov     dword ptr [rbp-24], 1
+    xor     edx, edx
+    cmp     dword ptr [rbp-8], 0
+    jne     sdu_tcvc_en
+    cmp     dword ptr [g_kf_count], 0
+    je      sdu_tcvc_go
+sdu_tcvc_en:
+    mov     edx, 1
+sdu_tcvc_go:
+    mov     dword ptr [rbp-16], edx
+    jmp     sdu_enable
+sdu_std_policy:
     ; ---- policy (the gate) ----
     lea     rcx, [g_passw]
     call    pw_policy_ok
@@ -16187,6 +17069,12 @@ sdw_draw:
     call    draw_sd_format
     jmp     sdw_one
 sdw_notfmt:
+    cmp     eax, ID_SDKFFILE
+    je      sdw_btn
+    cmp     eax, ID_SDKFDIR
+    je      sdw_btn
+    cmp     eax, ID_SDKFCLR
+    je      sdw_btn
     cmp     eax, ID_ACTION
     je      sdw_btn
     cmp     eax, ID_CANCEL
@@ -16246,6 +17134,24 @@ sdw_regrade:
     call    sd_toggle_format
     jmp     sdw_zero
 sdw_notfmtcmd:
+    cmp     eax, ID_SDKFFILE
+    jne     @F
+    mov     dword ptr [g_sd_result], SDR_KF_FILE
+    jmp     sdw_end
+@@:
+    cmp     eax, ID_SDKFDIR
+    jne     @F
+    mov     dword ptr [g_sd_result], SDR_KF_DIR
+    jmp     sdw_end
+@@:
+    cmp     eax, ID_SDKFCLR
+    jne     @F
+    call    wipe_gui_keyfiles
+    WINCALL EnableWindow, qword ptr [g_sd_hkfclr], 0
+    WINCALL InvalidateRect, qword ptr [g_sd_hwnd], 0, 1
+    call    sd_update
+    jmp     sdw_zero
+@@:
     cmp     eax, ID_ACTION
     jne     @F
     call    sd_accept
@@ -16315,6 +17221,12 @@ sd_build_pump proc
     ; Its y comes out of this same running total rather than being written out
     ; again in make_secdesk_controls - the two would drift apart, and the way
     ; that shows is the row landing under the OK button.
+    add     eax, SD_GAP
+    mov     dword ptr [g_sd_fmty], eax
+    add     eax, SD_ROW_H
+@@:
+    test    dword ptr [g_sd_flags], SDF_TCVC
+    jz      @F
     add     eax, SD_GAP
     mov     dword ptr [g_sd_fmty], eax
     add     eax, SD_ROW_H
@@ -16945,8 +17857,9 @@ pgd_col:
     cmp     dword ptr [g_op], 0
     je      @F
     lea     r10, [s_pg_dec]
-    cmp     dword ptr [g_is_zip], 0
-    je      @F
+    mov     eax, dword ptr [g_is_zip]
+    or      eax, dword ptr [g_is_tcvc]
+    jz      @F
     lea     r10, [s_pg_ext]
 @@:
     cmp     dword ptr [g_pg_done], 0
@@ -17251,6 +18164,7 @@ pgf_wipe:
     lea     rcx, [g_passw]
     mov     rdx, PWBUF_CHARS
     call    wzero
+    call    wipe_gui_keyfiles
     ; Cancelled is not a failure - the user asked for it - but it is not a
     ; success either, so it stops here rather than closing as if it worked.
     mov     eax, dword ptr [g_op_result]

@@ -29,14 +29,22 @@ What each format can do, and which of the three surfaces reaches it: the
 **buttons** in the window, **drag-and-drop** onto the window, and Explorer's
 **right-click / right-drag** through the shell extension.
 
-| action | `.mrk` | `.zip` | buttons | drop on window | Explorer |
-|---|---|---|---|---|---|
-| create | yes | yes | Create .mrk / Create ZIP | yes | right-click / right-drag |
-| open / browse | yes | yes | — | — | double-click, or "Myrkr decrypt/extract" |
-| extract all | yes | yes | Extract all | — | yes |
-| extract selected | yes | yes | Extract selected | — | — |
-| **add to an existing archive** | yes | yes | Add files / Add folder | **yes, since 1.0.16 — verified in 1.0.18** | no |
-| remove entries | yes | yes | Delete | — | no |
+| action | `.mrk` | `.zip` | `.tc` / `.hc` (read-only) | buttons | drop on window | Explorer |
+|---|---|---|---|---|---|---|
+| create | yes | yes | **no** | Create .mrk / Create ZIP | yes | right-click / right-drag |
+| open / browse | yes | yes | yes (incl. disguised files via drive glyph) | Open TrueCrypt/VeraCrypt container (`ID_OPENTC`) | yes (`.tc`/`.hc`) | double-click, right-click, or right-drag |
+| extract all | yes | yes | yes | Extract all | — | yes (single `.tc`/`.hc` right-drag) |
+| extract selected | yes | yes | yes | Extract selected | — | — |
+| drag entries out | yes | yes | yes (up to 512 MiB per entry) | — | drag out to Explorer | — |
+| **add to an existing archive** | yes | yes | **disabled** | Add files / Add folder | **yes (`.mrk`/`.zip` only)** | no |
+| remove entries | yes | yes | **disabled** | Delete | — | no |
+
+When opening a TrueCrypt/VeraCrypt volume, the password prompt (`myrkr_secdesk`)
+adds a **Keyfiles** row (**+ File**, **+ Folder**, **Clear**) and lifts the
+encryption password-policy floor (permitting empty passwords when keyfiles are
+staged, up to 128 UTF-8 password bytes). Once unlocked, **Add files**, **Add
+folder**, **Delete**, and drop-to-append are disabled, and the status bar displays
+the detected format, cipher/cascade, KDF, filesystem, and `Read-Only (XTS)`.
 
 ## The gap this closed
 

@@ -81,6 +81,7 @@ endm
 ; =============================================================================
 ; sha256_init(rcx = ctx)
 ; =============================================================================
+LANDING_PAD
 public sha256_init
 sha256_init proc
     movdqu  xmm0, xmmword ptr [init_h]
@@ -397,6 +398,7 @@ sha256_compress endp
 ; =============================================================================
 ; sha256_update(rcx = ctx, rdx = data, r8 = len)
 ; =============================================================================
+LANDING_PAD
 public sha256_update
 sha256_update proc frame
     FRAME_PROLOG 64
@@ -481,6 +483,7 @@ sha256_update endp
 ; =============================================================================
 ; sha256_final(rcx = ctx, rdx = out32) - pad and emit big-endian digest
 ; =============================================================================
+LANDING_PAD
 public sha256_final
 sha256_final proc frame
     FRAME_PROLOG 64

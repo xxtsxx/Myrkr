@@ -12,12 +12,15 @@ No plaintext is staged to disk; v6-v9 sources remain readable; edited output is
 v9, preserving compression and segmentation policy. Volume editing remains
 unsupported. See [the current design and tests](docs/AUDIT_2026-09-04.md).
 
-**myrkr.exe** is a self-contained Windows x64 console application that encrypts,
-decrypts, verifies, and archives files using AES-256-GCM with an Argon2id key
-derivation function. It is written entirely in 64-bit MASM assembly
-(`ml64.exe` + `link.exe`), links only against OS-inbox DLLs (kernel32, bcrypt,
-cabinet), and carries no C runtime, no third-party libraries, and no external
-dependencies of any kind.
+**myrkr.exe** is a self-contained Windows x64 application (48 MASM64 modules)
+that encrypts, decrypts, verifies, and archives files using AES-256-GCM with an
+Argon2id key derivation function, and also opens TrueCrypt (`.tc`) and VeraCrypt
+(`.hc`) volume containers strictly read-only in user mode across all 5 ciphers,
+15 XTS modes, 7 KDFs, keyfiles, and 5 filesystem families (`FAT12/16/32`,
+`exFAT`, `NTFS`, `ext2/3/4`, `HFS+`). It is written entirely in 64-bit MASM
+assembly (`ml64.exe` + `link.exe`), links only against OS-inbox DLLs, and
+carries no C runtime, no third-party libraries, and no external dependencies of
+any kind.
 
 This document is the authoritative, current-state record of *what* has been
 built and *why* each design decision was made. It is maintained alongside the

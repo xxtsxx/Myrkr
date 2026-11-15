@@ -40,6 +40,7 @@ are all present and correct, and `msiexec /a` evaluates none of it.
 | Add/Remove Programs entry | with ProductName and ProductVersion |
 | `HKLM\SOFTWARE\Myrkr` values | **only** those named on the command line |
 | `.mrk` association | unless `MYRKR_NOASSOC=1` |
+| `.tc` / `.hc` associations | unless `MYRKR_NOASSOC=1` or `MYRKR_NOTCASSOC=1` |
 | Explorer context menus | unless `MYRKR_NOCONTEXT=1` |
 | the drag-drop handler's CLSID | unless `MYRKR_NOSHELLEXT=1` |
 
@@ -254,6 +255,12 @@ Myrkr claimed `.mrk`, the key does disappear — correctly, since an empty orpha
 key is litter. Where another application has also written there, its values
 remain and the key survives, which is the case this rule exists for.
 
+`.tc` and `.hc` (TrueCrypt and VeraCrypt volume containers) are registered to a
+separate `Myrkr.VolumeContainer` ProgId (with `OpenWithProgids` entries on both
+extensions and no `Name='-'` removal on `.tc` or `.hc`, so VeraCrypt can coexist
+cleanly). Pass `MYRKR_NOTCASSOC=1` to leave `.tc` and `.hc` untouched while still
+registering `.mrk`, or `MYRKR_NOASSOC=1` to skip all file associations.
+
 ## Context menu (right-click)
 
 Right-click any selection of files or folders and one entry appears, named for
@@ -297,9 +304,9 @@ named and placed according to what was dragged:
 
 | Selection | Entry | Placement |
 |---|---|---|
-| anything else | **Myrkr encrypt** | index 0, with a separator beneath it |
-| every item a `.mrk` | **Myrkr decrypt** | index 0, with a separator beneath it |
-| every item a `.zip` | **Myrkr extract** | at the first separator — i.e. directly below Explorer's own **Extract…** |
+| anything else | **Encrypt** | index 0, with a separator beneath it |
+| every item a `.mrk`, or a single `.tc` / `.hc` | **Decrypt/extract** | index 0, with a separator beneath it |
+| every item a `.zip` | **Decrypt/extract** | at the first separator — i.e. directly below Explorer's own **Extract…** |
 
 A mixed selection, `.mrk` and `.zip` together included, is none of the first two
 and falls through to **Myrkr encrypt**.

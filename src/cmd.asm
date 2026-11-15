@@ -63,6 +63,9 @@ extern entry_stream_open:proc
 extern progress_begin:proc
 extern progress_add:proc
 extern progress_done:proc
+extern is_tcvc_path:proc
+extern do_tcvc_decrypt:proc
+extern do_tcvc_verify:proc
 
 externdef g_cfg_in:qword
 externdef g_cfg_out:qword
@@ -1295,6 +1298,14 @@ derive_output_dir endp
 public do_decrypt
 do_decrypt proc frame
     FRAME_PROLOG 32
+    mov     rcx, qword ptr [g_cfg_in]
+    call    is_tcvc_path
+    test    eax, eax
+    jz      dd_not_tcvc
+    call    do_tcvc_decrypt
+    FRAME_EPILOG
+    ret
+dd_not_tcvc:
     call    peek_archive
     cmp     eax, 1
     je      dd_archive
@@ -1350,6 +1361,14 @@ do_decrypt endp
 public do_verify
 do_verify proc frame
     FRAME_PROLOG 32
+    mov     rcx, qword ptr [g_cfg_in]
+    call    is_tcvc_path
+    test    eax, eax
+    jz      dv_not_tcvc
+    call    do_tcvc_verify
+    FRAME_EPILOG
+    ret
+dv_not_tcvc:
     call    peek_archive
     cmp     eax, 1
     jne     dv_single

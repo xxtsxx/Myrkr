@@ -16,6 +16,7 @@
 include macros.inc
 
 .data?
+public g_crc_table
 g_crc_table db 256*4 dup (?)
 g_crc_ready dd ?
 

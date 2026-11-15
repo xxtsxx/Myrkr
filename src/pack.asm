@@ -112,6 +112,8 @@ extern rlog_extracted:proc
 extern progress_done:proc
 extern compute_kcv:proc
 extern disk_has_space:proc
+extern is_tcvc_path:proc
+extern do_tcvc_list_idx:proc
 externdef g_cfg_compress:dword
 externdef g_cfg_compress_set:dword
 
@@ -4003,6 +4005,7 @@ commit_temp endp
 ; DOS device names; everything it refuses would otherwise be created somewhere
 ; the user did not ask for and cannot see.
 ; =============================================================================
+public entry_path
 entry_path proc frame
     FRAME_PROLOG 64
     mov     qword ptr [rbp-24], rcx
@@ -4117,6 +4120,7 @@ bare_part_path endp
 ;
 ; locals: [rbp-16] cursor [rbp-24] entries left [rbp-32] total [rbp-40] next
 ; =============================================================================
+public idx_extract_bytes
 idx_extract_bytes proc frame
     FRAME_PROLOG 64
     mov     qword ptr [rbp-16], 0
@@ -6406,9 +6410,19 @@ do_list proc frame
     FRAME_PROLOG 64
     mov     qword ptr [g_lstfill], 0
     ; [rbp-24]=cursor into g_idxbuf [rbp-32]=entries left
+    mov     rcx, qword ptr [g_cfg_in]
+    call    is_tcvc_path
+    test    eax, eax
+    jz      dl_mrk
+    call    do_tcvc_list_idx
+    test    eax, eax
+    jnz     dl_ret
+    jmp     dl_show
+dl_mrk:
     call    idx_read
     test    eax, eax
     jnz     dl_ret
+dl_show:
     prn_a   msg_lst_hdr
     cmp     qword ptr [g_idxcount], 0
     jne     dl_walk

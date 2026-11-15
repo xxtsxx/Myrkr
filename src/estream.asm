@@ -92,6 +92,7 @@ extern tagged_alloc:proc
 extern tagged_free:proc
 extern mem_free:proc
 extern zip_entry_to_mem:proc
+extern tcvc_entry_to_mem:proc
 ifdef TEST_IO
 extern zip_to_index:proc
 endif
@@ -1518,6 +1519,54 @@ zcr_no:
 zs_create endp
 
 ; -----------------------------------------------------------------------------
+; ts_create(rcx = itemPtr, rdx = unused) -> rax = IStream* or 0
+; Wraps a TrueCrypt/VeraCrypt file entry (extracted via tcvc_entry_to_mem) in
+; the same in-memory ZipStream vtable used by zs_create.
+; locals: [rbp-16] entry [rbp-32] this [rbp-48] out.ptr [rbp-40] out.len
+; -----------------------------------------------------------------------------
+public ts_create
+ts_create proc frame
+    FRAME_PROLOG 80
+    mov     qword ptr [rbp-16], rcx
+    mov     qword ptr [rbp-48], 0
+    mov     qword ptr [rbp-40], 0
+    test    dword ptr [rcx+IDXE_flags], IDXEF_DIR
+    jnz     tcr_alloc
+    lea     rdx, [rbp-48]
+    call    tcvc_entry_to_mem
+    test    eax, eax
+    jnz     tcr_no
+tcr_alloc:
+    mov     rcx, ZS_BYTES
+    call    tagged_alloc
+    test    rax, rax
+    jz      tcr_freebuf
+    mov     qword ptr [rbp-32], rax
+    mov     r10, rax
+    lea     rax, [vtbl_ZipStream]
+    mov     qword ptr [r10+ZS_vtbl], rax
+    mov     dword ptr [r10+ZS_refs], 1
+    mov     rax, qword ptr [rbp-48]
+    mov     qword ptr [r10+ZS_buf], rax
+    mov     rax, qword ptr [rbp-40]
+    mov     qword ptr [r10+ZS_len], rax
+    mov     qword ptr [r10+ZS_pos], 0
+    mov     rax, qword ptr [rbp-32]
+    FRAME_EPILOG
+    ret
+tcr_freebuf:
+    mov     rcx, qword ptr [rbp-48]
+    test    rcx, rcx
+    jz      tcr_no
+    mov     rdx, qword ptr [rbp-40]
+    call    mem_free
+tcr_no:
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+ts_create endp
+
+; -----------------------------------------------------------------------------
 ; ZS_QueryInterface(rcx = this, rdx = riid, r8 = ppv)
 ; locals: [rbp-16] this [rbp-24] riid [rbp-32] ppv
 ; -----------------------------------------------------------------------------
@@ -2526,16 +2575,23 @@ dgd_contents:
     call    do_item
     mov     r10, qword ptr [rbp-16]
     cmp     dword ptr [r10+DO_kind], 0
-    jne     dgd_zip
+    jne     dgd_not_mrk
     mov     rcx, rax
     lea     rdx, [r10+DO_path]
     lea     r8, [r10+DO_key]
     call    es_create
     jmp     dgd_stream
-dgd_zip:
+dgd_not_mrk:
+    cmp     dword ptr [r10+DO_kind], 1
+    jne     dgd_tcvc
     mov     rcx, rax
     lea     rdx, [r10+DO_path]
     call    zs_create
+    jmp     dgd_stream
+dgd_tcvc:
+    mov     rcx, rax
+    xor     edx, edx
+    call    ts_create
 dgd_stream:
     test    rax, rax
     jz      dgd_fail

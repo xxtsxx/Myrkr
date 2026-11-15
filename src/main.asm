@@ -49,7 +49,10 @@ ifdef TEST_IO
 extern pfx_stage:proc
 extern do_estream:proc
 extern do_dataobj:proc
+extern is_tcvc_path:proc
 endif
+externdef g_kf_paths:qword
+externdef g_kf_count:dword
 extern do_zip_add:proc
 extern do_delete:proc
 extern do_hash:proc
@@ -215,6 +218,7 @@ ifdef TEST_IO
 ; password from the command line at all - that surface is what would let an
 ; authorized-but-abused Myrkr be scripted across an estate.
 WSTR w_opt_p,    <-p>
+WSTR w_opt_keyfile, <--keyfile>
 ; "--stage <n>:<folder>" is likewise test-only.  The staged layout is a GUI
 ; gesture - you drop a file onto a folder row - and there is no reason for a
 ; release binary to carry a way to script it.  It exists so that the NAMING
@@ -776,6 +780,8 @@ collect_options proc frame
     mov     qword ptr [rbp-48], 0
     mov     qword ptr [g_cfg_in], 0
     mov     qword ptr [g_cfg_out], 0
+    mov     dword ptr [g_cfg_passlen], 0
+    mov     dword ptr [g_kf_count], 0
 
 co_loop:
     mov     rax, qword ptr [rbp-32]
@@ -792,6 +798,14 @@ ifdef TEST_IO
     call    wstr_eq
     test    eax, eax
     jnz     co_take_p
+    ; ---- "--keyfile <path>" (test builds only, repeatable) ------------------
+    mov     rax, qword ptr [rbp-32]
+    lea     r11, [g_argv]
+    mov     rcx, qword ptr [r11+rax*8]
+    lea     rdx, [w_opt_keyfile]
+    call    wstr_eq
+    test    eax, eax
+    jnz     co_take_keyfile
     ; ---- "--stage <n>:<folder>" (test builds only) --------------------------
     mov     rax, qword ptr [rbp-32]
     lea     r11, [g_argv]
@@ -928,6 +942,18 @@ co_take_p:
     test    rax, rax
     jz      co_usage
     mov     qword ptr [rbp-48], rax
+    jmp     co_loop
+co_take_keyfile:
+    call    co_next_arg
+    test    rax, rax
+    jz      co_usage
+    mov     ecx, dword ptr [g_kf_count]
+    cmp     ecx, MAX_KEYFILES
+    jae     co_usage
+    lea     rdx, [g_kf_paths]
+    mov     qword ptr [rdx+rcx*8], rax
+    inc     ecx
+    mov     dword ptr [g_kf_count], ecx
     jmp     co_loop
 ; "--stage <n>:<folder>" - place positional n inside <folder> in the archive.
 ; The value is UTF-16 and pfx_stage takes UTF-8, so it is converted here; the
@@ -1098,19 +1124,51 @@ co_setin:
     mov     rcx, qword ptr [r11+0]
     mov     qword ptr [g_cfg_in], rcx
 co_pwcheck:
+ifdef TEST_IO
+    ; ---- --keyfile is valid only on TrueCrypt/VeraCrypt containers -----------
+    cmp     dword ptr [g_kf_count], 0
+    je      co_kf_checked
+    mov     rcx, qword ptr [g_cfg_in]
+    test    rcx, rcx
+    jz      co_usage
+    call    is_tcvc_path
+    test    eax, eax
+    jz      co_usage
+co_kf_checked:
+endif
     ; ---- password: convert any provided -p; error only if it's mandatory -----
     mov     rcx, qword ptr [rbp-48]     ; -p value (0 if none was given)
     test    rcx, rcx
     jnz     co_haspw
+ifdef TEST_IO
+    ; Keyfile-only TC/VC containers may omit -p completely
+    cmp     dword ptr [g_kf_count], 0
+    jne     co_empty_kf_pw
+endif
     ; none supplied: fail only when this command requires a password
+    mov     r10, qword ptr [rbp-24]
     mov     eax, dword ptr [r10].CMDENT.needs_pass
     test    eax, eax
     jnz     co_usage
     jmp     co_ok
 co_haspw:
+ifdef TEST_IO
+    ; Allow -p "" when --keyfile is supplied
+    cmp     word ptr [rcx], 0
+    jne     co_conv_pw
+    cmp     dword ptr [g_kf_count], 0
+    jne     co_empty_kf_pw
+co_conv_pw:
+endif
     call    password_to_utf8            ; eax = 1 ok
     test    eax, eax
     jz      co_badpass
+    jmp     co_ok
+ifdef TEST_IO
+co_empty_kf_pw:
+    mov     dword ptr [g_cfg_passlen], 0
+    mov     byte ptr [g_cfg_pass], 0
+endif
 co_ok:
     mov     eax, EXIT_OK
     jmp     co_done

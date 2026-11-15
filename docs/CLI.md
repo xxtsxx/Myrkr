@@ -85,10 +85,21 @@ with a non-zero exit.
 ### `selftest`
 
 Runs every cryptographic primitive against its official test vector — FIPS-197
-for AES, RFC 9106 and a single-lane 64 MiB reference vector for Argon2id, plus
-GCM, SHA-256 and a deflate round-trip, and the key rule older containers need — and
-exits 0 only if all pass. This is the check to run after a build, an update, or
-any time you want the binary to prove itself.
+for AES, IEEE P1619 for AES-256-XTS, Serpent-256, Twofish-256, Camellia-256,
+Kuznyechik, SHA-256, SHA-512, BLAKE2s-256, RIPEMD-160, Whirlpool, Streebog-512,
+TC/VC CRC-32 keyfile mixing, RFC 9106 and a single-lane 64 MiB reference vector
+for Argon2id, plus GCM, a deflate round-trip, and the key rule older containers
+need — and exits 0 only if all pass. This is the check to run after a build, an
+update, or any time you want the binary to prove itself.
+
+### TrueCrypt (`.tc`) and VeraCrypt (`.hc`) volumes
+
+`myrkr list CONTAINER.hc` prompts interactively for the password in shipping
+builds (or accepts `-p PASS` and repeatable `--keyfile PATH` in `build.cmd
+testio` builds alongside `decrypt` and `verify`) when the input carries a `.tc`
+or `.hc` extension and does not begin with a `MYRK`/`MVOL` header. Disguised
+containers without `.tc`/`.hc` extensions are opened via the GUI command bar's
+**Open TrueCrypt/VeraCrypt container** glyph button.
 
 ### `bench`
 

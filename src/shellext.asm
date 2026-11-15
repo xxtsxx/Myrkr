@@ -186,6 +186,8 @@ WSTR sx_menu_decrypt,  <Decrypt/extract>
 WSTR sx_exe,        <myrkr.exe>
 WSTR sx_ext_mrk,    <.mrk>
 WSTR sx_ext_zip,    <.zip>
+WSTR sx_ext_tc,     <.tc>
+WSTR sx_ext_hc,     <.hc>
 ; Raw dw rather than WSTR: WSTR cannot carry a quote through its `forc`, and a
 ; trailing space inside <> is not reliably preserved.  `even` keeps each label
 ; 2-aligned - an odd-address wide string handed to a -W API can take an aligned
@@ -429,11 +431,23 @@ he_len:
     xor     eax, eax
     jmp     he_ret
 he_have:
-    cmp     r9, 4
-    jb      he_no
-    mov     rcx, qword ptr [rbp-8]
-    lea     rcx, [rcx+r9*2-8]               ; last four characters
+    xor     r8, r8
     mov     rdx, qword ptr [rbp-16]
+he_extlen:
+    cmp     word ptr [rdx+r8*2], 0
+    je      he_extdone
+    inc     r8
+    cmp     r8, 16
+    jb      he_extlen
+    jmp     he_no
+he_extdone:
+    test    r8, r8
+    jz      he_no
+    cmp     r9, r8
+    jb      he_no
+    sub     r9, r8
+    mov     rcx, qword ptr [rbp-8]
+    lea     rcx, [rcx+r9*2]                 ; trailing suffix of matching length
     WINCALL lstrcmpiW, rcx, rdx
     test    eax, eax
     jnz     he_no
@@ -630,6 +644,7 @@ sei_nodest:
     mov     qword ptr [rbp-48], 0            ; i
     mov     qword ptr [rbp-72], 1            ; every item so far is a .mrk
     mov     qword ptr [rbp-152], 1           ; every item so far is a .zip
+    mov     qword ptr [rbp-160], 1           ; every item so far is a .tc or .hc
 sei_loop:
     mov     eax, dword ptr [rbp-40]
     cmp     qword ptr [rbp-48], rax
@@ -662,11 +677,21 @@ sei_loop:
     mov     qword ptr [rbp-72], 0
 sei_ckzip:
     cmp     qword ptr [rbp-152], 0
-    je      sei_adv
+    je      sei_cktcvc
     WINCALL has_ext, qword ptr [rbp-56], addr sx_ext_zip
     test    eax, eax
-    jnz     sei_adv
+    jnz     sei_cktcvc
     mov     qword ptr [rbp-152], 0
+sei_cktcvc:
+    cmp     qword ptr [rbp-160], 0
+    je      sei_adv
+    WINCALL has_ext, qword ptr [rbp-56], addr sx_ext_tc
+    test    eax, eax
+    jnz     sei_adv
+    WINCALL has_ext, qword ptr [rbp-56], addr sx_ext_hc
+    test    eax, eax
+    jnz     sei_adv
+    mov     qword ptr [rbp-160], 0
 sei_adv:
     mov     rax, qword ptr [rbp-80]
     inc     rax                              ; step over the terminator too
@@ -689,7 +714,12 @@ sei_done:
     jmp     sei_kset
 sei_kmrk:
     cmp     qword ptr [rbp-72], 0
+    jne     sei_kdec
+    cmp     qword ptr [rbp-160], 0
     je      sei_kset
+    cmp     dword ptr [rbp-40], 1            ; single .tc/.hc -> decrypt/extract
+    jne     sei_kset
+sei_kdec:
     mov     r10, KIND_DECRYPT
 sei_kset:
     mov     qword ptr [rax+OBJ_KIND], r10

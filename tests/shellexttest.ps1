@@ -46,7 +46,43 @@ $child = @'
 $dll = $args[0]
 Add-Type -TypeDefinition @"
 using System;
+using System.Text;
 using System.Runtime.InteropServices;
+using System.Runtime.InteropServices.ComTypes;
+public class HdropData : IDataObject {
+  readonly string[] _paths;
+  public HdropData(string[] paths) { _paths = paths; }
+  [DllImport("kernel32.dll", SetLastError=true)] static extern IntPtr GlobalAlloc(uint flags, UIntPtr bytes);
+  [DllImport("kernel32.dll", SetLastError=true)] static extern IntPtr GlobalLock(IntPtr h);
+  [DllImport("kernel32.dll")] static extern bool GlobalUnlock(IntPtr h);
+  public void GetData(ref FORMATETC format, out STGMEDIUM medium) {
+    medium = new STGMEDIUM();
+    if (format.cfFormat != 15) Marshal.ThrowExceptionForHR(unchecked((int)0x80040064)); // DV_E_FORMATETC
+    var sb = new StringBuilder();
+    foreach (var p in _paths) { sb.Append(p); sb.Append('\0'); }
+    sb.Append('\0');
+    byte[] strBytes = Encoding.Unicode.GetBytes(sb.ToString());
+    int total = 20 + strBytes.Length; // sizeof(DROPFILES) == 20
+    IntPtr hMem = GlobalAlloc(0x0042, (UIntPtr)total); // GHND
+    IntPtr ptr = GlobalLock(hMem);
+    try {
+      Marshal.WriteInt32(ptr, 0, 20); // pFiles = 20
+      Marshal.WriteInt32(ptr, 16, 1); // fWide = TRUE
+      Marshal.Copy(strBytes, 0, IntPtr.Add(ptr, 20), strBytes.Length);
+    } finally { GlobalUnlock(hMem); }
+    medium.tymed = TYMED.TYMED_HGLOBAL;
+    medium.unionmember = hMem;
+    medium.pUnkForRelease = null;
+  }
+  public void GetDataHere(ref FORMATETC f, ref STGMEDIUM m) { throw new NotImplementedException(); }
+  public int QueryGetData(ref FORMATETC f) { return f.cfFormat == 15 ? 0 : 1; }
+  public int GetCanonicalFormatEtc(ref FORMATETC fIn, out FORMATETC fOut) { fOut = fIn; return 0; }
+  public void SetData(ref FORMATETC f, ref STGMEDIUM m, bool rel) { throw new NotImplementedException(); }
+  public IEnumFORMATETC EnumFormatEtc(DATADIR d) { throw new NotImplementedException(); }
+  public int DAdvise(ref FORMATETC f, ADVF a, IAdviseSink s, out int c) { c = 0; return unchecked((int)0x80040003); }
+  public void DUnadvise(int c) { }
+  public int EnumDAdvise(out IEnumSTATDATA e) { e = null; return unchecked((int)0x80040003); }
+}
 public static class SX {
   [DllImport("kernel32", CharSet=CharSet.Unicode, SetLastError=true)]
   public static extern IntPtr LoadLibraryW(string f);
@@ -55,6 +91,11 @@ public static class SX {
   [DllImport("user32")] public static extern IntPtr CreatePopupMenu();
   [DllImport("user32")] public static extern bool DestroyMenu(IntPtr h);
   [DllImport("user32")] public static extern int GetMenuItemCount(IntPtr h);
+  [DllImport("user32", CharSet=CharSet.Unicode)]
+  public static extern int GetMenuStringW(IntPtr h, uint item, StringBuilder s, int maxCount, uint flags);
+  [DllImport("shell32", CharSet=CharSet.Unicode)]
+  public static extern IntPtr ILCreateFromPathW(string path);
+  [DllImport("shell32")] public static extern void ILFree(IntPtr pidl);
   [DllImport("ole32")] public static extern int CoInitialize(IntPtr p);
 
   // DllGetClassObject(REFCLSID, REFIID, void**)
@@ -64,6 +105,12 @@ public static class SX {
   // IClassFactory::CreateInstance is vtable slot 3 (QI/AddRef/Release first)
   [UnmanagedFunctionPointer(CallingConvention.StdCall)]
   public delegate int CreateInstanceFn(IntPtr self, IntPtr outer, ref Guid iid, out IntPtr ppv);
+  // IUnknown::QueryInterface is vtable slot 0
+  [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+  public delegate int QueryInterfaceFn(IntPtr self, ref Guid iid, out IntPtr ppv);
+  // IShellExtInit::Initialize is vtable slot 3
+  [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+  public delegate int InitializeFn(IntPtr self, IntPtr pidlFolder, IntPtr pdtobj, IntPtr hkeyProgID);
   // IContextMenu::QueryContextMenu is vtable slot 3
   [UnmanagedFunctionPointer(CallingConvention.StdCall)]
   public delegate int QueryContextMenuFn(IntPtr self, IntPtr hmenu, uint indexMenu,
@@ -74,6 +121,42 @@ public static class SX {
   public static IntPtr Slot(IntPtr obj, int i) {
     IntPtr vtbl = Marshal.ReadIntPtr(obj);
     return Marshal.ReadIntPtr(vtbl, i * IntPtr.Size);
+  }
+  public static string DragLabel(IntPtr cf, string destFolder, string[] paths) {
+    Guid iidInit = new Guid("000214E8-0000-0000-C000-000000000046");
+    Guid iidCtx  = new Guid("000214E4-0000-0000-C000-000000000046");
+    var ci = Marshal.GetDelegateForFunctionPointer<CreateInstanceFn>(Slot(cf, 3));
+    IntPtr sei;
+    int hr = ci(cf, IntPtr.Zero, ref iidInit, out sei);
+    if (hr != 0 || sei == IntPtr.Zero) return "ERR_CI";
+    IntPtr pidl = ILCreateFromPathW(destFolder);
+    var dobj = new HdropData(paths);
+    IntPtr pDobj = Marshal.GetComInterfaceForObject(dobj, typeof(IDataObject));
+    try {
+      var init = Marshal.GetDelegateForFunctionPointer<InitializeFn>(Slot(sei, 3));
+      hr = init(sei, pidl, pDobj, IntPtr.Zero);
+      if (hr != 0) return "ERR_INIT";
+      var qi = Marshal.GetDelegateForFunctionPointer<QueryInterfaceFn>(Slot(sei, 0));
+      IntPtr cm;
+      hr = qi(sei, ref iidCtx, out cm);
+      if (hr != 0 || cm == IntPtr.Zero) return "ERR_QI";
+      IntPtr menu = CreatePopupMenu();
+      try {
+        var qcm = Marshal.GetDelegateForFunctionPointer<QueryContextMenuFn>(Slot(cm, 3));
+        hr = qcm(cm, menu, 0, 1, 0x7FFF, 0);
+        if (hr < 0) return "ERR_QCM";
+        var sb = new StringBuilder(128);
+        GetMenuStringW(menu, 0, sb, sb.Capacity, 0x0400); // MF_BYPOSITION
+        return sb.ToString();
+      } finally {
+        DestroyMenu(menu);
+        Marshal.GetDelegateForFunctionPointer<ReleaseFn>(Slot(cm, 2))(cm);
+      }
+    } finally {
+      if (pDobj != IntPtr.Zero) Marshal.Release(pDobj);
+      if (pidl != IntPtr.Zero) ILFree(pidl);
+      Marshal.GetDelegateForFunctionPointer<ReleaseFn>(Slot(sei, 2))(sei);
+    }
   }
 }
 "@
@@ -109,9 +192,16 @@ $n = [SX]::GetMenuItemCount($menu)
 [void][SX]::DestroyMenu($menu)
 $rel = [Runtime.InteropServices.Marshal]::GetDelegateForFunctionPointer([SX]::Slot($cm,2), [SX+ReleaseFn])
 [void]$rel.Invoke($cm)
+
+$dest = [IO.Path]::GetTempPath().TrimEnd('\')
+$lblTc  = [SX]::DragLabel($cf, $dest, @("C:\vol\archive.tc"))
+$lblHc  = [SX]::DragLabel($cf, $dest, @("C:\vol\archive.HC"))
+$lblTwo = [SX]::DragLabel($cf, $dest, @("C:\vol\a.tc", "C:\vol\b.hc"))
+$lblTxt = [SX]::DragLabel($cf, $dest, @("C:\vol\notes.txt"))
+
 $relf = [Runtime.InteropServices.Marshal]::GetDelegateForFunctionPointer([SX]::Slot($cf,2), [SX+ReleaseFn])
 [void]$relf.Invoke($cf)
-"OK {0} {1} {2}" -f $hr1, $hr2, $n
+"OK|{0}|{1}|{2}|{3}|{4}|{5}|{6}" -f $hr1, $hr2, $n, $lblTc, $lblHc, $lblTwo, $lblTxt
 exit 0
 '@
 
@@ -121,17 +211,22 @@ Set-Content -Path $tmp -Value $child -Encoding UTF8
 $out = & powershell -NoProfile -ExecutionPolicy Bypass -File $tmp $dll 2>&1
 $code = $LASTEXITCODE
 Remove-Item $tmp -Force -ErrorAction SilentlyContinue
-$line = ($out | Where-Object { $_ -match '^(OK|ERR)' } | Select-Object -Last 1)
+$line = ($out | Where-Object { $_ -match '^(OK\||ERR)' } | Select-Object -Last 1)
 
 # The whole point: a smashed return address kills the child.  Survival IS a check.
 Check "the child process survived the call" ($code -eq 0) "exit=$code $(if ($code -ne 0) { $out -join ' / ' })"
 
-if ($line -match '^OK\s+(-?\d+)\s+(-?\d+)\s+(-?\d+)$') {
+if ($line -match '^OK\|(-?\d+)\|(-?\d+)\|(-?\d+)\|([^|]*)\|([^|]*)\|([^|]*)\|([^|]*)$') {
     $hr1 = [int]$Matches[1]; $hr2 = [int]$Matches[2]; $items = [int]$Matches[3]
+    $lblTc = $Matches[4]; $lblHc = $Matches[5]; $lblTwo = $Matches[6]; $lblTxt = $Matches[7]
     # S_OK with zero ids used: HRESULT_FROM_WIN32-style MAKE_HRESULT(0,0,0) = 0
     Check "declines cleanly with no Initialize (1st call)" ($hr1 -eq 0) "hr=0x$('{0:X8}' -f $hr1)"
     Check "and again on the second call" ($hr2 -eq 0) "hr=0x$('{0:X8}' -f $hr2)"
     Check "added no menu item it was not entitled to" ($items -eq 0) "$items item(s)"
+    Check "single .tc right-drag offers Decrypt/extract" ($lblTc -eq "Decrypt/extract") "got '$lblTc'"
+    Check "single .hc right-drag offers Decrypt/extract" ($lblHc -eq "Decrypt/extract") "got '$lblHc'"
+    Check "multi .tc/.hc right-drag falls through to Encrypt" ($lblTwo -eq "Encrypt") "got '$lblTwo'"
+    Check "plain file right-drag offers Encrypt" ($lblTxt -eq "Encrypt") "got '$lblTxt'"
 } elseif ($code -eq 0) {
     Check "the child reported a result" $false "got: $($out -join ' / ')"
 }

@@ -216,7 +216,7 @@ if errorlevel 1 (
 :nochk
 
 set ASMFLAGS=/c /nologo /W3 /Zi %ASMEXTRA%
-set SOURCES=main console hardening random loadcfg sha256 aesgcm blake2b argon2 fileio volume secmem secdesk cmd archive pack compress progress crc32 sha1 inflate deflate unzip zip selftest redteam log ramlog estream gui
+set SOURCES=main console hardening random loadcfg sha256 sha512 blake2s ripemd160 whirlpool streebog aesgcm aesxts serpent twofish camellia kuznyechik blake2b argon2 fileio volume tcvc fs_fat fs_exfat fs_ntfs fs_ext fs_hfsplus secmem secdesk cmd archive pack compress progress crc32 sha1 inflate deflate unzip zip selftest redteam log ramlog estream gui
 rem shellext.asm is NOT in SOURCES: it is the whole of the second binary
 rem (myrkrshell.dll) and shares no object with the exe.  It is assembled with
 rem the same flags but linked separately, below.
@@ -272,7 +272,7 @@ link /nologo /subsystem:windows /entry:wstart /nodefaultlib /incremental:no ^
      %GUARDFLAGS% %REPROFLAGS% /debug /pdb:bin\myrkr.pdb /map:bin\myrkr.map ^
      /manifest:embed /manifestinput:myrkr.manifest /manifestuac:no ^
      %LINKLIB% ^
-     /out:bin\myrkr.exe obj\main.obj obj\console.obj obj\hardening.obj obj\random.obj obj\loadcfg.obj obj\sha256.obj obj\aesgcm.obj obj\blake2b.obj obj\argon2.obj obj\fileio.obj obj\volume.obj obj\secmem.obj obj\secdesk.obj obj\cmd.obj obj\archive.obj obj\pack.obj obj\compress.obj obj\progress.obj obj\crc32.obj obj\sha1.obj obj\inflate.obj obj\deflate.obj obj\unzip.obj obj\zip.obj obj\selftest.obj obj\redteam.obj obj\log.obj obj\ramlog.obj obj\estream.obj obj\gui.obj obj\myrkr.res ^
+     /out:bin\myrkr.exe obj\main.obj obj\console.obj obj\hardening.obj obj\random.obj obj\loadcfg.obj obj\sha256.obj obj\sha512.obj obj\blake2s.obj obj\ripemd160.obj obj\whirlpool.obj obj\streebog.obj obj\aesgcm.obj obj\aesxts.obj obj\serpent.obj obj\twofish.obj obj\camellia.obj obj\kuznyechik.obj obj\blake2b.obj obj\argon2.obj obj\fileio.obj obj\volume.obj obj\tcvc.obj obj\fs_fat.obj obj\fs_exfat.obj obj\fs_ntfs.obj obj\fs_ext.obj obj\fs_hfsplus.obj obj\secmem.obj obj\secdesk.obj obj\cmd.obj obj\archive.obj obj\pack.obj obj\compress.obj obj\progress.obj obj\crc32.obj obj\sha1.obj obj\inflate.obj obj\deflate.obj obj\unzip.obj obj\zip.obj obj\selftest.obj obj\redteam.obj obj\log.obj obj\ramlog.obj obj\estream.obj obj\gui.obj obj\myrkr.res ^
      kernel32.lib bcrypt.lib cabinet.lib user32.lib comdlg32.lib comctl32.lib shell32.lib ole32.lib gdi32.lib advapi32.lib uxtheme.lib msimg32.lib imm32.lib userenv.lib
 if errorlevel 1 goto :failed
 

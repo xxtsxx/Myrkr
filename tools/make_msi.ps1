@@ -11,7 +11,8 @@
       * a Start Menu shortcut
       * an Add/Remove Programs entry carrying ProductName + ProductVersion
       * HKLM policy values - ONLY those the installing admin asks for by name
-      * the .mrk file association          (MYRKR_NOASSOC=1 to skip)
+      * the .mrk file association          (MYRKR_NOASSOC=1 to skip all file associations)
+      * the .tc / .hc file associations    (MYRKR_NOTCASSOC=1 to skip TC/VC only)
       * Explorer context-menu verbs        (MYRKR_NOCONTEXT=1 to skip)
       * the drag-drop handler's COM registration (MYRKR_NOSHELLEXT=1 to skip)
 
@@ -162,6 +163,12 @@ $AssocComp = "FileAssoc"
 $AssocGuid = "{4A9E1B58-7C20-4D36-B8F1-0E5A3D9C7B24}"
 $AssocProp = "MYRKR_NOASSOC"
 $ProgId    = "Myrkr.Container"
+
+# --- .tc / .hc file associations (read-only TrueCrypt / VeraCrypt browse) ----
+$TcAssocComp = "TcFileAssoc"
+$TcAssocGuid = "{A82D5C19-3E74-4F62-9B18-6D0E4A2C8F53}"
+$TcAssocProp = "MYRKR_NOTCASSOC"
+$TcProgId    = "Myrkr.VolumeContainer"
 
 # --- Explorer context menus ---------------------------------------------------
 # These were four classic "%1" verbs.  They are gone, because %1 is per-FILE:
@@ -443,7 +450,7 @@ try {
         $productCode = $ProductCodeOverride.ToUpper()
         Write-Host ("  ProductCode    : PINNED to {0} (repair build)" -f $productCode)
     }
-    $secureProps = @("OLDERVERSIONBEINGUPGRADED", "NEWERVERSIONDETECTED", $AssocProp, $CtxProp, $ShellProp, $SdProp) +
+    $secureProps = @("OLDERVERSIONBEINGUPGRADED", "NEWERVERSIONDETECTED", $AssocProp, $TcAssocProp, $CtxProp, $ShellProp, $SdProp) +
                    ($Policies | ForEach-Object { $_.Prop }) +
                    ($Defaults | ForEach-Object { $_.Prop })
     $props = @{
@@ -624,6 +631,22 @@ try {
     # the key alive.
     RegRemoveTree "RegAssocClean" "$ClassesKey\$ProgId" $AssocComp
     Write-Host ("  file assoc     : .mrk -> {0} (skip with {1}=1)" -f $ProgId, $AssocProp)
+
+    # --- .tc / .hc associations ----------------------------------------------
+    $tcCond = "NOT $AssocProp AND NOT $TcAssocProp"
+    Exec ("INSERT INTO ``Component`` (``Component``,``ComponentId``,``Directory_``,``Attributes``,``Condition``,``KeyPath``) VALUES ('{0}','{1}','INSTALLDIR',260,'{2}','RegTcAssocExtTc')" -f $TcAssocComp, $TcAssocGuid, $tcCond)
+    Exec ("INSERT INTO ``FeatureComponents`` (``Feature_``,``Component_``) VALUES ('Main','{0}')" -f $TcAssocComp)
+    RegDefault "RegTcAssocExtTc" "$ClassesKey\.tc"                     $TcProgId                              $TcAssocComp
+    RegNamed   "RegTcOpenWithTc" "$ClassesKey\.tc\OpenWithProgids"     $TcProgId ""                           $TcAssocComp
+    RegDefault "RegTcAssocExtHc" "$ClassesKey\.hc"                     $TcProgId                              $TcAssocComp
+    RegNamed   "RegTcOpenWithHc" "$ClassesKey\.hc\OpenWithProgids"     $TcProgId ""                           $TcAssocComp
+    RegDefault "RegTcProgId"     "$ClassesKey\$TcProgId"               "TrueCrypt/VeraCrypt volume container" $TcAssocComp
+    RegDefault "RegTcIcon"       "$ClassesKey\$TcProgId\DefaultIcon"   $icoFile                               $TcAssocComp
+    RegDefault "RegTcCmd"        "$ClassesKey\$TcProgId\shell\open\command" $cmd                              $TcAssocComp
+    # Never delete .tc or .hc keys on uninstall: VeraCrypt or another tool may
+    # coexist on the same extension keys via OpenWithProgids / user choice.
+    RegRemoveTree "RegTcClean" "$ClassesKey\$TcProgId" $TcAssocComp
+    Write-Host ("  tc/vc assoc    : .tc, .hc -> {0} (skip with {1}=1 or {2}=1)" -f $TcProgId, $TcAssocProp, $AssocProp)
 
     # --- context-menu handler ------------------------------------------------
     # Conditioned on BOTH properties: the rows name a CLSID whose in-proc server

@@ -49,6 +49,7 @@ extern rlog_extracted:proc
 extern rlog_finish:proc
 extern rlog_flatten:proc
 extern rlog_wipe:proc
+extern mem_alloc:proc
 extern mem_free:proc
 extern rows_reset:proc
 extern rows_add:proc
@@ -59,6 +60,45 @@ externdef g_cfg_pass:byte
 externdef g_cfg_passlen:dword
 externdef g_cfg_pwminlen:dword
 externdef g_cfg_pwminclasses:dword
+
+extern streebog_init:proc
+extern streebog_update:proc
+extern streebog_final:proc
+extern aes256_xts_set_key:proc
+extern aes256_enc_block:proc
+extern aes256_dec_block:proc
+extern serpent_set_key:proc
+extern serpent_enc_block:proc
+extern serpent_dec_block:proc
+extern twofish_set_key:proc
+extern twofish_enc_block:proc
+extern twofish_dec_block:proc
+extern camellia_set_key:proc
+extern camellia_enc_block:proc
+extern camellia_dec_block:proc
+extern kuznyechik_set_key:proc
+extern kuznyechik_enc_block:proc
+extern kuznyechik_dec_block:proc
+extern xts_mode_key_size:proc
+extern xts_init:proc
+extern xts_encrypt:proc
+extern xts_decrypt:proc
+extern pbkdf2_hmac_ex:proc
+extern tcvc_mix_pool_chunk:proc
+extern tcvc_apply_keyfiles:proc
+extern tcvc_open:proc
+extern tcvc_open_mem:proc
+extern tcvc_read_bytes:proc
+extern tcvc_close:proc
+externdef g_tcvc_sec:byte
+externdef g_tcvc_data_size:qword
+externdef g_tcvc_sec_size:dword
+externdef g_tcvc_is_vera:dword
+externdef g_tcvc_mode_id:dword
+externdef g_tcvc_kdf_id:dword
+externdef g_tcvc_open_flag:dword
+
+TCVC_OFF_POOL   equ 25680
 
 GCMREQ struct
     key     dq ?
@@ -423,6 +463,83 @@ CSTR st_hdr,       "running self-tests:",13,10
 ; NIST SP800-38D AES-256-GCM: key=0(32), iv=0(12), aad=none, pt=16 zero bytes
 gcm_ct_exp  db 0ceh,0a7h,040h,03dh,04dh,060h,06bh,06eh,007h,04eh,0c5h,0d3h,0bah,0f3h,09dh,018h
 gcm_tag_exp db 0d0h,0d1h,0c8h,0a7h,099h,099h,06bh,0f0h,026h,05bh,098h,0b5h,0d4h,08ah,0b9h,019h
+
+; ---- TrueCrypt / VeraCrypt Stage 1 KAT vectors -------------------------------
+CSTR st_pass_tcciph, "  [PASS] tcvc ciphers  (AES-XTS, Serpent, Twofish, Camellia, Kuznyechik)",13,10
+CSTR st_fail_tcciph, "  [FAIL] tcvc ciphers",13,10
+CSTR st_pass_tcxts,  "  [PASS] tcvc xts-15   (all 15 single & cascade XTS modes, VC KATs)",13,10
+CSTR st_fail_tcxts,  "  [FAIL] tcvc xts-15",13,10
+CSTR st_pass_tckdf,  "  [PASS] tcvc kdfs     (6 PBKDF2 hashes + Streebog + VC Argon2id + pool)",13,10
+CSTR st_fail_tckdf,  "  [FAIL] tcvc kdfs",13,10
+CSTR st_pass_tcvol,  "  [PASS] tcvc volume   (TRUE + VERA 6-thread PBKDF2 + Argon2id + backup)",13,10
+CSTR st_fail_tcvol,  "  [FAIL] tcvc volume",13,10
+
+; Serpent-256 (VeraCrypt EncryptionTest.cpp): key = aeskat_key (00..1f), pt = 00..0f
+serp_pt     db 000h,001h,002h,003h,004h,005h,006h,007h,008h,009h,00ah,00bh,00ch,00dh,00eh,00fh
+serp_ct     db 0deh,026h,09fh,0f8h,033h,0e4h,032h,0b8h,05bh,02eh,088h,0d2h,070h,01ch,0e7h,05ch
+
+; Twofish-256 (Counterpane / EncryptionTest.cpp)
+tf_key      db 0D4h,03Bh,0B7h,055h,06Eh,0A3h,02Eh,046h,0F2h,0A2h,082h,0B7h,0D4h,05Bh,04Eh,00Dh
+            db 057h,0FFh,073h,09Dh,04Dh,0C9h,02Ch,01Bh,0D7h,0FCh,001h,070h,00Ch,0C8h,021h,06Fh
+tf_pt       db 090h,0AFh,0E9h,01Bh,0B2h,088h,054h,04Fh,02Ch,032h,0DCh,023h,09Bh,026h,035h,0E6h
+tf_ct       db 06Ch,0B4h,056h,01Ch,040h,0BFh,00Ah,097h,005h,093h,01Ch,0B6h,0D4h,008h,0E7h,0FAh
+
+; Camellia-256 (RFC 3713 Appendix A)
+cam_key     db 001h,023h,045h,067h,089h,0ABh,0CDh,0EFh,0FEh,0DCh,0BAh,098h,076h,054h,032h,010h
+            db 000h,011h,022h,033h,044h,055h,066h,077h,088h,099h,0AAh,0BBh,0CCh,0DDh,0EEh,0FFh
+cam_pt      db 001h,023h,045h,067h,089h,0ABh,0CDh,0EFh,0FEh,0DCh,0BAh,098h,076h,054h,032h,010h
+cam_ct      db 09Ah,0CCh,023h,07Dh,0FFh,016h,0D7h,06Ch,020h,0EFh,07Ch,091h,09Eh,03Ah,075h,009h
+
+; Kuznyechik (GOST R 34.12-2015 / RFC 7801)
+kuz_key     db 088h,099h,0AAh,0BBh,0CCh,0DDh,0EEh,0FFh,000h,011h,022h,033h,044h,055h,066h,077h
+            db 0FEh,0DCh,0BAh,098h,076h,054h,032h,010h,001h,023h,045h,067h,089h,0ABh,0CDh,0EFh
+kuz_pt      db 011h,022h,033h,044h,055h,066h,077h,000h,0FFh,0EEh,0DDh,0CCh,0BBh,0AAh,099h,088h
+kuz_ct      db 07Fh,067h,09Dh,090h,0BEh,0BCh,024h,030h,05Ah,046h,08Dh,042h,0B9h,0D4h,0EDh,0CDh
+
+; EncryptionTest::TestXts 96-byte primary testKey & 96-byte secondary modeKey
+xts_pri_key db 027h,018h,028h,018h,028h,045h,090h,045h,023h,053h,060h,028h,074h,071h,035h,026h
+            db 062h,049h,077h,057h,024h,070h,093h,069h,099h,059h,057h,049h,066h,096h,076h,027h
+            db 031h,041h,059h,026h,053h,058h,097h,093h,023h,084h,062h,064h,033h,083h,027h,095h
+            db 002h,088h,041h,097h,016h,093h,099h,037h,051h,005h,082h,009h,074h,094h,045h,092h
+            db 000h,000h,000h,0ffh,0ffh,0ffh,0ffh,0ffh,000h,000h,000h,000h,000h,001h,002h,003h
+            db 004h,005h,006h,007h,008h,009h,00ah,00bh,00ch,00dh,00eh,00fh,010h,011h,012h,013h
+xts_sec_key db 031h,041h,059h,026h,053h,058h,097h,093h,023h,084h,062h,064h,033h,083h,027h,095h
+            db 002h,088h,041h,097h,016h,093h,099h,037h,051h,005h,082h,009h,074h,094h,045h,092h
+            db 020h,021h,022h,023h,024h,025h,026h,027h,028h,029h,02ah,02bh,02ch,02dh,02eh,02fh
+            db 030h,031h,032h,033h,034h,035h,036h,037h,038h,039h,03ah,03bh,03ch,03dh,03eh,03fh
+            db 040h,041h,042h,043h,044h,045h,046h,047h,048h,049h,04ah,04bh,04ch,04dh,04eh,04fh
+            db 050h,051h,052h,053h,054h,055h,056h,057h,058h,059h,05ah,05bh,05ch,05dh,05eh,05fh
+
+align 4
+xts_exp_crc dd 033b91fabh, 03494d480h, 0c4d65b46h, 08176b223h, 0d6d39cdbh
+            dd 014ce7385h, 00ec81bf7h, 042f919adh, 0208d5c58h, 0be78cec1h
+            dd 0e69d680dh, 0e0aef0d1h, 058aad727h, 04641234ah, 0755dad72h
+
+; PBKDF2 KATs ("password", salt={12,34,56,78}, iters=5, outLen=192): head[0..3] + tail[188..191]
+tc_pbk_salt db 012h, 034h, 056h, 078h
+tc_pbk_exp  db 013h,064h,0aeh,0f8h, 071h,0fch,055h,01ah   ; 0: SHA-512
+            db 0f2h,0a0h,04fh,0b2h, 0dah,08eh,0ceh,085h   ; 1: SHA-256
+            db 08dh,051h,0fah,031h, 036h,0b5h,0ffh,024h   ; 2: BLAKE2s-256
+            db 050h,07ch,036h,06fh, 082h,074h,0e3h,090h   ; 3: Whirlpool
+            db 0d0h,053h,0a2h,030h, 07fh,007h,0a2h,0eah   ; 4: Streebog-512
+            db 07ah,03dh,07ch,003h, 000h,08ah,086h,0b2h   ; 5: RIPEMD-160
+
+; Streebog-512 VeraCrypt add512 carry-drop vector (128B input -> first 8 & last 4 bytes)
+sbg_exp_hd  db 0f0h,07fh,06fh,0aeh,081h,090h,0e4h,09dh
+sbg_exp_tl  db 0afh,08ah,008h,009h
+
+; VeraCrypt Argon2id PIM=1 vector ("password", "somesalt", t=3, m=65536 KiB, p=1, outlen=192)
+vc_a2_exp   db 048h,08dh,071h,0bdh,071h,06eh,068h,045h,0aah,0e6h,0e2h,029h,074h,018h,02ch,020h
+            db 0e9h,042h,08dh,07bh,03dh,04bh,0cfh,054h,004h,06ch,03eh,0beh,080h,033h,08fh,020h
+
+; Keyfile pool mixing KAT ("MyrkrKeyfileTest0123456789ABCDEF" -> 64B pool)
+tc_kf_msg   db "MyrkrKeyfileTest0123456789ABCDEF"
+TC_KF_MSG_N equ $ - tc_kf_msg
+tc_kf_hd    db 0cdh,078h,058h,087h,036h,0ebh,055h,0bbh,037h,075h,093h,001h,0c4h,082h,08ah,08bh
+tc_kf_tl    db 096h,0a7h,07bh,0d9h,028h,04fh,0d7h,02fh,0e6h,087h,0c9h,05fh,059h,0e3h,0e3h,08ah
+
+tc_bad_pw   db "wrong-pass"
+WSTR tc_empty_w, ""
 
 .data?
 st_out          db 32 dup (?)
@@ -1774,11 +1891,832 @@ st_sdesk_fail:
     inc     qword ptr [rbp-24]
 st_after_sdesk:
 
+    ; ---- TrueCrypt / VeraCrypt Stage 1 crypto & volume KATs -----------------
+    call    st_tcvc
+    add     qword ptr [rbp-24], rax
+
     mov     r12, qword ptr [rbp-56]
     mov     r13, qword ptr [rbp-64]
     mov     rax, qword ptr [rbp-24]
     FRAME_EPILOG
     ret
 run_selftest endp
+
+; =============================================================================
+; st_tcvc_seal_hdr(rcx=dst512, rdx=xtsCtx, r8=dk192, r9d=modeId,
+;                  [rbp+48]=isVera, [rbp+56]=secSize)
+; Builds and XTS-encrypts a v5 TC/VC 448-byte header at dst512+64 (4096B vol).
+; =============================================================================
+st_tcvc_seal_hdr proc frame
+    FRAME_PROLOG 96
+    mov     qword ptr [rbp-16], r12
+    mov     qword ptr [rbp-24], r13
+    mov     qword ptr [rbp-32], r14
+    mov     qword ptr [rbp-40], rbx
+    mov     qword ptr [rbp-48], rsi
+    mov     qword ptr [rbp-56], rdi
+
+    lea     rsi, [rcx + 64]                 ; hdr448
+    mov     r12, rdx                        ; xtsCtx
+    mov     r13, r8                         ; dk192
+    mov     r14d, r9d                       ; modeId
+
+    ; Zero hdr448
+    mov     rdi, rsi
+    xor     eax, eax
+    mov     ecx, 448 / 8
+    rep     stosq
+
+    ; Magic: "VERA" or "TRUE"
+    mov     eax, 045555254h                 ; "TRUE"
+    cmp     dword ptr [rbp+48], 0
+    je      stsh_magic
+    mov     eax, 041524556h                 ; "VERA"
+stsh_magic:
+    mov     dword ptr [rsi + 0], eax
+    mov     word ptr  [rsi + 4], 00500h     ; BE16 HeaderVersion = 5
+    mov     word ptr  [rsi + 6], 00B01h     ; BE16 min ver 0x010B
+
+    mov     rax, 4096
+    bswap   rax
+    mov     qword ptr [rsi + 36], rax       ; VolumeDataSize = 4096
+    mov     qword ptr [rsi + 52], rax       ; EncryptedAreaLength = 4096
+    mov     rax, 131072
+    bswap   rax
+    mov     qword ptr [rsi + 44], rax       ; EncryptedAreaStart = 131072
+
+    mov     eax, dword ptr [rbp+56]         ; secSize
+    bswap   eax
+    mov     dword ptr [rsi + 64], eax
+
+    ; Deterministic 256-byte master key area at hdr[192..447]
+    xor     ecx, ecx
+stsh_mk_lp:
+    imul    eax, ecx, 7
+    add     eax, 05Ah
+    mov     byte ptr [rsi + 192 + rcx], al
+    inc     ecx
+    cmp     ecx, 256
+    jb      stsh_mk_lp
+
+    ; VolumeKeyAreaCrc32 at +8 (BE32 over hdr[192..447])
+    xor     ecx, ecx
+    lea     rdx, [rsi + 192]
+    mov     r8d, 256
+    call    crc32_update
+    bswap   eax
+    mov     dword ptr [rsi + 8], eax
+
+    ; HeaderCrc32 at +188 (BE32 over hdr[0..187])
+    xor     ecx, ecx
+    mov     rdx, rsi
+    mov     r8d, 188
+    call    crc32_update
+    bswap   eax
+    mov     dword ptr [rsi + 188], eax
+
+    ; Encrypt hdr448 with header key dk192 at XTS startUnit 0
+    mov     ecx, r14d
+    call    xts_mode_key_size
+    mov     ebx, eax
+
+    mov     ecx, r14d
+    mov     rdx, r13
+    lea     r8,  [r13 + rbx]
+    mov     r9,  r12
+    call    xts_init
+
+    mov     rcx, r12
+    mov     rdx, rsi
+    mov     r8d, 448
+    xor     r9d, r9d
+    call    xts_encrypt
+
+    mov     r12, qword ptr [rbp-16]
+    mov     r13, qword ptr [rbp-24]
+    mov     r14, qword ptr [rbp-32]
+    mov     rbx, qword ptr [rbp-40]
+    mov     rsi, qword ptr [rbp-48]
+    mov     rdi, qword ptr [rbp-56]
+    FRAME_EPILOG
+    ret
+st_tcvc_seal_hdr endp
+
+; =============================================================================
+; st_tcvc() -> rax = failure count (0..4)
+; =============================================================================
+ST_TCVC_ARENA   equ 303104
+ST_OFF_BUF      equ 25552
+ST_OFF_REF      equ 29648
+ST_OFF_DK       equ 33744
+ST_OFF_MK       equ 33936
+ST_OFF_VOL      equ 36864
+ST_VOL_BYTES    equ 266240
+
+st_tcvc proc frame
+    FRAME_PROLOG 160
+    ; [rbp-16..64]  saved r12..r15, rbx, rsi, rdi
+    ; [rbp-72]      fails (dq)
+    ; [rbp-80]      state12[0..1] (crc, writePos)
+    ; [rbp-88]      state12[2]    (totalRead)
+    mov     qword ptr [rbp-16], r12
+    mov     qword ptr [rbp-24], r13
+    mov     qword ptr [rbp-32], r14
+    mov     qword ptr [rbp-40], r15
+    mov     qword ptr [rbp-48], rbx
+    mov     qword ptr [rbp-56], rsi
+    mov     qword ptr [rbp-64], rdi
+    mov     qword ptr [rbp-72], 0
+
+    mov     ecx, ST_TCVC_ARENA
+    call    mem_alloc
+    test    rax, rax
+    jnz     sttc_alloc_ok
+    mov     rax, 4
+    jmp     sttc_exit
+sttc_alloc_ok:
+    mov     r12, rax                        ; arena base (16-aligned)
+
+    ; =========================================================================
+    ; 1. Block Cipher ECB KATs + Encrypt/Decrypt Roundtrips
+    ; =========================================================================
+    ; 1a. AES-256 XTS block helpers
+    lea     rcx, [aeskat_key]
+    mov     rdx, r12
+    call    aes256_xts_set_key
+    movdqu  xmm0, xmmword ptr [aeskat_pt]
+    movdqu  xmmword ptr [r12 + ST_OFF_BUF], xmm0
+    mov     rcx, r12
+    lea     rdx, [r12 + ST_OFF_BUF]
+    call    aes256_enc_block
+    lea     rcx, [r12 + ST_OFF_BUF]
+    lea     rdx, [aeskat_c256]
+    mov     r8d, 16
+    call    ct_memcmp
+    test    eax, eax
+    jnz     sttc_ciph_fail
+    mov     rcx, r12
+    lea     rdx, [r12 + ST_OFF_BUF]
+    call    aes256_dec_block
+    lea     rcx, [r12 + ST_OFF_BUF]
+    lea     rdx, [aeskat_pt]
+    mov     r8d, 16
+    call    ct_memcmp
+    test    eax, eax
+    jnz     sttc_ciph_fail
+
+    ; 1b. Serpent-256
+    lea     rcx, [aeskat_key]
+    mov     rdx, r12
+    call    serpent_set_key
+    movdqu  xmm0, xmmword ptr [serp_pt]
+    movdqu  xmmword ptr [r12 + ST_OFF_BUF], xmm0
+    mov     rcx, r12
+    lea     rdx, [r12 + ST_OFF_BUF]
+    call    serpent_enc_block
+    lea     rcx, [r12 + ST_OFF_BUF]
+    lea     rdx, [serp_ct]
+    mov     r8d, 16
+    call    ct_memcmp
+    test    eax, eax
+    jnz     sttc_ciph_fail
+    mov     rcx, r12
+    lea     rdx, [r12 + ST_OFF_BUF]
+    call    serpent_dec_block
+    lea     rcx, [r12 + ST_OFF_BUF]
+    lea     rdx, [serp_pt]
+    mov     r8d, 16
+    call    ct_memcmp
+    test    eax, eax
+    jnz     sttc_ciph_fail
+
+    ; 1c. Twofish-256
+    lea     rcx, [tf_key]
+    mov     rdx, r12
+    call    twofish_set_key
+    movdqu  xmm0, xmmword ptr [tf_pt]
+    movdqu  xmmword ptr [r12 + ST_OFF_BUF], xmm0
+    mov     rcx, r12
+    lea     rdx, [r12 + ST_OFF_BUF]
+    call    twofish_enc_block
+    lea     rcx, [r12 + ST_OFF_BUF]
+    lea     rdx, [tf_ct]
+    mov     r8d, 16
+    call    ct_memcmp
+    test    eax, eax
+    jnz     sttc_ciph_fail
+    mov     rcx, r12
+    lea     rdx, [r12 + ST_OFF_BUF]
+    call    twofish_dec_block
+    lea     rcx, [r12 + ST_OFF_BUF]
+    lea     rdx, [tf_pt]
+    mov     r8d, 16
+    call    ct_memcmp
+    test    eax, eax
+    jnz     sttc_ciph_fail
+
+    ; 1d. Camellia-256
+    lea     rcx, [cam_key]
+    mov     rdx, r12
+    call    camellia_set_key
+    movdqu  xmm0, xmmword ptr [cam_pt]
+    movdqu  xmmword ptr [r12 + ST_OFF_BUF], xmm0
+    mov     rcx, r12
+    lea     rdx, [r12 + ST_OFF_BUF]
+    call    camellia_enc_block
+    lea     rcx, [r12 + ST_OFF_BUF]
+    lea     rdx, [cam_ct]
+    mov     r8d, 16
+    call    ct_memcmp
+    test    eax, eax
+    jnz     sttc_ciph_fail
+    mov     rcx, r12
+    lea     rdx, [r12 + ST_OFF_BUF]
+    call    camellia_dec_block
+    lea     rcx, [r12 + ST_OFF_BUF]
+    lea     rdx, [cam_pt]
+    mov     r8d, 16
+    call    ct_memcmp
+    test    eax, eax
+    jnz     sttc_ciph_fail
+
+    ; 1e. Kuznyechik
+    lea     rcx, [kuz_key]
+    mov     rdx, r12
+    call    kuznyechik_set_key
+    movdqu  xmm0, xmmword ptr [kuz_pt]
+    movdqu  xmmword ptr [r12 + ST_OFF_BUF], xmm0
+    mov     rcx, r12
+    lea     rdx, [r12 + ST_OFF_BUF]
+    call    kuznyechik_enc_block
+    lea     rcx, [r12 + ST_OFF_BUF]
+    lea     rdx, [kuz_ct]
+    mov     r8d, 16
+    call    ct_memcmp
+    test    eax, eax
+    jnz     sttc_ciph_fail
+    mov     rcx, r12
+    lea     rdx, [r12 + ST_OFF_BUF]
+    call    kuznyechik_dec_block
+    lea     rcx, [r12 + ST_OFF_BUF]
+    lea     rdx, [kuz_pt]
+    mov     r8d, 16
+    call    ct_memcmp
+    test    eax, eax
+    jnz     sttc_ciph_fail
+
+    lea     rcx, [st_pass_tcciph]
+    mov     edx, st_pass_tcciph_len
+    call    print_a
+    jmp     sttc_after_ciph
+sttc_ciph_fail:
+    lea     rcx, [st_fail_tcciph]
+    mov     edx, st_fail_tcciph_len
+    call    print_a
+    inc     qword ptr [rbp-72]
+sttc_after_ciph:
+
+    ; =========================================================================
+    ; 2. All 15 XTS Single & Cascade Modes (EncryptionTest::TestXts 2048B KATs)
+    ; =========================================================================
+    xor     ebx, ebx                        ; modeId = 0..14
+sttc_xts_lp:
+    xor     ecx, ecx
+sttc_xts_fill:
+    mov     byte ptr [r12 + ST_OFF_BUF + rcx], cl
+    inc     ecx
+    cmp     ecx, 2048
+    jb      sttc_xts_fill
+
+    mov     ecx, ebx
+    lea     rdx, [xts_pri_key]
+    lea     r8,  [xts_sec_key]
+    mov     r9,  r12
+    call    xts_init
+
+    mov     rcx, r12
+    lea     rdx, [r12 + ST_OFF_BUF]
+    mov     r8d, 2048
+    xor     r9d, r9d
+    call    xts_encrypt
+
+    xor     ecx, ecx
+    lea     rdx, [r12 + ST_OFF_BUF]
+    mov     r8d, 2048
+    call    crc32_update
+    lea     rcx, [xts_exp_crc]
+    cmp     eax, dword ptr [rcx + rbx*4]
+    jne     sttc_xts_fail
+
+    mov     rcx, r12
+    lea     rdx, [r12 + ST_OFF_BUF]
+    mov     r8d, 2048
+    xor     r9d, r9d
+    call    xts_decrypt
+
+    xor     ecx, ecx
+    lea     rdx, [r12 + ST_OFF_BUF]
+    mov     r8d, 2048
+    call    crc32_update
+    cmp     eax, 09f5edd58h
+    jne     sttc_xts_fail
+
+    inc     ebx
+    cmp     ebx, 15
+    jb      sttc_xts_lp
+
+    lea     rcx, [st_pass_tcxts]
+    mov     edx, st_pass_tcxts_len
+    call    print_a
+    jmp     sttc_after_xts
+sttc_xts_fail:
+    lea     rcx, [st_fail_tcxts]
+    mov     edx, st_fail_tcxts_len
+    call    print_a
+    inc     qword ptr [rbp-72]
+sttc_after_xts:
+
+    ; =========================================================================
+    ; 3. KDFs (6 PBKDF2-HMAC Hashes + Streebog Carry-Drop + VC Argon2id + Pool)
+    ; =========================================================================
+    xor     ebx, ebx                        ; hashId = 0..5
+sttc_pbk_lp:
+    mov     ecx, ebx
+    lea     rdx, [a2_pw2]                   ; "password"
+    mov     r8d, 8
+    lea     r9,  [tc_pbk_salt]
+    mov     qword ptr [rsp+32], 4
+    mov     qword ptr [rsp+40], 5
+    lea     rax, [r12 + ST_OFF_DK]
+    mov     qword ptr [rsp+48], rax
+    mov     qword ptr [rsp+56], 192
+    call    pbkdf2_hmac_ex
+    test    eax, eax
+    jnz     sttc_kdf_fail
+
+    lea     rsi, [tc_pbk_exp]
+    lea     rsi, [rsi + rbx*8]
+    lea     rcx, [r12 + ST_OFF_DK]
+    mov     rdx, rsi
+    mov     r8d, 4
+    call    ct_memcmp
+    test    eax, eax
+    jnz     sttc_kdf_fail
+
+    lea     rcx, [r12 + ST_OFF_DK + 188]
+    lea     rdx, [rsi + 4]
+    mov     r8d, 4
+    call    ct_memcmp
+    test    eax, eax
+    jnz     sttc_kdf_fail
+
+    inc     ebx
+    cmp     ebx, 6
+    jb      sttc_pbk_lp
+
+    ; Streebog-512 128-byte carry-drop test vector
+    lea     rdi, [r12 + ST_OFF_BUF]
+    xor     eax, eax
+    mov     ecx, 128 / 8
+    rep     stosq
+    mov     rax, -1
+    mov     qword ptr [r12 + ST_OFF_BUF + 0], rax
+    mov     qword ptr [r12 + ST_OFF_BUF + 8], rax
+    mov     byte ptr  [r12 + ST_OFF_BUF + 64], 1
+
+    mov     rcx, r12
+    call    streebog_init
+    mov     rcx, r12
+    lea     rdx, [r12 + ST_OFF_BUF]
+    mov     r8d, 128
+    call    streebog_update
+    mov     rcx, r12
+    lea     rdx, [r12 + ST_OFF_DK]
+    call    streebog_final
+
+    lea     rcx, [r12 + ST_OFF_DK]
+    lea     rdx, [sbg_exp_hd]
+    mov     r8d, 8
+    call    ct_memcmp
+    test    eax, eax
+    jnz     sttc_kdf_fail
+    lea     rcx, [r12 + ST_OFF_DK + 60]
+    lea     rdx, [sbg_exp_tl]
+    mov     r8d, 4
+    call    ct_memcmp
+    test    eax, eax
+    jnz     sttc_kdf_fail
+
+    ; VeraCrypt Argon2id PIM=1 ("password", "somesalt", t=3, m=65536, p=1, outlen=192)
+    lea     rcx, [a2_req]
+    mov     edx, sizeof ARGON2REQ
+    call    secure_zero
+    mov     dword ptr [a2_req].ARGON2REQ.t_cost,  3
+    mov     dword ptr [a2_req].ARGON2REQ.m_cost,  65536
+    mov     dword ptr [a2_req].ARGON2REQ.lanes,   1
+    mov     dword ptr [a2_req].ARGON2REQ.outlen,  192
+    mov     dword ptr [a2_req].ARGON2REQ.version, 013h
+    mov     dword ptr [a2_req].ARGON2REQ.atype,   2
+    lea     rax, [a2_pw2]
+    mov     qword ptr [a2_req].ARGON2REQ.pwd,     rax
+    mov     dword ptr [a2_req].ARGON2REQ.pwdlen,  8
+    lea     rax, [a2_salt2]
+    mov     qword ptr [a2_req].ARGON2REQ.salt,    rax
+    mov     dword ptr [a2_req].ARGON2REQ.saltlen, 8
+    lea     rax, [r12 + ST_OFF_DK]
+    mov     qword ptr [a2_req].ARGON2REQ.outp,    rax
+    lea     rcx, [a2_req]
+    call    argon2id_hash
+    test    eax, eax
+    jnz     sttc_kdf_fail
+    lea     rcx, [r12 + ST_OFF_DK]
+    lea     rdx, [vc_a2_exp]
+    mov     r8d, 32
+    call    ct_memcmp
+    test    eax, eax
+    jnz     sttc_kdf_fail
+
+    ; Keyfile pool mixing KAT + tcvc_apply_keyfiles(kfCount=0)
+    lea     rcx, [g_tcvc_sec + TCVC_OFF_POOL]
+    mov     edx, 128
+    call    secure_zero
+    mov     dword ptr [rbp-88], 0FFFFFFFFh  ; crc
+    mov     dword ptr [rbp-84], 0           ; writePos
+    mov     dword ptr [rbp-80], 0           ; totalRead
+    lea     rcx, [tc_kf_msg]
+    mov     edx, TC_KF_MSG_N
+    lea     r8,  [rbp-88]
+    mov     r9d, 64
+    call    tcvc_mix_pool_chunk
+    lea     rcx, [g_tcvc_sec + TCVC_OFF_POOL]
+    lea     rdx, [tc_kf_hd]
+    mov     r8d, 16
+    call    ct_memcmp
+    test    eax, eax
+    jnz     sttc_kdf_fail
+    lea     rcx, [g_tcvc_sec + TCVC_OFF_POOL + 48]
+    lea     rdx, [tc_kf_tl]
+    mov     r8d, 16
+    call    ct_memcmp
+    test    eax, eax
+    jnz     sttc_kdf_fail
+
+    lea     rcx, [a2_pw2]
+    mov     edx, 8
+    xor     r8d, r8d
+    xor     r9d, r9d
+    mov     qword ptr [rsp+32], 0
+    call    tcvc_apply_keyfiles
+    test    eax, eax
+    jnz     sttc_kdf_fail
+
+    lea     rcx, [st_pass_tckdf]
+    mov     edx, st_pass_tckdf_len
+    call    print_a
+    jmp     sttc_after_kdf
+sttc_kdf_fail:
+    lea     rcx, [st_fail_tckdf]
+    mov     edx, st_fail_tckdf_len
+    call    print_a
+    inc     qword ptr [rbp-72]
+sttc_after_kdf:
+
+    ; =========================================================================
+    ; 4. Synthetic Volume Unlock ("TRUE" + "VERA" PBKDF2 & Argon2id + Backup)
+    ; =========================================================================
+    ; Verify tcvc_open rejects empty path cleanly with EXIT_IO
+    lea     rcx, [tc_empty_w]
+    lea     rdx, [a2_pw2]
+    mov     r8d, 8
+    xor     r9d, r9d
+    mov     qword ptr [rsp+32], 0
+    call    tcvc_open
+    cmp     eax, EXIT_IO
+    jne     sttc_vol_fail
+
+    ; Prepare deterministic 4096-byte reference plaintext & 256-byte master key
+    xor     ecx, ecx
+sttc_ref_lp:
+    imul    eax, ecx, 13
+    xor     eax, ecx
+    add     eax, 037h
+    mov     byte ptr [r12 + ST_OFF_REF + rcx], al
+    inc     ecx
+    cmp     ecx, 4096
+    jb      sttc_ref_lp
+
+    xor     ecx, ecx
+sttc_mk_lp:
+    imul    eax, ecx, 7
+    add     eax, 05Ah
+    mov     byte ptr [r12 + ST_OFF_MK + rcx], al
+    inc     ecx
+    cmp     ecx, 256
+    jb      sttc_mk_lp
+
+    ; ---- 4a. TrueCrypt 7.1a ("TRUE", mode 8 = Serpent-Twofish-AES, RMD160 2000)
+    lea     r13, [r12 + ST_OFF_VOL]         ; volMem (266240 bytes)
+    mov     rdi, r13
+    xor     eax, eax
+    mov     ecx, ST_VOL_BYTES / 8
+    rep     stosq
+
+    ; Primary salt at +0 (seed 0x11), Backup salt at +135168 (seed 0x77)
+    xor     ecx, ecx
+sttc_salt_tc:
+    lea     eax, [ecx + 011h]
+    mov     byte ptr [r13 + rcx], al
+    lea     eax, [ecx + 077h]
+    mov     byte ptr [r13 + 135168 + rcx], al
+    inc     ecx
+    cmp     ecx, 64
+    jb      sttc_salt_tc
+
+    ; Primary header (RIPEMD-160 = hashId 5, 2000 iters)
+    mov     ecx, 5
+    lea     rdx, [a2_pw2]
+    mov     r8d, 8
+    mov     r9,  r13
+    mov     qword ptr [rsp+32], 64
+    mov     qword ptr [rsp+40], 2000
+    lea     rax, [r12 + ST_OFF_DK]
+    mov     qword ptr [rsp+48], rax
+    mov     qword ptr [rsp+56], 192
+    call    pbkdf2_hmac_ex
+
+    mov     rcx, r13
+    mov     rdx, r12
+    lea     r8,  [r12 + ST_OFF_DK]
+    mov     r9d, 8                          ; modeId 8 = Serpent-Twofish-AES
+    mov     qword ptr [rsp+32], 0           ; isVera = 0 ("TRUE")
+    mov     qword ptr [rsp+40], 512         ; secSize = 512
+    call    st_tcvc_seal_hdr
+
+    ; Backup header at +135168 (distinct salt -> proves independent re-derivation)
+    mov     ecx, 5
+    lea     rdx, [a2_pw2]
+    mov     r8d, 8
+    lea     r9,  [r13 + 135168]
+    mov     qword ptr [rsp+32], 64
+    mov     qword ptr [rsp+40], 2000
+    lea     rax, [r12 + ST_OFF_DK]
+    mov     qword ptr [rsp+48], rax
+    mov     qword ptr [rsp+56], 192
+    call    pbkdf2_hmac_ex
+
+    lea     rcx, [r13 + 135168]
+    mov     rdx, r12
+    lea     r8,  [r12 + ST_OFF_DK]
+    mov     r9d, 8
+    mov     qword ptr [rsp+32], 0
+    mov     qword ptr [rsp+40], 512
+    call    st_tcvc_seal_hdr
+
+    ; Encrypt 4096B volume data at host offset 131072 (startUnit = 256)
+    lea     rdi, [r13 + 131072]
+    lea     rsi, [r12 + ST_OFF_REF]
+    mov     ecx, 4096 / 8
+    rep     movsq
+
+    mov     ecx, 8
+    lea     rdx, [r12 + ST_OFF_MK]
+    lea     r8,  [r12 + ST_OFF_MK + 96]     ; 3-cipher cascade -> 96B key size
+    mov     r9,  r12
+    call    xts_init
+
+    mov     rcx, r12
+    lea     rdx, [r13 + 131072]
+    mov     r8d, 4096
+    mov     r9d, 256
+    call    xts_encrypt
+
+    ; Open primary TRUE container
+    mov     rcx, r13
+    mov     edx, ST_VOL_BYTES
+    lea     r8,  [a2_pw2]
+    mov     r9d, 8
+    mov     qword ptr [rsp+32], 0           ; pim = 0
+    call    tcvc_open_mem
+    test    eax, eax
+    jnz     sttc_vol_fail
+
+    cmp     dword ptr [g_tcvc_open_flag], 1
+    jne     sttc_vol_fail
+    cmp     dword ptr [g_tcvc_is_vera], 0
+    jne     sttc_vol_fail
+    cmp     dword ptr [g_tcvc_mode_id], 8
+    jne     sttc_vol_fail
+    cmp     dword ptr [g_tcvc_kdf_id], 5
+    jne     sttc_vol_fail
+    cmp     dword ptr [g_tcvc_sec_size], 512
+    jne     sttc_vol_fail
+    cmp     qword ptr [g_tcvc_data_size], 4096
+    jne     sttc_vol_fail
+
+    ; Read unaligned slice across XTS 512B boundary (offset 500, len 777)
+    mov     ecx, 500
+    lea     rdx, [r12 + ST_OFF_BUF]
+    mov     r8d, 777
+    call    tcvc_read_bytes
+    test    eax, eax
+    jnz     sttc_vol_fail
+    lea     rcx, [r12 + ST_OFF_BUF]
+    lea     rdx, [r12 + ST_OFF_REF + 500]
+    mov     r8d, 777
+    call    ct_memcmp
+    test    eax, eax
+    jnz     sttc_vol_fail
+
+    ; Corrupt primary header & verify automatic backup header recovery!
+    xor     byte ptr [r13 + 64], 0FFh
+    mov     rcx, r13
+    mov     edx, ST_VOL_BYTES
+    lea     r8,  [a2_pw2]
+    mov     r9d, 8
+    mov     qword ptr [rsp+32], 0
+    call    tcvc_open_mem
+    test    eax, eax
+    jnz     sttc_vol_fail
+
+    xor     ecx, ecx
+    lea     rdx, [r12 + ST_OFF_BUF]
+    mov     r8d, 4096
+    call    tcvc_read_bytes
+    test    eax, eax
+    jnz     sttc_vol_fail
+    lea     rcx, [r12 + ST_OFF_BUF]
+    lea     rdx, [r12 + ST_OFF_REF]
+    mov     r8d, 4096
+    call    ct_memcmp
+    test    eax, eax
+    jnz     sttc_vol_fail
+
+    ; ---- 4b. VeraCrypt 6-thread Parallel PBKDF2 ("VERA", Whirlpool, PIM=1) ----
+    ; Whirlpool = hashId 3, PIM=1 -> 15000 + 1000 = 16000 iterations, mode 10 (Camellia-Kuznyechik)
+    mov     ecx, 3
+    lea     rdx, [a2_pw2]
+    mov     r8d, 8
+    mov     r9,  r13
+    mov     qword ptr [rsp+32], 64
+    mov     qword ptr [rsp+40], 16000
+    lea     rax, [r12 + ST_OFF_DK]
+    mov     qword ptr [rsp+48], rax
+    mov     qword ptr [rsp+56], 192
+    call    pbkdf2_hmac_ex
+
+    mov     rcx, r13
+    mov     rdx, r12
+    lea     r8,  [r12 + ST_OFF_DK]
+    mov     r9d, 10                         ; mode 10 = Camellia-Kuznyechik (64B key)
+    mov     qword ptr [rsp+32], 1           ; isVera = 1 ("VERA")
+    mov     qword ptr [rsp+40], 4096        ; secSize = 4096
+    call    st_tcvc_seal_hdr
+
+    lea     rdi, [r13 + 131072]
+    lea     rsi, [r12 + ST_OFF_REF]
+    mov     ecx, 4096 / 8
+    rep     movsq
+    mov     ecx, 10
+    lea     rdx, [r12 + ST_OFF_MK]
+    lea     r8,  [r12 + ST_OFF_MK + 64]
+    mov     r9,  r12
+    call    xts_init
+    mov     rcx, r12
+    lea     rdx, [r13 + 131072]
+    mov     r8d, 4096
+    mov     r9d, 256
+    call    xts_encrypt
+
+    mov     rcx, r13
+    mov     edx, ST_VOL_BYTES
+    lea     r8,  [a2_pw2]
+    mov     r9d, 8
+    mov     qword ptr [rsp+32], 1           ; pim = 1
+    call    tcvc_open_mem
+    test    eax, eax
+    jnz     sttc_vol_fail
+    cmp     dword ptr [g_tcvc_is_vera], 1
+    jne     sttc_vol_fail
+    cmp     dword ptr [g_tcvc_mode_id], 10
+    jne     sttc_vol_fail
+    cmp     dword ptr [g_tcvc_kdf_id], 3
+    jne     sttc_vol_fail
+    cmp     dword ptr [g_tcvc_sec_size], 4096
+    jne     sttc_vol_fail
+
+    ; Wrong-password refusal check (pim = 1 -> exercises full PBKDF2 + Argon2id rejection)
+    mov     rcx, r13
+    mov     edx, ST_VOL_BYTES
+    lea     r8,  [tc_bad_pw]
+    mov     r9d, 10
+    mov     qword ptr [rsp+32], 1
+    call    tcvc_open_mem
+    cmp     eax, EXIT_AUTH
+    jne     sttc_vol_fail
+
+    ; ---- 4c. VeraCrypt Argon2id ("VERA", mode 14 = Kuznyechik-Serpent-Camellia, PIM=1)
+    lea     rcx, [a2_req]
+    mov     edx, sizeof ARGON2REQ
+    call    secure_zero
+    mov     dword ptr [a2_req].ARGON2REQ.t_cost,  3
+    mov     dword ptr [a2_req].ARGON2REQ.m_cost,  65536
+    mov     dword ptr [a2_req].ARGON2REQ.lanes,   1
+    mov     dword ptr [a2_req].ARGON2REQ.outlen,  192
+    mov     dword ptr [a2_req].ARGON2REQ.version, 013h
+    mov     dword ptr [a2_req].ARGON2REQ.atype,   2
+    lea     rax, [a2_pw2]
+    mov     qword ptr [a2_req].ARGON2REQ.pwd,     rax
+    mov     dword ptr [a2_req].ARGON2REQ.pwdlen,  8
+    mov     qword ptr [a2_req].ARGON2REQ.salt,    r13
+    mov     dword ptr [a2_req].ARGON2REQ.saltlen, 64
+    lea     rax, [r12 + ST_OFF_DK]
+    mov     qword ptr [a2_req].ARGON2REQ.outp,    rax
+    lea     rcx, [a2_req]
+    call    argon2id_hash
+    test    eax, eax
+    jnz     sttc_vol_fail
+
+    mov     rcx, r13
+    mov     rdx, r12
+    lea     r8,  [r12 + ST_OFF_DK]
+    mov     r9d, 14                         ; mode 14 = Kuznyechik-Serpent-Camellia
+    mov     qword ptr [rsp+32], 1
+    mov     qword ptr [rsp+40], 4096
+    call    st_tcvc_seal_hdr
+
+    lea     rdi, [r13 + 131072]
+    lea     rsi, [r12 + ST_OFF_REF]
+    mov     ecx, 4096 / 8
+    rep     movsq
+    mov     ecx, 14
+    lea     rdx, [r12 + ST_OFF_MK]
+    lea     r8,  [r12 + ST_OFF_MK + 96]
+    mov     r9,  r12
+    call    xts_init
+    mov     rcx, r12
+    lea     rdx, [r13 + 131072]
+    mov     r8d, 4096
+    mov     r9d, 256
+    call    xts_encrypt
+
+    mov     rcx, r13
+    mov     edx, ST_VOL_BYTES
+    lea     r8,  [a2_pw2]
+    mov     r9d, 8
+    mov     qword ptr [rsp+32], 1
+    call    tcvc_open_mem
+    test    eax, eax
+    jnz     sttc_vol_fail
+    cmp     dword ptr [g_tcvc_kdf_id], 6    ; TCVC_KDF_ARGON2ID
+    jne     sttc_vol_fail
+    cmp     dword ptr [g_tcvc_mode_id], 14
+    jne     sttc_vol_fail
+
+    xor     ecx, ecx
+    lea     rdx, [r12 + ST_OFF_BUF]
+    mov     r8d, 4096
+    call    tcvc_read_bytes
+    test    eax, eax
+    jnz     sttc_vol_fail
+    lea     rcx, [r12 + ST_OFF_BUF]
+    lea     rdx, [r12 + ST_OFF_REF]
+    mov     r8d, 4096
+    call    ct_memcmp
+    test    eax, eax
+    jnz     sttc_vol_fail
+
+    call    tcvc_close
+    lea     rcx, [st_pass_tcvol]
+    mov     edx, st_pass_tcvol_len
+    call    print_a
+    jmp     sttc_done
+
+sttc_vol_fail:
+    call    tcvc_close
+    lea     rcx, [st_fail_tcvol]
+    mov     edx, st_fail_tcvol_len
+    call    print_a
+    inc     qword ptr [rbp-72]
+
+sttc_done:
+    mov     rcx, r12
+    mov     edx, ST_TCVC_ARENA
+    call    secure_zero
+    mov     rcx, r12
+    mov     edx, ST_TCVC_ARENA
+    call    mem_free
+    mov     rax, qword ptr [rbp-72]
+
+sttc_exit:
+    mov     r12, qword ptr [rbp-16]
+    mov     r13, qword ptr [rbp-24]
+    mov     r14, qword ptr [rbp-32]
+    mov     r15, qword ptr [rbp-40]
+    mov     rbx, qword ptr [rbp-48]
+    mov     rsi, qword ptr [rbp-56]
+    mov     rdi, qword ptr [rbp-64]
+    FRAME_EPILOG
+    ret
+st_tcvc endp
 
 end
